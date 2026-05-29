@@ -35,16 +35,15 @@ per-circuit protection.
 # Build
 cargo build --release
 
-# Configure (copy the example and edit)
-cp config.example.yaml config.yaml
-
-# Provider keys come from env vars named in the config (api_key_env)
+# Configure: providers.yaml (shipped defs) + config.yaml (deployment with keys)
 export ANTHROPIC_KEY=sk-ant-...
 export ZAI_KEY=...
 
-# Run
-BUSBAR_CONFIG=./config.yaml ./target/release/busbar
+# Run (BUSBAR_PROVIDERS defaults to /etc/busbar/providers.yaml, BUSBAR_CONFIG to /etc/busbar/config.yaml)
+BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./target/release/busbar
 ```
+
+The two-file model separates vetted provider knowledge (`providers.yaml`) from operator deployment config (`config.yaml`). Operators reference providers by NAME in `config.yaml` and supply their keys via env vars.
 
 ## API
 
@@ -62,10 +61,12 @@ credential — the caller's own model/key fields are ignored.
 
 ## Configuration
 
-See [`config.example.yaml`](config.example.yaml). Providers declare a `base_url`
-and the **env var name** holding their key (keys are never stored in the config
-file). Models declare a `provider` and `max_concurrent`; pools are named lists of
-models whose concurrency caps stack into one aggregate.
+Busbar uses a two-file model:
+
+- **`providers.yaml`** (shipped): contains vetted provider definitions with protocol, base_url, and error_map. Operators rarely modify this file.
+- **`config.yaml`** (deployment): operator-owned config that references providers by NAME from `providers.yaml` and supplies their keys via `api_key_env`.
+
+Providers declare a `base_url` and the **env var name** holding their key in `providers.yaml`. Models declare a `provider` and `max_concurrent`; pools are named lists of models whose concurrency caps stack into one aggregate. Keys are never stored in config files—only env var names.
 
 ## Contributing
 

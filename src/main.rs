@@ -48,18 +48,32 @@ use std::time::Duration;
 use axum::{routing::get, routing::post, Router};
 
 use auth::AuthMiddleware;
-use config::RootCfg;
 use state::{App, Lane, ProtocolKind};
 use store::{InMemoryStore, LaneData};
 
 #[tokio::main]
 async fn main() {
-    let path = std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
+    // Read providers.yaml (shipped definitions)
+    let providers_path =
+        std::env::var("BUSBAR_PROVIDERS").unwrap_or_else(|_| "/etc/busbar/providers.yaml".into());
+    let raw_providers = std::fs::read_to_string(&providers_path).expect("read BUSBAR_PROVIDERS");
+    let interpolated_providers =
+        config::interpolate_env(&raw_providers).expect("expand ${ENV} variables in providers.yaml");
+    let defs: HashMap<String, config::ProviderDef> =
+        serde_yaml::from_str(&interpolated_providers).expect("parse providers.yaml");
 
-    let raw_content = std::fs::read_to_string(&path).expect("read BUSBAR_CONFIG");
-    let interpolated =
-        config::interpolate_env(&raw_content).expect("expand ${ENV} variables in config");
-    let cfg: RootCfg = serde_yaml::from_str(&interpolated).expect("parse config YAML");
+    // Read config.yaml (deployment)
+    let config_path =
+        std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
+    let raw_config = std::fs::read_to_string(&config_path).expect("read BUSBAR_CONFIG");
+    let interpolated_config =
+        config::interpolate_env(&raw_config).expect("expand ${ENV} variables in config");
+    let deploy: config::DeployCfg =
+        serde_yaml::from_str(&interpolated_config).expect("parse config.yaml as DeployCfg");
+
+    // Resolve deployment + definitions into resolved RootCfg
+    let cfg =
+        config::resolve(&deploy, &defs).expect("resolve provider deployments from providers.yaml");
     let auth_cfg = cfg
         .auth
         .as_ref()
@@ -117,17 +131,15 @@ async fn main() {
 
     let mut lanes = Vec::new();
     for ld in &lanes_data {
-        let proto = if ld.provider == "anthropic" {
+        let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
+        let proto = if provider_cfg.protocol == "anthropic" {
             ProtocolKind::Anthropic(crate::proto::AnthropicProtocol::new())
         } else {
             panic!(
                 "unknown protocol '{}' for provider {}",
-                ld.provider,
-                cfg.providers.get(&ld.provider).unwrap().protocol
+                provider_cfg.protocol, ld.provider
             );
         };
-
-        let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
         lanes.push(Lane {
             model: ld.model.clone(),
             provider: ld.provider.clone(),

@@ -109,13 +109,13 @@ fn default_protocol() -> String {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct HealthCfg {
     pub(crate) interval_secs: Option<u64>,
     pub(crate) timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct ModelCfg {
     #[serde(default = "neg1")]
     pub(crate) max_requests: i64,
@@ -128,7 +128,7 @@ fn neg1() -> i64 {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PoolCfg {
     #[serde(default)]
     pub(crate) members: Vec<PoolMember>,
@@ -143,7 +143,7 @@ pub(crate) struct PoolCfg {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PoolMember {
     pub(crate) target: String,
     #[serde(default = "default_weight")]
@@ -157,7 +157,7 @@ fn default_weight() -> u32 {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct BreakerCfg {
     #[serde(default = "default_cooldown")]
     pub(crate) base_cooldown_secs: u64,
@@ -174,7 +174,7 @@ fn default_max_cooldown() -> u64 {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct FailoverCfg {
     #[serde(default = "default_failover_deadline")]
     pub(crate) deadline_secs: u64,
@@ -193,7 +193,7 @@ fn default_cap() -> usize {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct OnExhaustedCfg {
     #[serde(default = "default_on_exhausted_action")]
     pub(crate) action: String,
@@ -204,7 +204,7 @@ fn default_on_exhausted_action() -> String {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AffinityCfg {
     #[serde(default = "default_affinity_mode")]
     pub(crate) mode: String,
@@ -218,6 +218,107 @@ fn default_affinity_mode() -> String {
 
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
+}
+
+/// Provider definition - vetted knowledge shipped in providers.yaml (no keys).
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct ProviderDef {
+    pub(crate) protocol: String,
+    pub(crate) base_url: String,
+    #[serde(default)]
+    pub(crate) error_map: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) health: Option<HealthCfg>,
+}
+
+/// Provider deployment - operator config in config.yaml (names provider + supplies key).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct ProviderDeploy {
+    pub(crate) api_key_env: String,
+    #[serde(default)]
+    pub(crate) protocol: Option<String>,
+    #[serde(default)]
+    pub(crate) base_url: Option<String>,
+    #[serde(default)]
+    pub(crate) error_map: Option<HashMap<String, String>>,
+}
+
+/// Deployment configuration - operator-owned config.yaml structure.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DeployCfg {
+    #[serde(default = "default_listen")]
+    pub(crate) listen: String,
+    pub(crate) auth: Option<AuthCfg>,
+    pub(crate) providers: HashMap<String, ProviderDeploy>,
+    pub(crate) models: HashMap<String, ModelCfg>,
+    pub(crate) pools: HashMap<String, PoolCfg>,
+}
+
+/// Resolve DeployCfg + ProviderDef map into resolved RootCfg.
+/// For each deployed provider, look up its definition by name; produce a resolved ProviderCfg
+/// = def's protocol/base_url/error_map (with any config.yaml override applied) + the deployment's api_key_env.
+pub(crate) fn resolve(
+    deploy: &DeployCfg,
+    defs: &HashMap<String, ProviderDef>,
+) -> Result<RootCfg, Vec<String>> {
+    let mut errors = Vec::new();
+    let mut resolved_providers: HashMap<String, ProviderCfg> = HashMap::new();
+
+    for (deploy_name, deploy_cfg) in &deploy.providers {
+        // Look up the provider definition by name
+        let def = match defs.get(deploy_name) {
+            Some(d) => d,
+            None => {
+                errors.push(format!(
+                    "provider '{}' referenced in config.yaml not found in providers.yaml",
+                    deploy_name
+                ));
+                continue;
+            }
+        };
+
+        // Apply overrides from deployment (rarely used)
+        let protocol = deploy_cfg
+            .protocol
+            .clone()
+            .unwrap_or_else(|| def.protocol.clone());
+        let base_url = deploy_cfg
+            .base_url
+            .clone()
+            .unwrap_or_else(|| def.base_url.clone());
+
+        // Merge error_map: def's map with deployment override taking precedence
+        let mut error_map = def.error_map.clone();
+        if let Some(override_map) = &deploy_cfg.error_map {
+            for (code, class) in override_map {
+                error_map.insert(code.clone(), class.clone());
+            }
+        }
+
+        resolved_providers.insert(
+            deploy_name.clone(),
+            ProviderCfg {
+                protocol,
+                base_url,
+                api_key_env: deploy_cfg.api_key_env.clone(),
+                health: def.health.clone(),
+                error_map,
+                _legacy_api_key: None,
+            },
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(RootCfg {
+            listen: deploy.listen.clone(),
+            auth: deploy.auth.clone().map(|a| a.normalize()),
+            providers: resolved_providers,
+            models: deploy.models.clone(),
+            pools: deploy.pools.clone(),
+        })
+    } else {
+        Err(errors)
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +374,195 @@ mod tests {
         let input = "plain-text-no-vars";
         let result = interpolate_env(input).unwrap();
         assert_eq!(result, "plain-text-no-vars");
+    }
+
+    // ADR-0008: Two-file resolution tests
+
+    #[test]
+    fn test_resolve_provider_from_def() {
+        // DeployCfg referencing z.ai + providers.yaml def -> resolved ProviderCfg has protocol/base_url/error_map from def
+        let mut defs = HashMap::new();
+        let mut error_map = HashMap::new();
+        error_map.insert("1113".to_string(), "billing".to_string());
+        error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+        defs.insert(
+            "z.ai".to_string(),
+            ProviderDef {
+                protocol: "anthropic".to_string(),
+                base_url: "https://api.z.ai/api/anthropic".to_string(),
+                error_map,
+                health: None,
+            },
+        );
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "z.ai".to_string(),
+            ProviderDeploy {
+                api_key_env: "ZAI_KEY".to_string(),
+                protocol: None,
+                base_url: None,
+                error_map: None,
+            },
+        );
+
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers,
+            models: HashMap::new(),
+            pools: HashMap::new(),
+        };
+
+        let result = resolve(&deploy, &defs).expect("resolve should succeed");
+
+        let provider_cfg = result
+            .providers
+            .get("z.ai")
+            .expect("z.ai should be in resolved providers");
+        assert_eq!(provider_cfg.protocol, "anthropic");
+        assert_eq!(provider_cfg.base_url, "https://api.z.ai/api/anthropic");
+        assert_eq!(provider_cfg.api_key_env, "ZAI_KEY");
+        assert_eq!(
+            provider_cfg.error_map.get("1113"),
+            Some(&"billing".to_string())
+        );
+        assert_eq!(
+            provider_cfg.error_map.get("1302"),
+            Some(&"rate_limit".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_unknown_provider_error() {
+        // config.yaml references nope not in providers.yaml -> resolve returns error naming nope
+        let defs = HashMap::new();
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "nope".to_string(),
+            ProviderDeploy {
+                api_key_env: "NOPE_KEY".to_string(),
+                protocol: None,
+                base_url: None,
+                error_map: None,
+            },
+        );
+
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers,
+            models: HashMap::new(),
+            pools: HashMap::new(),
+        };
+
+        let result = resolve(&deploy, &defs);
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("nope"));
+        assert!(errs[0].contains("not found in providers.yaml"));
+    }
+
+    #[test]
+    fn test_resolve_override_wins() {
+        // config.yaml provider with a base_url override wins over the def
+        let mut defs = HashMap::new();
+        let error_map = HashMap::new();
+
+        defs.insert(
+            "custom".to_string(),
+            ProviderDef {
+                protocol: "anthropic".to_string(),
+                base_url: "https://default.example.com".to_string(),
+                error_map,
+                health: None,
+            },
+        );
+
+        let mut providers = HashMap::new();
+        let mut override_error_map = HashMap::new();
+        override_error_map.insert("9999".to_string(), "client_error".to_string());
+
+        providers.insert(
+            "custom".to_string(),
+            ProviderDeploy {
+                api_key_env: "CUSTOM_KEY".to_string(),
+                protocol: Some("openai".to_string()), // Override protocol
+                base_url: Some("https://override.example.com".to_string()), // Override base_url
+                error_map: Some(override_error_map),  // Override error_map
+            },
+        );
+
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers,
+            models: HashMap::new(),
+            pools: HashMap::new(),
+        };
+
+        let result = resolve(&deploy, &defs).expect("resolve should succeed");
+
+        let provider_cfg = result
+            .providers
+            .get("custom")
+            .expect("custom should be in resolved providers");
+        assert_eq!(
+            provider_cfg.protocol, "openai",
+            "protocol override should win"
+        );
+        assert_eq!(
+            provider_cfg.base_url, "https://override.example.com",
+            "base_url override should win"
+        );
+        assert_eq!(provider_cfg.api_key_env, "CUSTOM_KEY");
+        assert_eq!(
+            provider_cfg.error_map.get("9999"),
+            Some(&"client_error".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_empty_error_map_allowed_in_def() {
+        // A def can have empty error_map; validation will catch it later if required
+        let mut defs = HashMap::new();
+        defs.insert(
+            "minimal".to_string(),
+            ProviderDef {
+                protocol: "anthropic".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                error_map: HashMap::new(), // Empty but valid for resolution
+                health: None,
+            },
+        );
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "minimal".to_string(),
+            ProviderDeploy {
+                api_key_env: "MINIMAL_KEY".to_string(),
+                protocol: None,
+                base_url: None,
+                error_map: None,
+            },
+        );
+
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers,
+            models: HashMap::new(),
+            pools: HashMap::new(),
+        };
+
+        let result = resolve(&deploy, &defs).expect("resolve should succeed");
+        let provider_cfg = result
+            .providers
+            .get("minimal")
+            .expect("minimal should exist");
+        assert!(provider_cfg.error_map.is_empty());
     }
 }
