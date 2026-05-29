@@ -366,11 +366,6 @@ pub(crate) async fn forward(
     body: Bytes,
     caller_token: Option<&str>,
 ) -> Response {
-    eprintln!(
-        "[DEBUG forward START] cands={:?}, caller_token={:?}",
-        cands,
-        caller_token.is_some()
-    );
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -387,12 +382,7 @@ pub(crate) async fn forward(
     // The client must restart the request itself after receiving the error event.
 
     let attempts = cands.len() + 2;
-    eprintln!(
-        "[DEBUG forward] Starting loop, attempts={} cands={:?}",
-        attempts, cands
-    );
-    for attempt in 0..attempts {
-        eprintln!("[DEBUG forward] Attempt {}", attempt);
+    for _attempt in 0..attempts {
         let (i, permit) = match pick_among(&app, &cands).await {
             Some(x) => x,
             None => {
@@ -440,14 +430,6 @@ pub(crate) async fn forward(
                     // §6 caveat: passthrough 401/403 is caller's key failing, not busbar's
                     // Do NOT trip breaker / change member health; relay verbatim to caller
                     let auth_mode = app.auth_mode;
-                    eprintln!(
-                        "[DEBUG forward] status={}, auth_mode={:?}, is_passthrough_40x={}",
-                        status.as_u16(),
-                        auth_mode,
-                        auth_mode == crate::auth::AuthMode::Passthrough
-                            && (status == StatusCode::UNAUTHORIZED
-                                || status == StatusCode::FORBIDDEN)
-                    );
                     let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
                         && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
 
@@ -532,7 +514,6 @@ pub(crate) async fn forward(
         }
     }
 
-    eprintln!("[DEBUG forward] All attempts exhausted");
     (
         StatusCode::SERVICE_UNAVAILABLE,
         "router: all lanes exhausted",
