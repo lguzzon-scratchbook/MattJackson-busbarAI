@@ -36,14 +36,14 @@ per-circuit protection.
 cargo build --release
 
 # Configure (copy the example and edit)
-cp config.example.json config.json
+cp config.example.yaml config.yaml
 
 # Provider keys come from env vars named in the config (api_key_env)
 export ANTHROPIC_KEY=sk-ant-...
 export ZAI_KEY=...
 
 # Run
-BUSBAR_CONFIG=./config.json ./target/release/busbar
+BUSBAR_CONFIG=./config.yaml ./target/release/busbar
 ```
 
 ## API
@@ -62,7 +62,7 @@ credential — the caller's own model/key fields are ignored.
 
 ## Configuration
 
-See [`config.example.json`](config.example.json). Providers declare a `base_url`
+See [`config.example.yaml`](config.example.yaml). Providers declare a `base_url`
 and the **env var name** holding their key (keys are never stored in the config
 file). Models declare a `provider` and `max_concurrent`; pools are named lists of
 models whose concurrency caps stack into one aggregate.

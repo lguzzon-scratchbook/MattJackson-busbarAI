@@ -47,10 +47,25 @@ use state::App;
 
 #[tokio::main]
 async fn main() {
-    let path = std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.json".into());
-    let cfg: Cfg =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read BUSBAR_CONFIG"))
-            .expect("parse config");
+    let path = std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
+
+    let raw_content = std::fs::read_to_string(&path).expect("read BUSBAR_CONFIG");
+    let interpolated =
+        config::interpolate_env(&raw_content).expect("expand ${ENV} variables in config");
+    let cfg: Cfg = serde_yaml::from_str(&interpolated).expect("parse config YAML");
+
+    // Validate protocol against registered implementations
+    let registered_protocols: &[&str] = &["anthropic"];
+    for (provider_name, provider_cfg) in &cfg.providers {
+        if !registered_protocols.contains(&provider_cfg.protocol.as_str()) {
+            panic!(
+                "unknown protocol '{}' for provider '{}'; known: {}",
+                provider_cfg.protocol,
+                provider_name,
+                registered_protocols.join(", ")
+            );
+        }
+    }
 
     let mut lanes = Vec::new();
     let mut by_model = HashMap::new();
