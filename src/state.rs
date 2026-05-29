@@ -91,4 +91,5 @@ pub(crate) struct App {
     pub(crate) pools: HashMap<String, Vec<usize>>,
     pub(crate) rr: AtomicUsize,
     pub(crate) client: reqwest::Client,
+    pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
 }

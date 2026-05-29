@@ -27,6 +27,7 @@
 // v2: OpenAI-protocol providers (P4/A5500 /v1/chat/completions) need Anthropic
 // <-> OpenAI translation; not handled here. All v1 lanes are Anthropic-format.
 
+mod auth;
 mod config;
 mod forward;
 mod handlers;
@@ -41,6 +42,7 @@ use std::time::Duration;
 
 use axum::{routing::get, routing::post, Router};
 
+use auth::AuthMiddleware;
 use config::RootCfg;
 use proto::Protocol;
 use state::App;
@@ -53,6 +55,11 @@ async fn main() {
     let interpolated =
         config::interpolate_env(&raw_content).expect("expand ${ENV} variables in config");
     let cfg: RootCfg = serde_yaml::from_str(&interpolated).expect("parse config YAML");
+    let auth_cfg = cfg
+        .auth
+        .as_ref()
+        .map(|a| a.clone().normalize())
+        .unwrap_or_else(config::AuthCfg::default_none);
 
     // Validate protocol against registered implementations
     let registered_protocols: &[&str] = &["anthropic"];
@@ -145,6 +152,9 @@ async fn main() {
         );
     }
 
+    let listen = cfg.listen.clone();
+    let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
+
     let app = Arc::new(App {
         lanes,
         by_model,
@@ -155,15 +165,20 @@ async fn main() {
             .pool_max_idle_per_host(64)
             .build()
             .unwrap(),
+        auth: auth_mw,
     });
 
-    let listen = cfg.listen.clone();
     let router = Router::new()
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
         .route("/:name/v1/messages", post(route::named))
         .route("/:provider/:model/v1/messages", post(route::adhoc))
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            auth::auth_middleware,
+        ))
         .with_state(app);
+
     let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind");
     eprintln!("busbar listening on {listen}");
     axum::serve(listener, router).await.unwrap();

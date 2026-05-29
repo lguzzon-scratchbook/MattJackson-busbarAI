@@ -46,11 +46,39 @@ pub(crate) struct RootCfg {
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AuthCfg {
     #[serde(default = "default_auth_mode")]
     pub(crate) mode: String,
-    pub(crate) token: Option<String>,
+    #[deprecated(since = "0.1.0", note = "use client_tokens allowlist instead")]
+    #[serde(rename = "token", default)]
+    pub(crate) _legacy_token: Option<String>,
+    #[serde(default)]
+    pub(crate) client_tokens: Vec<String>,
+}
+
+impl AuthCfg {
+    /// Normalize legacy single-token format into allowlist.
+    #[allow(deprecated)] // accessing deprecated field for normalization logic
+    pub(crate) fn normalize(mut self) -> Self {
+        if let Some(tok) = self._legacy_token.take() {
+            // If client_tokens is empty and we have legacy token, promote it
+            if self.client_tokens.is_empty() {
+                self.client_tokens.push(tok);
+            }
+        }
+        self
+    }
+
+    /// Create a default AuthCfg for initialization.
+    #[allow(deprecated)] // accessing deprecated field in constructor
+    pub(crate) fn default_none() -> Self {
+        Self {
+            mode: "none".to_string(),
+            _legacy_token: None,
+            client_tokens: vec![],
+        }
+    }
 }
 
 fn default_auth_mode() -> String {
