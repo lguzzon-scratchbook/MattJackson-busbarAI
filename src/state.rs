@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Semaphore;
 
+use crate::proto::Protocol;
+
 const COOLDOWN_BASE_SECS: u64 = 15;
 const COOLDOWN_MAX_SECS: u64 = 120;
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
@@ -27,6 +29,7 @@ pub(crate) struct Lane {
     pub(crate) provider: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
+    pub(crate) protocol: Arc<dyn Protocol>,
     pub(crate) sem: Arc<Semaphore>,
     pub(crate) max: usize,
     pub(crate) limited: bool,

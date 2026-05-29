@@ -9,6 +9,12 @@ use serde::Deserialize;
 pub(crate) struct ProviderCfg {
     pub(crate) base_url: String,
     pub(crate) api_key_env: String,
+    #[serde(default = "default_protocol")]
+    pub(crate) protocol: String,
+}
+
+fn default_protocol() -> String {
+    "anthropic".to_string()
 }
 #[derive(Deserialize)]
 pub(crate) struct ModelCfg {

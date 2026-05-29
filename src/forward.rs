@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use axum::{body::Body, http::StatusCode, response::IntoResponse, response::Response};
-use serde_json::{json, Value};
+use axum::{body::Body, http::header::CONTENT_TYPE, response::IntoResponse, response::Response};
+use reqwest::StatusCode;
+use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::breaker::{classify, Verdict};
+use crate::proto::{convert_headers, CanonicalSignal};
 use crate::state::{now, App};
 
 async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, OwnedSemaphorePermit)> {
@@ -40,8 +42,7 @@ async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, OwnedSema
     Some((i, p))
 }
 
-use axum::{body::Bytes, http::header::CONTENT_TYPE};
-use std::sync::atomic::Ordering;
+use axum::body::Bytes;
 
 pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Response {
     let mut v: Value = match serde_json::from_slice(&body) {
@@ -58,16 +59,16 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                 return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane").into_response()
             }
         };
-        v["model"] = json!(app.lanes[i].model);
+        let proto = app.lanes[i].protocol.as_ref();
+        proto.rewrite_model(&mut v, &app.lanes[i].model);
         let payload = serde_json::to_vec(&v).unwrap();
-        let (base, key) = (app.lanes[i].base_url.clone(), app.lanes[i].api_key.clone());
+        let base = &app.lanes[i].base_url;
+        let key = &app.lanes[i].api_key;
         app.lanes[i].inflight.fetch_add(1, Ordering::Relaxed);
         let res = app
             .client
-            .post(format!("{base}/v1/messages"))
-            .header("x-api-key", &key)
-            .header("authorization", format!("Bearer {key}"))
-            .header("anthropic-version", "2023-06-01")
+            .post(format!("{base}{}", proto.upstream_path()))
+            .headers(convert_headers(proto.auth_headers(key)))
             .header(CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
@@ -83,29 +84,35 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                 let status = r.status();
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
                 let bytes = r.bytes().await.unwrap_or_default();
-                let text = String::from_utf8_lossy(&bytes);
-                match classify(status, &text) {
-                    Verdict::Billing => {
+                match proto.classify(status, &bytes) {
+                    CanonicalSignal {
+                        class: "billing", ..
+                    } => {
                         app.lanes[i].kill("billing / insufficient balance (1113)");
                         drop(permit);
                         continue;
                     }
-                    Verdict::Auth => {
+                    CanonicalSignal { class: "auth", .. } => {
                         app.lanes[i].kill(&format!("auth rejected (HTTP {})", status.as_u16()));
                         drop(permit);
                         continue;
                     }
-                    Verdict::RateLimit => {
+                    CanonicalSignal {
+                        class: "rate_limit",
+                        ..
+                    } => {
                         app.lanes[i].cooldown_rate_limit();
                         drop(permit);
                         continue;
                     }
-                    Verdict::Transient(w) => {
-                        app.lanes[i].cooldown_transient(w);
+                    CanonicalSignal {
+                        class: "transient", ..
+                    } => {
+                        app.lanes[i].cooldown_transient("5xx");
                         drop(permit);
                         continue;
                     }
-                    Verdict::Relay => {
+                    CanonicalSignal { class: "relay", .. } => {
                         if status.is_success() {
                             app.lanes[i].success();
                         }
@@ -114,6 +121,11 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                             rb = rb.header(CONTENT_TYPE, ct);
                         }
                         return rb.body(Body::from(bytes)).unwrap();
+                    }
+                    CanonicalSignal { class: _, .. } => {
+                        app.lanes[i].cooldown_transient("unknown");
+                        drop(permit);
+                        continue;
                     }
                 }
             }

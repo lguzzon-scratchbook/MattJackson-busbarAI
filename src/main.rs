@@ -27,10 +27,10 @@
 // v2: OpenAI-protocol providers (P4/A5500 /v1/chat/completions) need Anthropic
 // <-> OpenAI translation; not handled here. All v1 lanes are Anthropic-format.
 
-mod breaker;
 mod config;
 mod forward;
 mod handlers;
+mod proto;
 mod route;
 mod state;
 
@@ -42,6 +42,7 @@ use std::time::Duration;
 use axum::{routing::get, routing::post, Router};
 
 use config::Cfg;
+use proto::Protocol;
 use state::App;
 
 #[tokio::main]
@@ -66,12 +67,21 @@ async fn main() {
             );
         }
         let limited = mc.max_requests >= 0;
+        let proto: Arc<dyn Protocol> = if p.protocol == "anthropic" {
+            Arc::new(proto::AnthropicProtocol::new())
+        } else {
+            panic!(
+                "unknown protocol '{}' for provider {}",
+                p.protocol, mc.provider
+            );
+        };
         by_model.insert(model.clone(), lanes.len());
         lanes.push(state::Lane {
             model,
             provider: mc.provider,
             base_url: p.base_url.trim_end_matches('/').to_string(),
             api_key: key,
+            protocol: proto,
             sem: std::sync::Arc::new(tokio::sync::Semaphore::new(mc.max_concurrent)),
             max: mc.max_concurrent,
             limited,
