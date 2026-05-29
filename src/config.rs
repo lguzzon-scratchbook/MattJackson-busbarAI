@@ -96,7 +96,7 @@ pub(crate) struct ProviderCfg {
     pub(crate) health: Option<HealthCfg>,
     // Future fields (parse and be inert):
     #[serde(default, rename = "api_key")]
-    _legacy_api_key: Option<String>,
+    pub(crate) _legacy_api_key: Option<String>,
 }
 
 fn default_protocol() -> String {

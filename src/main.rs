@@ -29,6 +29,7 @@
 
 mod auth;
 mod config;
+mod config_validate;
 mod forward;
 mod handlers;
 mod proto;
@@ -63,17 +64,12 @@ async fn main() {
         .map(|a| a.clone().normalize())
         .unwrap_or_else(config::AuthCfg::default_none);
 
-    // Validate protocol against registered implementations
-    let registered_protocols: &[&str] = &["anthropic"];
-    for (provider_name, provider_cfg) in &cfg.providers {
-        if !registered_protocols.contains(&provider_cfg.protocol.as_str()) {
-            panic!(
-                "unknown protocol '{}' for provider '{}'; known: {}",
-                provider_cfg.protocol,
-                provider_name,
-                registered_protocols.join(", ")
-            );
+    // Validate configuration before building lanes
+    if let Err(validation_errors) = config_validate::validate(&cfg) {
+        for err in &validation_errors {
+            eprintln!("[error] {}", err);
         }
+        std::process::exit(1);
     }
 
     let mut lanes = Vec::new();
