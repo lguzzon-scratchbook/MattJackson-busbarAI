@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# NOTE: Cargo.lock IS committed for binaries (busbar is a bin) — do not ignore it.
+
+# Local runtime config & secrets (real config is mounted; keys come from env)
+config.json
+*.env
+.env
+.env.*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / scratch
+*.log

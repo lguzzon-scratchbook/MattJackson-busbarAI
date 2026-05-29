@@ -1,0 +1,19 @@
+{
+  "listen": "0.0.0.0:8080",
+
+  "providers": {
+    "z.ai":      { "base_url": "https://api.z.ai/api/anthropic", "api_key_env": "ZAI_KEY" },
+    "anthropic": { "base_url": "https://api.anthropic.com",      "api_key_env": "ANTHROPIC_KEY" }
+  },
+
+  "models": {
+    "glm-4.5": { "provider": "z.ai", "max_concurrent": 10 },
+    "glm-5.1": { "provider": "z.ai", "max_concurrent": 10 },
+    "glm-4.6": { "provider": "z.ai", "max_concurrent": 3 }
+  },
+
+  "pools": {
+    "glm":       ["glm-5.1", "glm-4.6", "glm-4.5"],
+    "hindsight": ["glm-5.1", "glm-4.6", "glm-4.5"]
+  }
+}
