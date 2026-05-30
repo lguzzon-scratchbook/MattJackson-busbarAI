@@ -13,11 +13,13 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: early / pre-1.0, in active development.** The shipping path
-> today is an Anthropic-format gateway with named/ad-hoc routing, round-robin
-> pools, and a circuit breaker. Weighted distribution, OpenAI ingress, and
-> cross-protocol failover are in progress. APIs and config may change before 1.0.
-> See [`docs/`](docs/) for the design and roadmap.
+> **Project status: pre-1.0 (targeting 0.9.0), in active development.** Working today:
+> **Anthropic and OpenAI ingress** (`/v1/messages` and `/v1/chat/completions`), named/ad-hoc
+> routing, **weighted** pools (smooth WRR) with failover + session affinity, a two-stage
+> **circuit breaker**, and **cross-protocol request translation** through a lossless superset
+> IR (e.g. an OpenAI-format request routed to an Anthropic backend). In progress: cross-protocol
+> **streaming response** translation. APIs and config may change before 1.0. See
+> [`docs/`](docs/) for the design and roadmap.
 
 ## Why Busbar
 
@@ -51,13 +53,17 @@ Clients append `/v1/messages` themselves, matching the Anthropic SDK.
 
 | Method · Route | Purpose |
 |---|---|
-| `POST /<name>/v1/messages` | `<name>` is a model (`/glm-4.6`) **or** a pool (`/glm`) |
+| `POST /<name>/v1/messages` | Anthropic-format ingress; `<name>` is a model (`/glm-4.6`) **or** a pool (`/glm`) |
 | `POST /<provider>/<model>/v1/messages` | ad-hoc direct route (`/z.ai/glm-4.6`) |
+| `POST /v1/chat/completions` | OpenAI-format ingress; the `model` field in the body selects the model/pool |
 | `GET /stats` | per-member health, counts, and pool membership (JSON) |
 | `GET /healthz` | `200` if any member is usable, else `503` |
 
-The router rewrites the request's `model` field and injects the provider's
-credential — the caller's own model/key fields are ignored.
+Clients use their native SDK: the Anthropic SDK appends `/v1/messages`, the OpenAI SDK appends
+`/v1/chat/completions`. When the chosen backend speaks a different protocol than the ingress,
+Busbar translates the request through its lossless superset IR. The router rewrites the
+request's `model` field and injects the provider's credential — the caller's own model/key
+fields are ignored.
 
 ## Configuration
 
