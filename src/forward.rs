@@ -302,10 +302,7 @@ where
                     Poll::Ready(Some(Ok(Bytes::from(sse_error))))
                 } else {
                     // Before first byte or non-SSE: propagate error (allows failover at caller level)
-                    Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))))
+                    Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))))
                 }
             }
 
@@ -363,11 +360,7 @@ impl RequestCtx {
 
     /// Remaining time until deadline in seconds.
     fn remaining(&self, now: u64) -> u64 {
-        if now >= self.deadline {
-            0
-        } else {
-            self.deadline - now
-        }
+        self.deadline.saturating_sub(now)
     }
 
     /// Add a lane to the exclusion set (mark as already tried).
