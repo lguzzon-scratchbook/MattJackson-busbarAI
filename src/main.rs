@@ -33,6 +33,7 @@ mod config;
 mod config_validate;
 mod forward;
 mod handlers;
+mod ir;
 mod proto;
 mod route;
 mod state;

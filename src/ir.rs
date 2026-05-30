@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Matthew Jackson
+
+//! ADR-0005 superset IR — request side only (B-502a). Response/stream IR is B-502b.
+
+use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) struct IrRequest {
+    pub system: Vec<IrBlock>,
+    pub messages: Vec<IrMessage>,
+    pub tools: Vec<IrTool>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub stream: bool,
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) struct IrMessage {
+    pub role: IrRole,
+    pub content: Vec<IrBlock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) enum IrRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) enum IrBlock {
+    Text {
+        text: String,
+        cache_control: Option<CacheControl>,
+        citations: Vec<Value>,
+    },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Vec<IrBlock>,
+        is_error: bool,
+    },
+    Image {
+        media_type: String,
+        data: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) struct CacheControl {
+    pub kind: CacheKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) enum CacheKind {
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Used by tests only (B-502a)
+pub(crate) struct IrTool {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}

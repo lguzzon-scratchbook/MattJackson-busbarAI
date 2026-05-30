@@ -24,7 +24,12 @@ pub(crate) trait ProtocolReader: Send + Sync {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError;
 
     /// Classify a response into a canonical signal (two-stage pipeline).
+    #[allow(dead_code)] // Used by B-502a/B-503
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal;
+
+    /// Read an IR request from wire JSON.
+    #[allow(dead_code)] // Used by B-502a/B-503
+    fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError>;
 }
 
 /// ProtocolWriter rewrites intents for the upstream wire format.
@@ -36,7 +41,12 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)>;
 
     /// Rewrites the model field in the request body.
+    #[allow(dead_code)] // Used by B-502a/B-503
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str);
+
+    /// Write an IR request to wire JSON.
+    #[allow(dead_code)] // Used by B-502a/B-503
+    fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value;
 }
 
 /// Bundled Protocol with name + reader + writer.
@@ -204,6 +214,393 @@ impl ProtocolReader for AnthropicReader {
             retry_after: None,
         }
     }
+
+    fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError> {
+        let obj = body.as_object().ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".to_string()),
+            retry_after: None,
+        })?;
+
+        let mut extra = serde_json::Map::new();
+        let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
+
+        // Handle system field (string or array)
+        if let Some(system_val) = obj.get("system") {
+            if system_val.is_string() {
+                let text = system_val.as_str().unwrap_or("").to_string();
+                system_blocks.push(crate::ir::IrBlock::Text {
+                    text,
+                    cache_control: None,
+                    citations: Vec::new(),
+                });
+            } else if system_val.is_array() {
+                for block_val in system_val.as_array().unwrap() {
+                    system_blocks.push(read_block(block_val)?);
+                }
+            }
+        }
+
+        // Handle messages array
+        let mut messages: Vec<crate::ir::IrMessage> = Vec::new();
+        if let Some(messages_val) = obj.get("messages") {
+            for msg_val in messages_val.as_array().unwrap_or(&Vec::new()) {
+                messages.push(read_message(msg_val)?);
+            }
+        }
+
+        // Handle tools array
+        let mut tools: Vec<crate::ir::IrTool> = Vec::new();
+        if let Some(tools_val) = obj.get("tools") {
+            for tool_val in tools_val.as_array().unwrap_or(&Vec::new()) {
+                tools.push(read_tool(tool_val)?);
+            }
+        }
+
+        // Extract scalar fields and extra
+        let max_tokens = obj
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let temperature = obj
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+        let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Collect unmodeled top-level keys into extra
+        let modeled_keys: std::collections::HashSet<&str> = [
+            "model",
+            "system",
+            "messages",
+            "tools",
+            "max_tokens",
+            "temperature",
+            "stream",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        for (key, value) in obj.iter() {
+            if !modeled_keys.contains(key.as_str()) {
+                extra.insert(key.clone(), value.clone());
+            }
+        }
+
+        Ok(crate::ir::IrRequest {
+            system: system_blocks,
+            messages,
+            tools,
+            max_tokens,
+            temperature,
+            stream,
+            extra,
+        })
+    }
+}
+
+// Helper functions for IR mapping (used by read_request/write_request)
+#[allow(dead_code)] // Used by tests only (B-502a)
+fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrError> {
+    let obj = block_val.as_object().ok_or(IrError {
+        class: StatusClass::ClientError,
+        provider_signal: Some("ir_parse".to_string()),
+        retry_after: None,
+    })?;
+
+    let block_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match block_type {
+        "text" => {
+            let text = obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Parse cache_control - object form: {"type": "ephemeral"}
+            let cache_control = if let Some(cc_val) = obj.get("cache_control") {
+                if let Some(cc_obj) = cc_val.as_object() {
+                    if let Some(cc_type) = cc_obj.get("type").and_then(|t| t.as_str()) {
+                        if cc_type == "ephemeral" {
+                            Some(crate::ir::CacheControl {
+                                kind: crate::ir::CacheKind::Ephemeral,
+                            })
+                        } else {
+                            return Err(IrError {
+                                class: StatusClass::ClientError,
+                                provider_signal: Some("ir_parse".to_string()),
+                                retry_after: None,
+                            });
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let citations = obj
+                .get("citations")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            Ok(crate::ir::IrBlock::Text {
+                text,
+                cache_control,
+                citations,
+            })
+        }
+        "thinking" => {
+            let text = obj
+                .get("thinking")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let signature = obj
+                .get("signature")
+                .and_then(|v| v.as_str().map(String::from));
+            Ok(crate::ir::IrBlock::Thinking { text, signature })
+        }
+        "tool_use" => {
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input = obj.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            Ok(crate::ir::IrBlock::ToolUse { id, name, input })
+        }
+        "tool_result" => {
+            let tool_use_id = obj
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let content_val = obj.get("content").unwrap_or(&serde_json::Value::Null);
+            let content = if content_val.is_array() {
+                content_val
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(read_block)
+                    .collect::<Result<_, _>>()?
+            } else {
+                vec![crate::ir::IrBlock::Text {
+                    text: content_val.as_str().unwrap_or("").to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }]
+            };
+            let is_error = obj
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok(crate::ir::IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            })
+        }
+        "image" => {
+            let source = obj.get("source").ok_or(IrError {
+                class: StatusClass::ClientError,
+                provider_signal: Some("ir_parse".to_string()),
+                retry_after: None,
+            })?;
+            if let Some(src_obj) = source.as_object() {
+                let media_type = src_obj
+                    .get("media_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let data = src_obj
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(crate::ir::IrBlock::Image { media_type, data })
+            } else {
+                Err(IrError {
+                    class: StatusClass::ClientError,
+                    provider_signal: Some("ir_parse".to_string()),
+                    retry_after: None,
+                })
+            }
+        }
+        _ => Err(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".to_string()),
+            retry_after: None,
+        }),
+    }
+}
+
+#[allow(dead_code)] // Used by tests only (B-502a)
+fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrError> {
+    let obj = msg_val.as_object().ok_or(IrError {
+        class: StatusClass::ClientError,
+        provider_signal: Some("ir_parse".to_string()),
+        retry_after: None,
+    })?;
+
+    let role_str = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let role = match role_str {
+        "user" => crate::ir::IrRole::User,
+        "assistant" => crate::ir::IrRole::Assistant,
+        "system" => crate::ir::IrRole::System,
+        _ => {
+            return Err(IrError {
+                class: StatusClass::ClientError,
+                provider_signal: Some("ir_parse".to_string()),
+                retry_after: None,
+            })
+        }
+    };
+
+    let content_val = obj.get("content").unwrap_or(&serde_json::Value::Null);
+    let content = if content_val.is_array() {
+        content_val
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(read_block)
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![crate::ir::IrBlock::Text {
+            text: content_val.as_str().unwrap_or("").to_string(),
+            cache_control: None,
+            citations: Vec::new(),
+        }]
+    };
+
+    Ok(crate::ir::IrMessage { role, content })
+}
+
+#[allow(dead_code)] // Used by tests only (B-502a)
+fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError> {
+    let obj = tool_val.as_object().ok_or(IrError {
+        class: StatusClass::ClientError,
+        provider_signal: Some("ir_parse".to_string()),
+        retry_after: None,
+    })?;
+
+    let name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let description = obj
+        .get("description")
+        .and_then(|v| v.as_str().map(String::from));
+    let input_schema = obj
+        .get("input_schema")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    Ok(crate::ir::IrTool {
+        name,
+        description,
+        input_schema,
+    })
+}
+
+#[allow(dead_code)] // Used by tests only (B-502a)
+fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
+    match block {
+        crate::ir::IrBlock::Text {
+            text,
+            cache_control,
+            citations,
+        } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".to_string(), serde_json::json!("text"));
+            obj.insert("text".to_string(), serde_json::json!(text));
+            if let Some(cc) = cache_control {
+                let cc_val = match cc.kind {
+                    crate::ir::CacheKind::Ephemeral => serde_json::json!({"type": "ephemeral"}),
+                };
+                obj.insert("cache_control".to_string(), cc_val);
+            }
+            if !citations.is_empty() {
+                obj.insert(
+                    "citations".to_string(),
+                    serde_json::Value::Array(citations.clone()),
+                );
+            }
+            serde_json::Value::Object(obj)
+        }
+        crate::ir::IrBlock::Thinking { text, signature } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".to_string(), serde_json::json!("thinking"));
+            obj.insert("thinking".to_string(), serde_json::json!(text));
+            if let Some(sig) = signature {
+                obj.insert("signature".to_string(), serde_json::json!(sig));
+            }
+            serde_json::Value::Object(obj)
+        }
+        crate::ir::IrBlock::ToolUse { id, name, input } => {
+            serde_json::json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+        }
+        crate::ir::IrBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".to_string(), serde_json::json!("tool_result"));
+            obj.insert("tool_use_id".to_string(), serde_json::json!(tool_use_id));
+            if content.is_empty() {
+                obj.insert("content".to_string(), serde_json::json!(""));
+            } else {
+                obj.insert(
+                    "content".to_string(),
+                    serde_json::Value::Array(content.iter().map(write_block).collect()),
+                );
+            }
+            if *is_error {
+                obj.insert("is_error".to_string(), serde_json::Value::Bool(true));
+            }
+            serde_json::Value::Object(obj)
+        }
+        crate::ir::IrBlock::Image { media_type, data } => {
+            serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } })
+        }
+    }
+}
+
+#[allow(dead_code)] // Used by tests only (B-502a)
+fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
+    let role_str = match msg.role {
+        crate::ir::IrRole::System => "system",
+        crate::ir::IrRole::User => "user",
+        crate::ir::IrRole::Assistant => "assistant",
+        crate::ir::IrRole::Tool => "tool_use",
+    };
+    let content_val: serde_json::Value = if msg.content.is_empty() {
+        serde_json::Value::String("".to_string())
+    } else {
+        serde_json::Value::Array(msg.content.iter().map(write_block).collect())
+    };
+    serde_json::json!({ "role": role_str, "content": content_val })
+}
+
+#[allow(dead_code)] // Used by tests only (B-502a)
+fn write_tool(tool: &crate::ir::IrTool) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_string(), serde_json::json!(tool.name));
+    if let Some(desc) = &tool.description {
+        obj.insert("description".to_string(), serde_json::json!(desc));
+    }
+    obj.insert("input_schema".to_string(), tool.input_schema.clone());
+    serde_json::Value::Object(obj)
 }
 
 /// Anthropic writer implementation (migrated from `Protocol::upstream_path`, `auth_headers`, `rewrite_model`).
@@ -236,6 +633,34 @@ impl ProtocolWriter for AnthropicWriter {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".to_string(), serde_json::json!(model));
         }
+    }
+
+    fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        if !req.system.is_empty() {
+            let system_array: Vec<_> = req.system.iter().map(write_block).collect();
+            out.insert("system".to_string(), serde_json::Value::Array(system_array));
+        }
+        let messages_array: Vec<_> = req.messages.iter().map(write_message).collect();
+        out.insert(
+            "messages".to_string(),
+            serde_json::Value::Array(messages_array),
+        );
+        if !req.tools.is_empty() {
+            let tools_array: Vec<_> = req.tools.iter().map(write_tool).collect();
+            out.insert("tools".to_string(), serde_json::Value::Array(tools_array));
+        }
+        if let Some(max_tokens) = req.max_tokens {
+            out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        }
+        if let Some(temperature) = req.temperature {
+            out.insert("temperature".to_string(), serde_json::json!(temperature));
+        }
+        out.insert("stream".to_string(), serde_json::json!(req.stream));
+        for (key, value) in &req.extra {
+            out.insert(key.clone(), value.clone());
+        }
+        serde_json::Value::Object(out)
     }
 }
 
@@ -276,6 +701,130 @@ pub(crate) fn convert_headers(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    fn rich_fixture() -> serde_json::Value {
+        // Use 0.7f32 as hex to ensure exact round-trip: f32::from_bits(0x3f333333) = 0.699999988...
+
+        serde_json::json!({
+            "system": [{"type": "text", "text": "You are a helpful assistant.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "What is the weather?"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}}]},
+                {"role": "assistant", "content": [{"type": "thinking", "thinking": "I need to analyze the weather...", "signature": "sig_abc123xyz"}, {"type": "tool_use", "id": "tool_1", "name": "get_weather", "input": {"location": "San Francisco"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool_1", "content": [{"type": "text", "text": "Sunny, 72°F"}]}]}
+            ],
+            "tools": [{"name": "get_weather", "description": "Get weather for a location", "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}],
+            "max_tokens": 4096,
+            "temperature": 0.699999988079071,
+            "stream": true,
+            "top_p": 0.95
+        })
+    }
+
+    #[test]
+    fn test_roundtrip_identity() {
+        let registry = ProtocolRegistry::with_builtins();
+        let protocol = registry.get("anthropic").expect("anthropic should exist");
+        let reader = protocol.reader();
+        let writer = protocol.writer();
+        let j = rich_fixture();
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+        let roundtrip = writer.write_request(&ir);
+        assert_eq!(
+            roundtrip, j,
+            "round-trip must be byte-identical on representable subset"
+        );
+    }
+
+    #[test]
+    fn test_signature_verbatim() {
+        let registry = ProtocolRegistry::with_builtins();
+        let protocol = registry.get("anthropic").expect("anthropic should exist");
+        let reader = protocol.reader();
+        let writer = protocol.writer();
+        let j = rich_fixture();
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+        let mut found_thinking = false;
+        for msg in &ir.messages {
+            if msg.role == crate::ir::IrRole::Assistant {
+                for block in &msg.content {
+                    if let crate::ir::IrBlock::Thinking { text: _, signature } = block {
+                        found_thinking = true;
+                        assert_eq!(signature.as_deref(), Some("sig_abc123xyz"));
+                    }
+                }
+            }
+        }
+        assert!(found_thinking);
+        let roundtrip = writer.write_request(&ir);
+        if let Some(msgs) = roundtrip.get("messages").and_then(|v| v.as_array()) {
+            for msg_val in msgs {
+                if let Some(content_arr) = msg_val.get("content").and_then(|v| v.as_array()) {
+                    for block_val in content_arr {
+                        if let Some(block_obj) = block_val.as_object() {
+                            if block_obj.get("type").and_then(|t| t.as_str()) == Some("thinking") {
+                                assert_eq!(
+                                    block_obj.get("signature").and_then(|s| s.as_str()),
+                                    Some("sig_abc123xyz")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cache_control_preserved() {
+        let registry = ProtocolRegistry::with_builtins();
+        let protocol = registry.get("anthropic").expect("anthropic should exist");
+        let reader = protocol.reader();
+        let writer = protocol.writer();
+        let j = rich_fixture();
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+        assert!(!ir.system.is_empty());
+        if let crate::ir::IrBlock::Text {
+            text: _,
+            cache_control,
+            citations: _,
+        } = &ir.system[0]
+        {
+            assert!(cache_control.is_some());
+            match cache_control.as_ref().unwrap().kind {
+                crate::ir::CacheKind::Ephemeral => {}
+            };
+        }
+        let roundtrip = writer.write_request(&ir);
+        if let Some(system_arr) = roundtrip.get("system").and_then(|v| v.as_array()) {
+            if let Some(first_block) = system_arr.first() {
+                assert!(first_block
+                    .as_object()
+                    .unwrap()
+                    .contains_key("cache_control"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_extra_passthrough() {
+        let registry = ProtocolRegistry::with_builtins();
+        let protocol = registry.get("anthropic").expect("anthropic should exist");
+        let reader = protocol.reader();
+        let writer = protocol.writer();
+        let j = rich_fixture();
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+        assert!(ir.extra.contains_key("top_p"));
+        let roundtrip = writer.write_request(&ir);
+        assert!(roundtrip.as_object().unwrap().contains_key("top_p"));
+    }
 
     #[test]
     fn test_registry_resolves_anthropic() {
