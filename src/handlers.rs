@@ -39,10 +39,13 @@ pub(crate) async fn stats(State(app): State<Arc<App>>) -> Response {
     let pools: HashMap<&String, Vec<&str>> = app
         .pools
         .iter()
-        .map(|(n, idx)| {
+        .map(|(n, weighted_lanes)| {
             (
                 n,
-                idx.iter().map(|&i| app.lanes[i].model.as_str()).collect(),
+                weighted_lanes
+                    .iter()
+                    .map(|wl| app.lanes[wl.idx].model.as_str())
+                    .collect(),
             )
         })
         .collect();

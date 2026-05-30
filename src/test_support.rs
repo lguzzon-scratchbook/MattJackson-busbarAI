@@ -370,7 +370,10 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+        )]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
@@ -388,7 +391,13 @@ mod tests {
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+        let response = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(response.status().as_u16(), 200);
 
         use http_body_util::BodyExt as _;
@@ -439,7 +448,10 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+        )]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
@@ -457,7 +469,13 @@ mod tests {
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+        let response = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -516,7 +534,10 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+        )]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
@@ -535,7 +556,13 @@ mod tests {
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         assert_eq!(sem.available_permits(), 1);
-        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+        let response = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(response.status().as_u16(), 200);
         assert!(sem.clone().try_acquire_owned().is_err());
 
@@ -630,7 +657,13 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
         let app = Arc::new(App {
@@ -650,7 +683,16 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Should failover from lane 0 (error) to lane 1 (success)
-        let response = forward(app.clone(), vec![0, 1], req_body.into(), None).await;
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(response.status().as_u16(), 200);
 
         let t = now();
@@ -744,7 +786,13 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
         let app = Arc::new(App {
@@ -764,7 +812,16 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Consume response body fully
-        let response = forward(app.clone(), vec![0, 1], req_body.into(), None).await;
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(response.status().as_u16(), 200);
 
         use http_body_util::BodyExt as _;
@@ -849,7 +906,10 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+        )]);
         let auth_cfg_passthrough = AuthCfg {
             mode: "passthrough".to_string(),
             client_tokens: vec![],
@@ -872,7 +932,13 @@ mod tests {
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        let response = forward(app_passthrough.clone(), vec![0], req_body.into(), None).await;
+        let response = forward(
+            app_passthrough.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(
             response.status().as_u16(),
             401,
@@ -947,7 +1013,13 @@ mod tests {
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        let response = forward(app_token.clone(), vec![0], req_body.into(), None).await;
+        let response = forward(
+            app_token.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(
             response.status().as_u16(),
             401,
@@ -1012,7 +1084,10 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+        )]);
         let auth_cfg_passthrough = AuthCfg {
             mode: "passthrough".to_string(),
             client_tokens: vec![],
@@ -1041,7 +1116,7 @@ mod tests {
         // Forward with caller's token (simulating what auth middleware would extract)
         let response = forward(
             app.clone(),
-            vec![0],
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
             Some(caller_bearer_token),
         )
@@ -1226,7 +1301,10 @@ mod tests {
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+        )]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
@@ -1246,7 +1324,13 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Forward request (tap integrated in FirstByteBody)
-        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+        let response = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+        )
+        .await;
         assert_eq!(response.status().as_u16(), 200);
 
         use http_body_util::BodyExt as _;
@@ -1420,7 +1504,10 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -1438,7 +1525,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // Should return 400 verbatim (ClientFault → relay)
             assert_eq!(response.status().as_u16(), 400);
@@ -1501,7 +1594,10 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -1519,7 +1615,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let _response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // Lane hard-down (billing)
             let t = now();
@@ -1581,7 +1683,10 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -1599,7 +1704,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let _response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // TransientUpstream → cooldown + err counter incremented
             let t = now();
@@ -1659,7 +1770,10 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -1677,7 +1791,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let _response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // TransientUpstream via HTTP status classification (429 → RateLimit)
             let t = now();
@@ -1738,7 +1858,10 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -1756,7 +1879,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let _response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // TransientUpstream (5xx → ServerError)
             let t = now();
@@ -1817,7 +1946,10 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -1835,7 +1967,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let _response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // HardDown (401 → Auth)
             let t = now();
@@ -1942,7 +2080,10 @@ mod tests {
 
             let setup_app = |lane_data: LaneData, lane: Lane, _error_map_name: &str| {
                 let by_model = HashMap::from([("test-model".to_string(), 0)]);
-                let pools = HashMap::from([("default".to_string(), vec![0])]);
+                let pools = HashMap::from([(
+                    "default".to_string(),
+                    vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                )]);
                 let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
                 let store = Arc::new(InMemoryStore::new(vec![lane_data]));
                 Arc::new(App {
@@ -1964,7 +2105,13 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
             // Lane 1 with error_map: code 1113 → billing → HardDown
-            let _response_1 = forward(app_1.clone(), vec![0], req_body.clone().into(), None).await;
+            let _response_1 = forward(
+                app_1.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.clone().into(),
+                None,
+            )
+            .await;
             let t = now();
             assert!(
                 !app_1.store.usable(0, t),
@@ -1973,7 +2120,13 @@ mod tests {
 
             // Lane 2 without mapping: HTTP 400 → ClientFault → no trip
             let app_2 = setup_app(lane_data_2, lane_2, "without mapping");
-            let _response_2 = forward(app_2.clone(), vec![0], req_body.into(), None).await;
+            let _response_2 = forward(
+                app_2.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
             assert!(
                 app_2.store.usable(0, t),
                 "Lane 2 (no error_map) should remain usable after ClientFault"
@@ -2131,7 +2284,10 @@ mod tests {
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
 
-            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data]));
             let app = Arc::new(App {
@@ -2149,7 +2305,13 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+            let response = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // Status should be relayed verbatim as 400
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2250,7 +2412,13 @@ mod tests {
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
+            let pools = HashMap::from([(
+                "default".to_string(),
+                vec![
+                    crate::state::WeightedLane { idx: 0, weight: 1 },
+                    crate::state::WeightedLane { idx: 1, weight: 1 },
+                ],
+            )]);
             let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
             let store = Arc::new(InMemoryStore::new(vec![lane_data_0, lane_data_1]));
             let app = Arc::new(App {
@@ -2268,7 +2436,16 @@ mod tests {
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let response = forward(app.clone(), vec![0, 1], req_body.into(), None).await;
+            let response = forward(
+                app.clone(),
+                vec![
+                    crate::state::WeightedLane { idx: 0, weight: 1 },
+                    crate::state::WeightedLane { idx: 1, weight: 1 },
+                ],
+                req_body.into(),
+                None,
+            )
+            .await;
 
             // Should get 400 from lane 0
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);

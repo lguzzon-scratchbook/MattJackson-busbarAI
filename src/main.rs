@@ -48,7 +48,7 @@ use std::time::Duration;
 use axum::{routing::get, routing::post, Router};
 
 use auth::AuthMiddleware;
-use state::{App, Lane, ProtocolKind};
+use state::{App, Lane, ProtocolKind, WeightedLane};
 use store::{InMemoryStore, LaneData};
 
 #[tokio::main]
@@ -154,26 +154,33 @@ async fn main() {
 
     let mut pools = HashMap::new();
     for (name, pool) in cfg.pools {
-        let members: Vec<String> = pool.members.iter().map(|m| m.target.clone()).collect();
-        let idx: Vec<usize> = members
+        // Wire per-member weights from config into the pool structure (B-401).
+        // Each pool member has a weight; default is 1 if not specified.
+        let weighted_members: Vec<WeightedLane> = pool
+            .members
             .iter()
             .map(|m| {
-                *by_model
-                    .get(m)
-                    .unwrap_or_else(|| panic!("pool {name} references unknown model {m}"))
+                let lane_idx = *by_model
+                    .get(&m.target)
+                    .unwrap_or_else(|| panic!("pool {name} references unknown model {}", m.target));
+                WeightedLane {
+                    idx: lane_idx,
+                    weight: m.weight, // from config PoolMember.weight (default 1)
+                }
             })
             .collect();
-        pools.insert(name, idx);
+        pools.insert(name, weighted_members);
     }
 
     eprintln!("busbar: {} models, {} pools", lanes.len(), pools.len());
-    for (n, idx) in &pools {
-        let agg: usize = idx.iter().map(|&i| lanes[i].max).sum();
+    for (n, wl_vec) in &pools {
+        let agg: usize = wl_vec.iter().map(|wl| lanes[wl.idx].max).sum();
         eprintln!(
             "  pool /{} = [{}] aggregate {}",
             n,
-            idx.iter()
-                .map(|&i| lanes[i].model.clone())
+            wl_vec
+                .iter()
+                .map(|wl| lanes[wl.idx].model.clone())
                 .collect::<Vec<_>>()
                 .join(", "),
             agg

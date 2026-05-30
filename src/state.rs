@@ -72,11 +72,21 @@ impl ProtocolKind {
     }
 }
 
+/// A pool lane with its associated weight (B-401).
+#[derive(Clone)]
+pub(crate) struct WeightedLane {
+    pub(crate) idx: usize,  // index into lanes array
+    pub(crate) weight: u32, // member weight from config
+}
+
 pub(crate) struct App {
     pub(crate) lanes: Vec<Lane>,
     pub(crate) store: Arc<dyn StateStore>,
     pub(crate) by_model: HashMap<String, usize>,
-    pub(crate) pools: HashMap<String, Vec<usize>>,
+    /// Pools now carry weights alongside lane indices (B-401).
+    pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
+    /// Round-robin counter - no longer used after B-401 but kept for potential fallback.
+    #[allow(dead_code)] // No longer used; SWRR handles selection
     pub(crate) rr: AtomicUsize,
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,

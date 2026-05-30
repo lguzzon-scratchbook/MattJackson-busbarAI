@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::breaker::{classify as classify_disposition, normalize_raw_error, Disposition};
 use crate::proto::{convert_headers, StatusClass};
-use crate::state::App;
+use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
 /// B-203: Non-buffering stream inspection tap for Anthropic SSE usage parsing.
@@ -332,46 +332,35 @@ impl<S, P> FirstByteBody<S, P> {
     }
 }
 
-async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, Permit)> {
+/// B-401: pick_among using weighted selection (SWRR) over healthy subset.
+/// `cands` is now Vec<WeightedLane> where each lane has its weight from config.
+async fn pick_among(app: &Arc<App>, cands: &[WeightedLane]) -> Option<(usize, Permit)> {
     let t = now();
-    let usable: Vec<usize> = cands
-        .iter()
-        .copied()
-        .filter(|&i| app.store.usable(i, t))
-        .collect();
-    if usable.is_empty() {
-        return None;
+
+    // Extract lane indices and weights for select_weighted call
+    let candidates: Vec<usize> = cands.iter().map(|wl| wl.idx).collect();
+    let weights: Vec<u32> = cands.iter().map(|wl| wl.weight).collect();
+
+    // Use SWRR selection over healthy members only (B-401)
+    let picked_lane_idx = app.store.select_weighted(&candidates, &weights, t)?;
+
+    // Try to acquire the selected lane immediately
+    if let Some(p) = app.store.try_acquire(picked_lane_idx) {
+        return Some((picked_lane_idx, p));
     }
-    let start = app.rr.fetch_add(1, Ordering::Relaxed);
-    let order: Vec<usize> = (0..usable.len())
-        .map(|k| usable[(start + k) % usable.len()])
-        .collect();
-    for &i in &order {
-        if let Some(p) = app.store.try_acquire(i) {
-            return Some((i, p));
+
+    // If acquisition fails, await until first free (concurrency-aware fallback)
+    loop {
+        if let Some(p) = app.store.try_acquire(picked_lane_idx) {
+            return Some((picked_lane_idx, p));
         }
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
     }
-    let futs: Vec<_> = order
-        .iter()
-        .map(|&i| {
-            let store = app.store.clone();
-            Box::pin(async move {
-                loop {
-                    if let Some(p) = store.try_acquire(i) {
-                        return (i, p);
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
-            })
-        })
-        .collect();
-    let ((i, p), _, _) = futures::future::select_all(futs).await;
-    Some((i, p))
 }
 
 pub(crate) async fn forward(
     app: Arc<App>,
-    cands: Vec<usize>,
+    cands: Vec<WeightedLane>,
     body: Bytes,
     caller_token: Option<&str>,
 ) -> Response {

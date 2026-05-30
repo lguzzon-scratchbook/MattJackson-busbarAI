@@ -11,7 +11,7 @@ use axum::{
 };
 
 use crate::forward::forward;
-use crate::state::App;
+use crate::state::{App, WeightedLane};
 
 // POST /<name>/v1/messages   — name resolves to a pool (round-robin) or a single model
 pub(crate) async fn named(
@@ -24,10 +24,17 @@ pub(crate) async fn named(
     let _caller_token = None;
 
     if let Some(cands) = app.pools.get(&name) {
+        // Convert WeightedLane vec to match forward signature (already same type now)
         return forward(app.clone(), cands.clone(), body, _caller_token).await;
     }
     if let Some(&i) = app.by_model.get(&name) {
-        return forward(app.clone(), vec![i], body, _caller_token).await;
+        return forward(
+            app.clone(),
+            vec![WeightedLane { idx: i, weight: 1 }],
+            body,
+            _caller_token,
+        )
+        .await;
     }
 
     (
@@ -47,7 +54,14 @@ pub(crate) async fn adhoc(
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {
-            forward(app.clone(), vec![i], body, _caller_token).await
+            // Single lane with weight=1 (default for ad-hoc routing)
+            forward(
+                app.clone(),
+                vec![WeightedLane { idx: i, weight: 1 }],
+                body,
+                _caller_token,
+            )
+            .await
         }
         Some(&i) => (
             StatusCode::BAD_REQUEST,

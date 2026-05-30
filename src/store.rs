@@ -118,6 +118,13 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     #[allow(dead_code)] // Used for future budget tracking
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
+    // weighted member selection (B-401 SWRR algorithm)
+    /// Select a candidate from the given list using smooth weighted round-robin over healthy members.
+    /// `candidates` are indices into the store's lane array.
+    /// `weights` is the per-member weight for each candidate (must match candidates length).
+    /// Returns None if no healthy members or all candidates are unusable.
+    fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize>;
+
     // stats snapshot for /stats
     fn snapshot(&self, lane: usize, now: u64) -> LaneSnapshot;
 }
@@ -186,6 +193,8 @@ struct LaneState {
     breaker_state: AtomicU64, // 0=Closed, 1=Open, 2=HalfOpen (stored as u64 for CAS)
     probe_in_flight: AtomicBool,
     outcome_window: std::sync::Mutex<OutcomeWindow>,
+    // SWRR state per lane (B-401)
+    current_weight: AtomicI64,
 }
 
 impl InMemoryStore {
@@ -211,6 +220,7 @@ impl InMemoryStore {
                     breaker_state: AtomicU64::new(0), // Closed
                     probe_in_flight: AtomicBool::new(false),
                     outcome_window: std::sync::Mutex::new(OutcomeWindow::new(1024)),
+                    current_weight: AtomicI64::new(0),
                 })
             })
             .collect();
@@ -392,6 +402,28 @@ pub(crate) struct LaneData {
     pub ok: u64,
     pub err: u64,
     pub client_fault: u64,
+}
+
+/// Helper for weighted selection tests - creates a lane with specific weight.
+#[cfg(test)]
+fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) {
+    let lane = LaneData {
+        model: format!("model-{}", id),
+        provider: format!("provider-{}", id),
+        max: max_permits,
+        sem: Arc::new(Semaphore::new(max_permits)),
+        limited: false,
+        budget: -1,
+        cooldown_until: 0,
+        streak: 0,
+        dead: false,
+        dead_reason: String::new(),
+        inflight: 0,
+        ok: 0,
+        err: 0,
+        client_fault: 0,
+    };
+    (lane, (id as u32) + 1) // weight = id + 1 (so lane 0 has weight 1, lane 1 has weight 2, etc.)
 }
 
 /// Breaker configuration per pool.
@@ -693,6 +725,52 @@ impl StateStore for InMemoryStore {
                 -1
             },
         }
+    }
+
+    // B-401: SWRR selection over healthy subset (ADR-0001 algorithm)
+    fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize> {
+        // Filter to usable members only and build (lane_idx, effective_weight) pairs
+        let mut healthy: Vec<(usize, i64)> = Vec::with_capacity(candidates.len());
+        for (&candidate, &weight) in candidates.iter().zip(weights.iter()) {
+            if self.usable(candidate, now) {
+                healthy.push((candidate, weight as i64));
+            }
+        }
+
+        if healthy.is_empty() {
+            return None; // No healthy members -> pool exhaustion (B-403 handles this)
+        }
+
+        // SWRR algorithm over healthy subset only (ADR-0001):
+        // total = Σ effective_weight_i (healthy members only)
+        let total: i64 = healthy.iter().map(|(_, w)| *w).sum();
+
+        // for each healthy i: current_weight_i += effective_weight_i
+        for &(lane_idx, eff_wt) in &healthy {
+            let ls = self.get_lane(lane_idx);
+            ls.current_weight.fetch_add(eff_wt, Ordering::Relaxed);
+        }
+
+        // pick = argmax_i(current_weight_i) over healthy members
+        let mut best_lane: Option<usize> = None;
+        let mut best_weight: i64 = i64::MIN;
+
+        for &(lane_idx, _) in &healthy {
+            let ls = self.get_lane(lane_idx);
+            let cw = ls.current_weight.load(Ordering::Relaxed);
+            if cw > best_weight {
+                best_weight = cw;
+                best_lane = Some(lane_idx);
+            }
+        }
+
+        // current_weight_pick -= total for the picked member
+        if let Some(pick) = best_lane {
+            let ls = self.get_lane(pick);
+            ls.current_weight.fetch_sub(total, Ordering::Relaxed);
+        }
+
+        best_lane
     }
 }
 
@@ -1337,6 +1415,139 @@ mod tests {
         assert!(
             until >= 50060,
             "record_transient should honor retry_after as cooldown floor (got {until})"
+        );
+    }
+
+    // B-401: SWRR convergence test - 3-member pool with weights 1/2/3 should distribute exactly in that ratio
+    #[test]
+    fn test_swrr_convergence_1_2_3() {
+        let (lane0, w0) = make_lane_data_with_weight(0, 10);
+        let (lane1, w1) = make_lane_data_with_weight(1, 10);
+        let (lane2, w2) = make_lane_data_with_weight(2, 3);
+
+        // Weights are: lane 0 -> 1, lane 1 -> 2, lane 2 -> 3
+        let store = Arc::new(InMemoryStore::new(vec![lane0, lane1, lane2]));
+        set_now_for_test(1000);
+
+        // Run SWRR selection many times and count distribution
+        let candidates: Vec<usize> = vec![0, 1, 2];
+        let weights: Vec<u32> = vec![w0, w1, w2];
+
+        let mut counts = [0usize; 3];
+        const N: usize = 600; // Should give exactly 1:2:3 distribution (6 per cycle)
+
+        for _ in 0..N {
+            let picked = store.select_weighted(&candidates, &weights, 1000).unwrap();
+            counts[picked] += 1;
+        }
+
+        // With SWRR over weights [1,2,3], sum=6: each cycle of 6 picks gives 1+2+3=6
+        // N=600 means exactly 100 cycles, so expected: lane0=100, lane1=200, lane2=300
+        assert_eq!(
+            counts[0], 100,
+            "member 0 (weight 1) should be picked ~100 times"
+        );
+        assert_eq!(
+            counts[1], 200,
+            "member 1 (weight 2) should be picked ~200 times"
+        );
+        assert_eq!(
+            counts[2], 300,
+            "member 2 (weight 3) should be picked ~300 times"
+        );
+
+        // Verify total equals N
+        let total: usize = counts.iter().sum();
+        assert_eq!(total, N, "total picks should equal N");
+    }
+
+    // B-401: Rebalance on trip - when member 0 trips (Open), distribution should renormalize to survivors
+    #[test]
+    fn test_swrr_rebalance_on_trip() {
+        let (lane0, w0) = make_lane_data_with_weight(0, 10);
+        let (lane1, w1) = make_lane_data_with_weight(1, 3);
+
+        let store = Arc::new(InMemoryStore::new(vec![lane0, lane1]));
+        set_now_for_test(1000);
+
+        // Put member 0 in Open state (tripped)
+        store.get_lane(0).breaker_state.store(1, Ordering::Relaxed); // Open
+        store
+            .get_lane(0)
+            .cooldown_until
+            .store(u64::MAX, Ordering::Relaxed);
+
+        let candidates: Vec<usize> = vec![0, 1];
+        let weights: Vec<u32> = vec![w0, w1];
+
+        // All picks should go to member 1 since member 0 is Open/unusable
+        for _ in 0..100 {
+            let picked = store.select_weighted(&candidates, &weights, 1000).unwrap();
+            assert_eq!(picked, 1, "tripped member 0 should never be selected");
+        }
+
+        // Verify member 0 is not usable
+        assert!(
+            !store.usable(0, 1000),
+            "member 0 in Open state should not be usable"
+        );
+    }
+
+    // B-401: No Open selection - verify select_weighted never returns an unusable member
+    #[test]
+    fn test_swrr_no_open_selection() {
+        let (lane0, w0) = make_lane_data_with_weight(0, 10);
+        let (lane1, w1) = make_lane_data_with_weight(1, 10);
+        let (lane2, w2) = make_lane_data_with_weight(2, 3);
+
+        let store = Arc::new(InMemoryStore::new(vec![lane0, lane1, lane2]));
+        set_now_for_test(1000);
+
+        // Put member 1 in Open state
+        store.get_lane(1).breaker_state.store(1, Ordering::Relaxed);
+        store
+            .get_lane(1)
+            .cooldown_until
+            .store(u64::MAX, Ordering::Relaxed);
+
+        let candidates: Vec<usize> = vec![0, 1, 2];
+        let weights: Vec<u32> = vec![w0, w1, w2];
+
+        // Run many selections and verify member 1 is never picked while Open
+        for _ in 0..500 {
+            if let Some(picked) = store.select_weighted(&candidates, &weights, 1000) {
+                assert_ne!(picked, 1, "Open member should never be selected");
+            }
+        }
+
+        // Member 0 and 2 should both get picked (renormalized to 10:3 ratio)
+    }
+
+    // B-401: All-down - when every member is Open, select_weighted returns None
+    #[test]
+    fn test_swrr_all_down_returns_none() {
+        let (lane0, w0) = make_lane_data_with_weight(0, 10);
+        let (lane1, w1) = make_lane_data_with_weight(1, 3);
+
+        let store = Arc::new(InMemoryStore::new(vec![lane0, lane1]));
+        set_now_for_test(1000);
+
+        // Put all members in Open state
+        for i in 0..2 {
+            store.get_lane(i).breaker_state.store(1, Ordering::Relaxed);
+            store
+                .get_lane(i)
+                .cooldown_until
+                .store(u64::MAX, Ordering::Relaxed);
+        }
+
+        let candidates: Vec<usize> = vec![0, 1];
+        let weights: Vec<u32> = vec![w0, w1];
+
+        // Should return None when no healthy members
+        assert!(
+            store.select_weighted(&candidates, &weights, 1000).is_none(),
+            "select_weighted should return None when all members are Open"
         );
     }
 }
