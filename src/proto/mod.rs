@@ -298,8 +298,34 @@ mod gemini;
 mod openai;
 
 pub(crate) use anthropic::{AnthropicReader, AnthropicWriter};
-pub(crate) use gemini::{GeminiReader, GeminiWriter, ProtocolRegistry};
+pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
+
+/// String-keyed registry for protocol lookup (ADR-0008). Shared infrastructure: lives in the
+/// proto module root, not any single protocol's file. `with_builtins` registers every protocol.
+#[derive(Default)]
+#[allow(dead_code)] // Scaffolding: not wired into App/Lane yet (B-501)
+pub(crate) struct ProtocolRegistry {
+    map: std::collections::HashMap<String, Arc<Protocol>>,
+}
+
+impl ProtocolRegistry {
+    /// Create a new registry with built-in protocols.
+    #[allow(dead_code)] // Used by B-501 for provider resolution
+    pub(crate) fn with_builtins() -> Self {
+        let mut map = std::collections::HashMap::new();
+        map.insert("anthropic".to_string(), Arc::new(Protocol::anthropic()));
+        map.insert("openai".to_string(), Arc::new(Protocol::openai()));
+        map.insert("gemini".to_string(), Arc::new(Protocol::gemini()));
+        Self { map }
+    }
+
+    /// Get a protocol by name.
+    #[allow(dead_code)] // Used by B-501 for provider resolution
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<Protocol>> {
+        self.map.get(name).cloned()
+    }
+}
 
 pub(crate) fn convert_headers(
     headers: Vec<(HeaderName, HeaderValue)>,
