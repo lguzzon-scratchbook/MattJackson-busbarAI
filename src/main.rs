@@ -211,6 +211,31 @@ async fn main() {
                 cap: 3,
             }));
 
+    // B-403: Build fallback_pools map (same as pools for now; can diverge later)
+    let fallback_pools = pools.clone();
+
+    // B-403: Parse on_exhausted configs per pool
+    let mut on_exhausted_cfgs = std::collections::HashMap::new();
+    for (pool_name, pool_cfg) in &cfg.pools {
+        if let Some(ref on_exc) = pool_cfg.on_exhausted {
+            match crate::config::OnExhausted::parse(&on_exc.action) {
+                Ok(mode) => {
+                    eprintln!("  pool /{}: on_exhausted = {:?}", pool_name, mode);
+                    on_exhausted_cfgs.insert(pool_name.clone(), mode);
+                }
+                Err(e) => {
+                    panic!(
+                        "pool '{}' has invalid on_exhausted action '{}': {}",
+                        pool_name, on_exc.action, e
+                    );
+                }
+            }
+        } else {
+            // Default to Status503 if not specified
+            on_exhausted_cfgs.insert(pool_name.clone(), crate::config::OnExhausted::Status503);
+        }
+    }
+
     let app = Arc::new(App {
         lanes,
         store,
@@ -225,6 +250,8 @@ async fn main() {
         auth: auth_mw.clone(),
         auth_mode: auth_mw.mode,
         failover_cfg,
+        fallback_pools,
+        on_exhausted_cfgs,
     });
 
     let router = Router::new()

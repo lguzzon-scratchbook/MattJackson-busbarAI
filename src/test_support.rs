@@ -241,7 +241,6 @@ mod tests {
     use crate::state::{now, App, Lane, ProtocolKind};
     use crate::store::{InMemoryStore, LaneData};
 
-
     use reqwest::Client;
     use serde_json::json;
     use std::collections::HashMap;
@@ -391,6 +390,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -470,6 +471,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -557,6 +560,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -684,6 +689,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -814,6 +821,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -937,6 +946,8 @@ mod tests {
             auth: auth_mw_passthrough,
             auth_mode: crate::auth::AuthMode::Passthrough,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1019,6 +1030,8 @@ mod tests {
             auth: auth_mw_token,
             auth_mode: crate::auth::AuthMode::Token,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1117,6 +1130,8 @@ mod tests {
             auth: auth_mw,
             auth_mode: crate::auth::AuthMode::Passthrough,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         // Caller's Bearer token (NOT busbar's key)
@@ -1243,6 +1258,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1404,6 +1421,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1541,6 +1560,8 @@ mod tests {
                 exclusions: None,
                 cap: 3,
             }),
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1746,6 +1767,8 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1950,6 +1973,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2041,6 +2066,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2131,6 +2158,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2219,6 +2248,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2308,6 +2339,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2397,6 +2430,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2532,6 +2567,8 @@ mod tests {
                     auth,
                     auth_mode: crate::auth::AuthMode::None,
                     failover_cfg: None,
+                    fallback_pools: HashMap::new(),
+                    on_exhausted_cfgs: HashMap::new(),
                 })
             };
 
@@ -2737,6 +2774,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2869,6 +2908,8 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                fallback_pools: HashMap::new(),
+                on_exhausted_cfgs: HashMap::new(),
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();

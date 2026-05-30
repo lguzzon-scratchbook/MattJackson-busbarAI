@@ -261,6 +261,84 @@ fn default_on_exhausted_action() -> String {
     "reject".to_string()
 }
 
+/// Pool exhaustion mode configuration.
+/// Maps from config string `action` field to executable behavior when all members are tripped/excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OnExhausted {
+    /// Status503: return 503 Service Unavailable with Retry-After header
+    /// set to the soonest member's cooldown expiry.
+    Status503,
+    /// FallbackPool(name): route to a configured fallback pool by name.
+    /// Guard against loops via depth cap (max 1) or visited pool tracking.
+    FallbackPool(String),
+    /// LeastBad: send to the member with soonest cooldown expiry even though Open.
+    /// Log loudly that this is a degraded path.
+    LeastBad,
+}
+
+impl OnExhausted {
+    /// Parse an action string from config into an OnExhausted variant.
+    /// Returns Err(String) for unknown actions - NO bare _ => allowed.
+    pub(crate) fn parse(action: &str) -> Result<Self, String> {
+        match action {
+            "reject" | "503" | "status_503" => Ok(OnExhausted::Status503),
+            "fallback_pool" => Err("fallback_pool requires a pool name argument".into()),
+            "least_bad" | "least-bad" | "leastbad" => Ok(OnExhausted::LeastBad),
+            // FallbackPool with name - parse as "fallback_pool:<pool_name>" format
+            s if s.starts_with("fallback_pool:") => {
+                let pool_name = &s["fallback_pool:".len()..];
+                if pool_name.is_empty() {
+                    Err("fallback_pool requires a non-empty pool name".into())
+                } else {
+                    Ok(OnExhausted::FallbackPool(pool_name.to_string()))
+                }
+            }
+            // Explicit handling of common typos/variants for clarity
+            "status503" => Ok(OnExhausted::Status503),
+            "fallback" | "failover" => Err(format!(
+                "'{}' is not a valid on_exhausted action; use 'fallback_pool:<pool_name>'",
+                action
+            )),
+            // Unknown actions - explicit error, NO _ => catch-all
+            unknown => Err(format!(
+                "unknown on_exhausted action '{}': valid values are 'reject', '503', 'status_503', 'fallback_pool:<name>', or 'least_bad'",
+                unknown
+            )),
+        }
+    }
+
+    /// Parse with optional pool name argument (reserved for future use).
+    #[allow(dead_code)] // Reserved for future extension
+    pub(crate) fn parse_with_arg(action: &str, arg: Option<&str>) -> Result<Self, String> {
+        match action {
+            "reject" | "503" | "status_503" | "status503" => Ok(OnExhausted::Status503),
+            "least_bad" | "least-bad" | "leastbad" => Ok(OnExhausted::LeastBad),
+            "fallback_pool" => {
+                let pool_name = arg.ok_or("fallback_pool requires a pool name argument")?;
+                if pool_name.is_empty() {
+                    Err("fallback_pool requires a non-empty pool name".into())
+                } else {
+                    Ok(OnExhausted::FallbackPool(pool_name.to_string()))
+                }
+            }
+            // Explicit handling of common typos/variants for clarity
+            s if s.starts_with("fallback_pool:") => {
+                let pool_name = &s["fallback_pool:".len()..];
+                if pool_name.is_empty() {
+                    Err("fallback_pool requires a non-empty pool name".into())
+                } else {
+                    Ok(OnExhausted::FallbackPool(pool_name.to_string()))
+                }
+            }
+            // Unknown actions - explicit error, NO _ => catch-all
+            unknown => Err(format!(
+                "unknown on_exhausted action '{}': valid values are 'reject', '503', 'status_503', 'fallback_pool:<name>', or 'least_bad'",
+                unknown
+            )),
+        }
+    }
+}
+
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AffinityCfg {
@@ -622,5 +700,75 @@ mod tests {
             .get("minimal")
             .expect("minimal should exist");
         assert!(provider_cfg.error_map.is_empty());
+    }
+
+    // B-403: OnExhausted mode parsing tests
+    #[test]
+    fn test_on_exhausted_parse_status_503_variants() {
+        // Test all Status503 variants
+        assert_eq!(
+            OnExhausted::parse("reject").unwrap(),
+            OnExhausted::Status503
+        );
+        assert_eq!(OnExhausted::parse("503").unwrap(), OnExhausted::Status503);
+        assert_eq!(
+            OnExhausted::parse("status_503").unwrap(),
+            OnExhausted::Status503
+        );
+        assert_eq!(
+            OnExhausted::parse("status503").unwrap(),
+            OnExhausted::Status503
+        );
+    }
+
+    #[test]
+    fn test_on_exhausted_parse_least_bad_variants() {
+        // Test all LeastBad variants
+        assert_eq!(
+            OnExhausted::parse("least_bad").unwrap(),
+            OnExhausted::LeastBad
+        );
+        assert_eq!(
+            OnExhausted::parse("least-bad").unwrap(),
+            OnExhausted::LeastBad
+        );
+        assert_eq!(
+            OnExhausted::parse("leastbad").unwrap(),
+            OnExhausted::LeastBad
+        );
+    }
+
+    #[test]
+    fn test_on_exhausted_parse_fallback_pool() {
+        // Test FallbackPool with colon syntax
+        let result = OnExhausted::parse("fallback_pool:drain").unwrap();
+        assert_eq!(result, OnExhausted::FallbackPool("drain".to_string()));
+
+        let result2 = OnExhausted::parse("fallback_pool:backup").unwrap();
+        assert_eq!(result2, OnExhausted::FallbackPool("backup".to_string()));
+    }
+
+    #[test]
+    fn test_on_exhausted_parse_unknown_action() {
+        // Test that unknown actions produce clear error messages (exhaustive match)
+        let result = OnExhausted::parse("invalid_mode");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("unknown on_exhausted action"));
+        assert!(err_msg.contains("invalid_mode"));
+
+        let result2 = OnExhausted::parse("fallback");
+        assert!(result2.is_err());
+        let err_msg2 = result2.unwrap_err();
+        assert!(err_msg2.contains("'fallback' is not a valid on_exhausted action"));
+    }
+
+    #[test]
+    fn test_on_exhausted_parse_empty_fallback_pool_name() {
+        // Test that empty fallback pool name produces error
+        let result = OnExhausted::parse("fallback_pool:");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("fallback_pool requires a non-empty pool name"));
     }
 }

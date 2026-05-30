@@ -94,4 +94,9 @@ pub(crate) struct App {
     /// B-402: Default failover config (deadline_s and max_failover cap).
     #[allow(dead_code)] // Used by forward.rs for default policy
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
+    /// B-403: Fallback pools mapping (pool name -> WeightedLane vec) for fallback mode.
+    pub(crate) fallback_pools: HashMap<String, Vec<WeightedLane>>,
+    /// B-403: OnExhausted config per pool name.
+    #[allow(dead_code)] // Used by forward.rs for exhaustion handling
+    pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
 }
