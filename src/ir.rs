@@ -20,6 +20,39 @@ pub(crate) struct IrRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IrStreamEvent {
+    MessageStart {
+        role: IrRole,
+        usage: Option<IrUsage>,
+    },
+    BlockStart {
+        index: usize,
+        block: IrBlockMeta,
+    },
+    BlockDelta {
+        index: usize,
+        delta: IrDelta,
+    },
+    BlockStop {
+        index: usize,
+    },
+    MessageDelta {
+        stop_reason: Option<String>,
+        usage: IrUsage,
+    },
+    MessageStop,
+    Error(crate::proto::IrError),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IrResponse {
+    pub role: IrRole,
+    pub content: Vec<IrBlock>,
+    pub stop_reason: Option<String>,
+    pub usage: IrUsage,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)] // Used by tests only (B-502a)
 pub(crate) struct IrMessage {
     pub role: IrRole,
@@ -81,32 +114,6 @@ pub(crate) struct IrTool {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // B-502b: response/stream IR types (used by tests in proto.rs)
-pub(crate) enum IrStreamEvent {
-    MessageStart {
-        role: IrRole,
-        usage: Option<IrUsage>,
-    },
-    BlockStart {
-        index: usize,
-        block: IrBlockMeta,
-    },
-    BlockDelta {
-        index: usize,
-        delta: IrDelta,
-    },
-    BlockStop {
-        index: usize,
-    },
-    MessageDelta {
-        stop_reason: Option<String>,
-        usage: IrUsage,
-    },
-    MessageStop,
-    Error(crate::proto::IrError),
 }
 
 #[derive(Debug, Clone, PartialEq)]

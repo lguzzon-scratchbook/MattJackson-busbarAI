@@ -54,6 +54,10 @@ pub(crate) trait ProtocolReader: Send + Sync {
         state: &mut crate::ir::StreamDecodeState,
     ) -> Vec<IrStreamEvent>;
 
+    /// Read a whole (non-streaming) response from wire JSON.
+    #[allow(dead_code)] // Used by B-503c-1
+    fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError>;
+
     /// Clone this reader as a trait object.
     #[allow(dead_code)] // Used by B-502a for Protocol cloning
     fn clone_box(&self) -> Box<dyn ProtocolReader>;
@@ -78,6 +82,10 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Write a response/stream event to wire (event_type, data) (B-502b).
     #[allow(dead_code)] // Used by B-502b/B-503
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)>;
+
+    /// Write a whole (non-streaming) response to wire JSON.
+    #[allow(dead_code)] // Used by B-503c-1
+    fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value;
 
     /// Clone this writer as a trait object.
     #[allow(dead_code)] // Used by B-502a for Protocol cloning
@@ -622,6 +630,76 @@ impl ProtocolReader for AnthropicReader {
             None => vec![],
         }
     }
+
+    fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
+        let obj = body.as_object().ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+
+        // Parse role (should be "assistant" for responses)
+        let role_str = obj.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let role = match role_str {
+            "assistant" => crate::ir::IrRole::Assistant,
+            _ => {
+                return Err(IrError {
+                    class: StatusClass::ClientError,
+                    provider_signal: Some("ir_parse".into()),
+                    retry_after: None,
+                })
+            }
+        };
+
+        // Parse content blocks
+        let content_val = obj.get("content").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+        let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        if content_val.is_array() {
+            for block_val in content_val.as_array().unwrap() {
+                content.push(read_block(block_val)?);
+            }
+        }
+
+        // Parse stop_reason (optional)
+        let stop_reason = obj
+            .get("stop_reason")
+            .and_then(|r| r.as_str())
+            .map(String::from);
+
+        // Parse usage
+        let usage_val = obj.get("usage").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+        let usage = crate::ir::IrUsage {
+            input_tokens: usage_val
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage_val
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: usage_val
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
+            cache_read_input_tokens: usage_val
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64()),
+        };
+
+        Ok(crate::ir::IrResponse {
+            role,
+            content,
+            stop_reason,
+            usage,
+        })
+    }
 }
 
 // Helper functions for IR mapping (used by read_request/write_request)
@@ -895,7 +973,7 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             serde_json::Value::Object(obj)
         }
         crate::ir::IrBlock::Image { media_type, data } => {
-            serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } })
+            serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data  } })
         }
     }
 }
@@ -1136,6 +1214,52 @@ impl ProtocolWriter for AnthropicWriter {
                 Some(("error".to_string(), serde_json::Value::Object(data_obj)))
             }
         }
+    }
+
+    fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+
+        // role: "assistant" for responses
+        obj.insert("type".to_string(), serde_json::json!("message"));
+        obj.insert("role".to_string(), serde_json::json!("assistant"));
+
+        // content blocks
+        let content_array: Vec<serde_json::Value> = resp.content.iter().map(write_block).collect();
+        obj.insert(
+            "content".to_string(),
+            serde_json::Value::Array(content_array),
+        );
+
+        // stop_reason (omit if None)
+        if let Some(ref reason) = resp.stop_reason {
+            obj.insert("stop_reason".to_string(), serde_json::json!(reason));
+        }
+
+        // usage
+        let mut usage_map = serde_json::Map::new();
+        usage_map.insert(
+            "input_tokens".to_string(),
+            serde_json::json!(resp.usage.input_tokens),
+        );
+        usage_map.insert(
+            "output_tokens".to_string(),
+            serde_json::json!(resp.usage.output_tokens),
+        );
+        if let Some(ccit) = resp.usage.cache_creation_input_tokens {
+            usage_map.insert(
+                "cache_creation_input_tokens".to_string(),
+                serde_json::json!(ccit),
+            );
+        }
+        if let Some(crit) = resp.usage.cache_read_input_tokens {
+            usage_map.insert(
+                "cache_read_input_tokens".to_string(),
+                serde_json::json!(crit),
+            );
+        }
+        obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+
+        serde_json::Value::Object(obj)
     }
 }
 
@@ -1561,6 +1685,142 @@ impl ProtocolReader for OpenAiReader {
     fn clone_box(&self) -> Box<dyn ProtocolReader> {
         Box::new(self.clone())
     }
+
+    fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
+        let obj = body.as_object().ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+
+        // Get choices array
+        let choices_val = obj.get("choices").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+        let choices = choices_val.as_array().ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+
+        if choices.is_empty() {
+            return Err(IrError {
+                class: StatusClass::ClientError,
+                provider_signal: Some("ir_parse".into()),
+                retry_after: None,
+            });
+        }
+
+        let choice = &choices[0];
+
+        // Parse role (should be "assistant")
+        let message_val = choice.get("message").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+        let _role_str = message_val
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+
+        // Parse content (may be null)
+        let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        if let Some(content_val) = message_val.get("content") {
+            if content_val.is_string() && !content_val.as_str().unwrap_or("").is_empty() {
+                content.push(crate::ir::IrBlock::Text {
+                    text: content_val.as_str().unwrap_or("").to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                });
+            } else if content_val.is_array() {
+                for block_val in content_val.as_array().unwrap() {
+                    let block = read_openai_block(block_val)?;
+                    // Only include text blocks from array content (OpenAI image_url not supported in response)
+                    if !matches!(block, crate::ir::IrBlock::Image { .. }) {
+                        content.push(block);
+                    }
+                }
+            }
+        }
+
+        // Parse tool_calls
+        if let Some(tool_calls_val) = message_val.get("tool_calls") {
+            if let Some(tc_arr) = tool_calls_val.as_array() {
+                for tc_val in tc_arr {
+                    let id = tc_val
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let func = tc_val.get("function").ok_or(IrError {
+                        class: StatusClass::ClientError,
+                        provider_signal: Some("ir_parse".into()),
+                        retry_after: None,
+                    })?;
+                    let name = func
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = func
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}");
+                    let input = serde_json::from_str(arguments)
+                        .unwrap_or(serde_json::Value::String(arguments.to_string()));
+
+                    content.push(crate::ir::IrBlock::ToolUse { id, name, input });
+                }
+            }
+        }
+
+        // Parse finish_reason → stop_reason mapping
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        let stop_reason = match finish_reason {
+            "stop" => Some("end_turn".to_string()),
+            "length" => Some("max_tokens".to_string()),
+            "tool_calls" => Some("tool_use".to_string()),
+            other if !other.is_empty() => Some(other.to_string()),
+            _ => None,
+        };
+
+        // Parse usage
+        let usage_val = obj.get("usage").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+        let cache_read_input_tokens = usage_val
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64());
+
+        let usage = crate::ir::IrUsage {
+            input_tokens: usage_val
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage_val
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: None, // OpenAI doesn't provide this split
+            cache_read_input_tokens,
+        };
+
+        Ok(crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content,
+            stop_reason,
+            usage,
+        })
+    }
 }
 
 /// Read an OpenAI-format block from JSON.
@@ -1960,6 +2220,101 @@ impl ProtocolWriter for OpenAiWriter {
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
+    }
+
+    fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+
+        // Build choices array with one choice
+        let mut messages_array: Vec<serde_json::Value> = Vec::new();
+
+        for block in &resp.content {
+            if let crate::ir::IrBlock::Text { text, .. } = block {
+                messages_array.push(serde_json::json!({ "role": "assistant", "content": text }));
+            }
+        }
+
+        // ToolUse blocks become tool_calls (not in content)
+        let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
+        for block in &resp.content {
+            if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                // Serialize input to JSON string
+                let args_str = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                tool_calls_arr.push(serde_json::json!({
+                    "type": "function",
+                    "id": id,
+                    "function": {
+                        "name": name,
+                        "arguments": args_str
+                    }
+                }));
+            }
+        }
+
+        // Thinking blocks are DROPPED on OpenAI write (lossy-by-necessity; OpenAI has no thinking)
+        // They are not collapsed into content.
+
+        let mut message_obj = serde_json::json!({
+            "role": "assistant",
+            "content": if messages_array.is_empty() {
+                serde_json::Value::Null
+            } else {
+                // Concatenate all Text blocks
+                let texts: Vec<String> = resp.content.iter().filter_map(|b| {
+                    if let crate::ir::IrBlock::Text { text, .. } = b {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                }).collect();
+                serde_json::json!(texts.join(""))
+            },
+        });
+
+        // Add tool_calls only if present
+        if !tool_calls_arr.is_empty() {
+            message_obj["tool_calls"] = serde_json::Value::Array(tool_calls_arr);
+        }
+
+        let mut choices_array: Vec<serde_json::Value> = Vec::new();
+        let finish_reason = match resp.stop_reason.as_deref() {
+            Some("end_turn") | Some("stop_sequence") => "stop",
+            Some("max_tokens") => "length",
+            Some("tool_use") => "tool_calls",
+            Some(reason) => reason,
+            None => "",
+        };
+
+        let mut choice_obj = serde_json::Map::new();
+        choice_obj.insert("index".to_string(), serde_json::json!(0));
+        choice_obj.insert("message".to_string(), message_obj);
+        if !finish_reason.is_empty() {
+            choice_obj.insert(
+                "finish_reason".to_string(),
+                serde_json::json!(finish_reason),
+            );
+        }
+        choices_array.push(serde_json::Value::Object(choice_obj));
+
+        obj.insert("object".to_string(), serde_json::json!("chat.completion"));
+        obj.insert(
+            "choices".to_string(),
+            serde_json::Value::Array(choices_array),
+        );
+
+        // Build usage
+        let mut usage_map = serde_json::Map::new();
+        usage_map.insert(
+            "prompt_tokens".to_string(),
+            serde_json::json!(resp.usage.input_tokens),
+        );
+        usage_map.insert(
+            "completion_tokens".to_string(),
+            serde_json::json!(resp.usage.output_tokens),
+        );
+        obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+
+        serde_json::Value::Object(obj)
     }
 }
 
@@ -3958,5 +4313,261 @@ mod stream_translate_tests {
     fn test_translate_same_protocol_is_none() {
         assert!(StreamTranslate::new("openai", "openai").is_none());
         assert!(StreamTranslate::new("anthropic", "anthropic").is_none());
+    }
+
+    // ============================================================
+    // B-503c-1: Whole-response (non-streaming) R/W tests
+    // ============================================================
+
+    #[test]
+    fn test_anthropic_read_response_decode() {
+        // Anthropic message → IrResponse with exact fields
+        let data = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null
+            }
+        });
+
+        let reader = AnthropicReader;
+        let resp = reader.read_response(&data).expect("should parse");
+
+        assert_eq!(resp.role, crate::ir::IrRole::Assistant);
+        assert_eq!(resp.content.len(), 1);
+        if let crate::ir::IrBlock::Text { text, .. } = &resp.content[0] {
+            assert_eq!(text, "hi");
+        } else {
+            panic!("expected Text block");
+        }
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(resp.usage.input_tokens, 5);
+    }
+
+    #[test]
+    fn test_openai_read_response_decode() {
+        // OpenAI chat.completion → IrResponse with exact fields and stop_reason mapping
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3
+            }
+        });
+
+        let reader = OpenAiReader;
+        let resp = reader.read_response(&data).expect("should parse");
+
+        assert_eq!(resp.role, crate::ir::IrRole::Assistant);
+        assert_eq!(resp.content.len(), 1);
+        if let crate::ir::IrBlock::Text { text, .. } = &resp.content[0] {
+            assert_eq!(text, "hi");
+        } else {
+            panic!("expected Text block");
+        }
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn")); // mapped from "stop"
+        assert_eq!(resp.usage.input_tokens, 5);
+    }
+
+    #[test]
+    fn test_cross_protocol_openai_to_anthropic() {
+        // OpenAI → IR → Anthropic: verify output is Anthropic-shaped
+        let openai_data = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3
+            }
+        });
+
+        let ir_resp = OpenAiReader
+            .read_response(&openai_data)
+            .expect("OpenAI read");
+        let anthropic_json = AnthropicWriter.write_response(&ir_resp);
+
+        // Assert Anthropic-shaped output
+        assert_eq!(
+            anthropic_json.get("type").and_then(|v| v.as_str()),
+            Some("message")
+        );
+        if let Some(content_arr) = anthropic_json.get("content").and_then(|c| c.as_array()) {
+            assert!(!content_arr.is_empty());
+            let first_block = &content_arr[0];
+            assert_eq!(
+                first_block.get("type").and_then(|v| v.as_str()),
+                Some("text")
+            );
+            assert_eq!(first_block.get("text").and_then(|v| v.as_str()), Some("hi"));
+        } else {
+            panic!("missing content array");
+        }
+        assert_eq!(
+            anthropic_json.get("stop_reason").and_then(|v| v.as_str()),
+            Some("end_turn")
+        );
+    }
+
+    #[test]
+    fn test_cross_protocol_anthropic_to_openai() {
+        // Anthropic → IR → OpenAI: verify output is OpenAI-shaped
+        let anthropic_data = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null
+            }
+        });
+
+        let ir_resp = AnthropicReader
+            .read_response(&anthropic_data)
+            .expect("Anthropic read");
+        let openai_json = OpenAiWriter.write_response(&ir_resp);
+
+        // Assert OpenAI-shaped output
+        assert_eq!(
+            openai_json.get("object").and_then(|v| v.as_str()),
+            Some("chat.completion")
+        );
+        if let Some(choices_arr) = openai_json.get("choices").and_then(|c| c.as_array()) {
+            assert!(!choices_arr.is_empty());
+            let choice = &choices_arr[0];
+            if let Some(msg) = choice.get("message") {
+                assert_eq!(msg.get("role").and_then(|v| v.as_str()), Some("assistant"));
+                assert_eq!(msg.get("content").and_then(|v| v.as_str()), Some("hi"));
+            } else {
+                panic!("missing message");
+            }
+            assert_eq!(
+                choice.get("finish_reason").and_then(|v| v.as_str()),
+                Some("stop")
+            );
+        } else {
+            panic!("missing choices array");
+        }
+    }
+
+    #[test]
+    fn test_cross_protocol_tool_use_response() {
+        // OpenAI tool_calls response → IR → Anthropic: verify tool_use block round-trips
+        let openai_data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{\"x\":1}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3
+            }
+        });
+
+        let ir_resp = OpenAiReader
+            .read_response(&openai_data)
+            .expect("OpenAI read");
+
+        // Verify IR has ToolUse block
+        assert_eq!(ir_resp.content.len(), 1);
+        if let crate::ir::IrBlock::ToolUse { id, name, input } = &ir_resp.content[0] {
+            assert_eq!(id, "call_1");
+            assert_eq!(name, "f");
+            match input {
+                serde_json::Value::Object(obj) => {
+                    assert_eq!(obj.get("x"), Some(&serde_json::json!(1)));
+                }
+                _ => panic!("input should be Object"),
+            }
+        } else {
+            panic!("expected ToolUse block");
+        }
+
+        let anthropic_json = AnthropicWriter.write_response(&ir_resp);
+
+        // Assert Anthropic output has tool_use block with correct fields
+        if let Some(content_arr) = anthropic_json.get("content").and_then(|c| c.as_array()) {
+            assert!(!content_arr.is_empty());
+            let first_block = &content_arr[0];
+            assert_eq!(
+                first_block.get("type").and_then(|v| v.as_str()),
+                Some("tool_use")
+            );
+            assert_eq!(
+                first_block.get("id").and_then(|v| v.as_str()),
+                Some("call_1")
+            );
+            assert_eq!(first_block.get("name").and_then(|v| v.as_str()), Some("f"));
+            // input should be an object with x: 1
+            if let Some(input_val) = first_block.get("input") {
+                match input_val {
+                    serde_json::Value::Object(obj) => {
+                        assert_eq!(obj.get("x"), Some(&serde_json::json!(1)));
+                    }
+                    _ => panic!("input should be Object"),
+                }
+            } else {
+                panic!("missing input");
+            }
+        } else {
+            panic!("missing content array");
+        }
+
+        // stop_reason should be "tool_use" (passthrough from Anthropic canonical form)
+        assert_eq!(
+            anthropic_json.get("stop_reason").and_then(|v| v.as_str()),
+            Some("tool_use")
+        );
+    }
+
+    #[test]
+    fn test_same_protocol_roundtrip_idempotence() {
+        // Anthropic read → write → read yields equal IrResponse
+        let original_data = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "tool_use", "id": "tool_1", "name": "get_weather", "input": {"loc": "SF"}}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null
+            }
+        });
+
+        let reader = AnthropicReader;
+        let writer = AnthropicWriter;
+
+        // First read
+        let ir1 = reader.read_response(&original_data).expect("first read");
+
+        // Write to JSON
+        let written_json = writer.write_response(&ir1);
+
+        // Read again
+        let ir2 = reader.read_response(&written_json).expect("second read");
+
+        // Decode IR must be identical (ground truth for anti-fab)
+        assert_eq!(ir1, ir2, "decoded IR must be identical after round-trip");
     }
 }
