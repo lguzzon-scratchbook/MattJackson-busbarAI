@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -392,15 +394,33 @@ impl RequestCtx {
     }
 }
 
-/// B-401 / B-402: pick_among using weighted selection (SWRR) over healthy subset.
+/// B-401 / B-402 / B-404: pick_among using weighted selection (SWRR) over healthy subset.
 /// `cands` is now Vec<WeightedLane> where each lane has its weight from config.
 /// `request_ctx` provides accumulated exclusions to avoid retrying failed lanes.
+/// `_affinity_key` enables sticky routing as a preference (not a hard constraint).
 async fn pick_among(
     app: &Arc<App>,
     cands: &[WeightedLane],
     request_ctx: &mut RequestCtx,
+    _affinity_key: Option<&str>,
 ) -> Option<(usize, Permit)> {
     let t = now();
+
+    // B-404: Session affinity preference - try sticky lane first if usable
+    if let Some(k) = _affinity_key {
+        if !cands.is_empty() {
+            let mut h = DefaultHasher::new();
+            k.hash(&mut h);
+            let pos = (h.finish() as usize) % cands.len();
+            let sticky = cands[pos].idx;
+
+            if !request_ctx.excluded.contains(&sticky) && app.store.usable(sticky, t) {
+                if let Some(p) = app.store.try_acquire(sticky) {
+                    return Some((sticky, p));
+                }
+            }
+        }
+    }
 
     // Filter out already-tried lanes (accumulated exclusions across hops)
     let filtered_cands = request_ctx.filter_candidates(cands);
@@ -437,7 +457,7 @@ pub(crate) async fn forward(
     body: Bytes,
     caller_token: Option<&str>,
 ) -> Response {
-    forward_with_pool(app, cands, body, caller_token, "__default__").await
+    forward_with_pool(app, cands, body, caller_token, "__default__", None).await
 }
 
 /// Forward with pool name context for on_exhausted config lookup.
@@ -447,12 +467,23 @@ pub(crate) async fn forward_with_pool(
     body: Bytes,
     caller_token: Option<&str>,
     pool_name: &str,
+    affinity_key: Option<&str>,
 ) -> Response {
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("router: bad json: {e}")).into_response()
         }
+    };
+
+    // Derive affinity key early (before any mutations to v)
+    let _affinity_key_str: Option<String> = if let Some(k) = affinity_key {
+        Some(k.to_string())
+    } else {
+        v.get("system")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
     };
 
     // Before-first-byte failover boundary (B-202):
@@ -478,29 +509,30 @@ pub(crate) async fn forward_with_pool(
             return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
         }
 
-        let (i, permit) = match pick_among(&app, &cands, &mut request_ctx).await {
-            Some(x) => x,
-            None => {
-                if cands.is_empty() {
-                    // Pool has no members at all — nothing to do.
-                    return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane")
-                        .into_response();
+        let (i, permit) =
+            match pick_among(&app, &cands, &mut request_ctx, _affinity_key_str.as_deref()).await {
+                Some(x) => x,
+                None => {
+                    if cands.is_empty() {
+                        // Pool has no members at all — nothing to do.
+                        return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane")
+                            .into_response();
+                    }
+                    // No usable lane — whether the members were tripped before this request
+                    // arrived or excluded during its failover attempts, apply the configured
+                    // exhaustion mode (Status503 / FallbackPool / LeastBad) with loop prevention.
+                    return handle_exhaustion_for_pool(
+                        app.clone(),
+                        &cands,
+                        now(),
+                        pool_name,
+                        body,
+                        caller_token,
+                        &mut request_ctx,
+                    )
+                    .await;
                 }
-                // No usable lane — whether the members were tripped before this request
-                // arrived or excluded during its failover attempts, apply the configured
-                // exhaustion mode (Status503 / FallbackPool / LeastBad) with loop prevention.
-                return handle_exhaustion_for_pool(
-                    app.clone(),
-                    &cands,
-                    now(),
-                    pool_name,
-                    body,
-                    caller_token,
-                    &mut request_ctx,
-                )
-                .await;
-            }
-        };
+            };
 
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
@@ -862,7 +894,7 @@ async fn handle_fallback_pool(
             return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
         }
 
-        let Some((i, permit)) = pick_among(&app, &fallback_cands, request_ctx).await else {
+        let Some((i, permit)) = pick_among(&app, &fallback_cands, request_ctx, None).await else {
             // Fallback pool itself exhausted — consult ITS on_exhausted config (multi-level
             // chains). The visited-set guarantees this recursion terminates.
             return Box::pin(handle_exhaustion_for_pool(

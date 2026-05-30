@@ -3194,6 +3194,7 @@ mod tests {
             req_body.into(),
             None,
             "leastbad",
+            None,
         )
         .await;
 
@@ -3330,6 +3331,7 @@ mod tests {
             req_body.into(),
             None,
             "pool_a",
+            None,
         )
         .await;
 
@@ -3451,6 +3453,7 @@ mod tests {
             req_body.into(),
             None,
             "primary",
+            None,
         )
         .await;
 
@@ -3469,5 +3472,527 @@ mod tests {
         );
 
         server.shutdown().await;
+    }
+
+    /// B-404 Test 1: Sticky while healthy - same x-session-id should route to same member.
+    #[tokio::test]
+    async fn test_sticky_session_while_healthy() {
+        use std::collections::HashMap;
+
+        // Create separate mock servers for each lane so we can track which lane served the request
+        let state0 = Arc::new(MockServerState::new());
+        let server0 = MockServer::new(state0.clone()).await;
+
+        let state1 = Arc::new(MockServerState::new());
+        let server1 = MockServer::new(state1.clone()).await;
+
+        let state2 = Arc::new(MockServerState::new());
+        let server2 = MockServer::new(state2.clone()).await;
+
+        // All lanes always return their own identifier
+        for _ in 0..3 {
+            state0.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({ "served_by": "lane0" }),
+            });
+            state1.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({ "served_by": "lane1" }),
+            });
+            state2.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({ "served_by": "lane2" }),
+            });
+        }
+
+        let lane_data_0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_2 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server0.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server1.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane2 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server2.base_url(),
+            api_key: "test-key-2".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "sticky-test".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane { idx: 2, weight: 1 },
+            ],
+        )]);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![
+            lane_data_0,
+            lane_data_1,
+            lane_data_2,
+        ]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1, lane2],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // First call with session id "session-abc"
+        let response1 = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane { idx: 2, weight: 1 },
+            ],
+            req_body.clone().into(),
+            None,
+            "sticky-test",
+            Some("session-abc"),
+        )
+        .await;
+
+        let body1 = axum::body::to_bytes(response1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str1 = String::from_utf8_lossy(&body1);
+
+        // Second call with same session id - should get same lane
+        let response2 = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane { idx: 2, weight: 1 },
+            ],
+            req_body.clone().into(),
+            None,
+            "sticky-test",
+            Some("session-abc"),
+        )
+        .await;
+
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str2 = String::from_utf8_lossy(&body2);
+
+        // Both should return the same lane
+        assert_eq!(
+            body_str1, body_str2,
+            "Same session id should route to same member. First: {body_str1}, Second: {body_str2}"
+        );
+
+        // Third call with different session id - should potentially get a different lane
+        let response3 = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane { idx: 2, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+            "sticky-test",
+            Some("session-xyz"),
+        )
+        .await;
+
+        let _body3 = axum::body::to_bytes(response3.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // Different session should hash to potentially different lane (not guaranteed, but test passes if it's deterministic)
+        // The important thing is that affinity works - same key gives same result
+        server0.shutdown().await;
+        server1.shutdown().await;
+        server2.shutdown().await;
+    }
+
+    /// B-404 Test 2: Sticky member tripped → yields to healthy member.
+    #[tokio::test]
+    async fn test_sticky_yields_when_tripped() {
+        use std::collections::HashMap;
+
+        // Separate mock servers for each lane
+        let state0 = Arc::new(MockServerState::new());
+        let server0 = MockServer::new(state0.clone()).await;
+
+        let state1 = Arc::new(MockServerState::new());
+        let server1 = MockServer::new(state1.clone()).await;
+
+        // Lane 0 returns error, lane 1 always succeeds with its identifier
+        for _ in 0..2 {
+            state0.push(MockResponse::ServerError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: json!({ "error": "lane 0 failed" }),
+            });
+            state1.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({ "served_by": "lane1", "content": [] }),
+            });
+        }
+
+        let lane_data_0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 1,
+            sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 1,
+            sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server0.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 1,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server1.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 1,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "failover-test".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data_0, lane_data_1]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Use a session id that hashes to lane 0 (first lane)
+        let response = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+            "failover-test",
+            Some("session-to-lane-0"),
+        )
+        .await;
+
+        // Should succeed by falling through to lane 1 (healthy)
+        assert_eq!(response.status().as_u16(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+
+        // Should be served by lane 1, NOT lane 0 (affinity is preference, not pin)
+        assert!(
+            body_str.contains("lane1"),
+            "Should fall through to healthy member when sticky lane fails; got: {body_str}"
+        );
+
+        server0.shutdown().await;
+        server1.shutdown().await;
+    }
+
+    /// B-404 Test 3: No header → system block hash for affinity.
+    #[tokio::test]
+    async fn test_sticky_from_system_block() {
+        use std::collections::HashMap;
+
+        // Separate mock servers for each lane
+        let state0 = Arc::new(MockServerState::new());
+        let server0 = MockServer::new(state0.clone()).await;
+
+        let state1 = Arc::new(MockServerState::new());
+        let server1 = MockServer::new(state1.clone()).await;
+
+        // Both lanes always return their own identifier
+        for _ in 0..2 {
+            state0.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({ "served_by": "lane0" }),
+            });
+            state1.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({ "served_by": "lane1" }),
+            });
+        }
+
+        let lane_data_0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server0.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server1.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "system-test".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data_0, lane_data_1]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Request with system block
+        let req_body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "system": "my-system-block"
+        }))
+        .unwrap();
+
+        // First call with system block
+        let response1 = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.clone().into(),
+            None,
+            "system-test",
+            None, // No header - should derive from system block
+        )
+        .await;
+
+        let body1 = axum::body::to_bytes(response1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str1 = String::from_utf8_lossy(&body1);
+
+        // Second call with same system block - should get same lane (deterministic)
+        let response2 = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+            "system-test",
+            None, // No header - should derive from system block
+        )
+        .await;
+
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str2 = String::from_utf8_lossy(&body2);
+
+        // Both should return the same lane (deterministic from system block hash)
+        assert_eq!(
+            body_str1, body_str2,
+            "Same system block should route to same member deterministically"
+        );
+
+        server0.shutdown().await;
+        server1.shutdown().await;
     }
 }

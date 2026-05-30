@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 
@@ -17,15 +17,26 @@ use crate::state::{App, WeightedLane};
 pub(crate) async fn named(
     State(app): State<Arc<App>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // NOTE: Caller token extraction from request extensions requires handler signature change.
     // For now, caller_token is None - passthrough mode will use lane's api_key as fallback.
     let _caller_token = None;
 
+    let affinity_key = headers.get("x-session-id").and_then(|v| v.to_str().ok());
+
     if let Some(cands) = app.pools.get(&name) {
         // Convert WeightedLane vec to match forward signature (already same type now)
-        return forward_with_pool(app.clone(), cands.clone(), body, _caller_token, &name).await;
+        return forward_with_pool(
+            app.clone(),
+            cands.clone(),
+            body,
+            _caller_token,
+            &name,
+            affinity_key,
+        )
+        .await;
     }
     if let Some(&i) = app.by_model.get(&name) {
         // Use forward for model-based routing (no pool name context needed)
