@@ -13,7 +13,7 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: 0.11.1 (pre-1.0), in active development.** Working today:
+> **Project status: 0.12.0 (pre-1.0), in active development.** Working today:
 > **five protocols** — Anthropic, OpenAI (chat completions), Google **Gemini**, AWS **Bedrock**
 > (Converse), and OpenAI **Responses** — each read/written natively, with **full cross-protocol
 > translation** through a lossless superset IR (request *and* response, streaming *and*
@@ -26,8 +26,13 @@ per-circuit protection.
 > All five protocols are first-class including streaming: Gemini uses `:streamGenerateContent`,
 > Bedrock uses native AWS **SigV4** auth + ConverseStream (busbar decodes the binary
 > `application/vnd.amazon.eventstream` frames and translates them to the caller's protocol).
-> Roadmap (0.12+): governance — virtual keys, budgets, rate limits — plus persistence and a
-> management API. APIs and config may change before 1.0. See [`docs/`](docs/) for design and roadmap.
+> And **governance** (opt-in `governance` config section, durable in embedded SQLite per ADR-0009):
+> **virtual keys** (busbar-issued, distinct from provider keys) with per-key **allowed-pools** ACLs
+> (403), **budgets** (402 when exceeded), and **rate limits** (429 + Retry-After), administered via
+> an admin-token-guarded **management API** (`/admin/keys` CRUD + usage). Note: budget cost is
+> currently flat-per-request and TPM trails RPM — token-priced budgets/TPM are a planned refinement.
+> Roadmap (0.13+): breadth, then 1.0 hardening (docs, soak, security review). APIs and config may
+> change before 1.0. See [`docs/`](docs/) for design and roadmap.
 
 ## Why Busbar
 
