@@ -251,6 +251,7 @@ async fn main() {
             state::PoolRuntime {
                 failover: pool_cfg.failover.clone(),
                 affinity: pool_cfg.affinity.clone(),
+                breaker: pool_cfg.breaker.as_ref().map(store::BreakerCfg::from),
             },
         );
     }

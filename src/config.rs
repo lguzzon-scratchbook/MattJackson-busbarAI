@@ -136,8 +136,9 @@ fn neg1() -> i64 {
 pub(crate) struct PoolCfg {
     #[serde(default)]
     pub(crate) members: Vec<PoolMember>,
+    /// Per-pool breaker settings (resolved into `store::BreakerCfg` at startup; drives trip
+    /// thresholds and cooldown backoff for this pool's lanes).
     #[serde(default)]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) breaker: Option<BreakerCfg>,
     #[serde(default)]
     pub(crate) failover: Option<FailoverCfg>,
@@ -174,19 +175,14 @@ pub(crate) enum BreakerTripMode {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub(crate) struct BreakerTripConfig {
     #[serde(default = "default_trip_mode")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub mode: BreakerTripMode,
     #[serde(default = "default_window_s")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub window_s: u64,
     #[serde(default = "default_threshold")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub threshold: f64,
     #[serde(default = "default_min_requests")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub min_requests: usize,
     #[serde(default = "default_consecutive_n")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub n: u32,
 }
 
@@ -214,13 +210,10 @@ fn default_consecutive_n() -> u32 {
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct BreakerCfg {
     #[serde(default = "default_cooldown")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub base_cooldown_secs: u64,
     #[serde(default = "default_max_cooldown")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub max_cooldown_secs: u64,
     #[serde(default)]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub trip: Option<BreakerTripConfig>,
 }
 

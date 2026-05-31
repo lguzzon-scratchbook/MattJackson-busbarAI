@@ -422,6 +422,7 @@ mod tests {
                     mode: "session".to_string(),
                     header_name: Some("x-user-id".to_string()),
                 }),
+                breaker: None,
             },
         );
         // App is behind Arc; rebuild with the populated map.
@@ -444,6 +445,7 @@ mod tests {
                     mode: "session".to_string(),
                     header_name: None,
                 }),
+                breaker: None,
             },
         );
         let inner = Arc::get_mut(&mut app).expect("sole owner");

@@ -48,6 +48,9 @@ pub(crate) struct PoolRuntime {
     pub(crate) failover: Option<crate::config::FailoverCfg>,
     /// Per-pool session-affinity settings (which request header pins a session to a lane).
     pub(crate) affinity: Option<crate::config::AffinityCfg>,
+    /// Per-pool breaker settings (trip mode/thresholds + cooldown backoff), resolved into the
+    /// runtime `store::BreakerCfg` the FSM evaluates. `None` falls back to ADR-0002 defaults.
+    pub(crate) breaker: Option<crate::store::BreakerCfg>,
 }
 
 pub(crate) struct App {

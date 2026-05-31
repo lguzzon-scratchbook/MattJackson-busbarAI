@@ -5,6 +5,30 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — unreleased
+
+### Added
+- **Per-pool circuit-breaker config is now live.** A pool's `breaker:` block
+  (`trip.mode` error_rate|consecutive, `trip.window_s`/`threshold`/`min_requests`/`n`,
+  `base_cooldown_secs`/`max_cooldown_secs`) is resolved at startup and drives the
+  trip decision via `should_trip` — previously the block was parsed but ignored and
+  the breaker used a hardcoded `err >= 5` rule. Streak ownership moved to the record
+  path (incremented once per failure, reset on success) so consecutive-mode trips and
+  cooldown escalation are coherent. Example added to `config.yaml` (pool `sensitive`).
+- **`failover.exclusions`** are enforced — members named there are removed from a
+  pool's candidate set (never selected, primary or failover).
+- **Pool `affinity.header_name`** is honored — the session-pinning header is now
+  configurable per pool (defaults to `x-session-id`).
+
+### Notes
+- Breaker state remains **per-lane** (not per-(pool,lane)). This is correct for the
+  common case and for upstream-driven signals (a 401/429 is a property of the
+  upstream, shared across pools). Full per-(pool,lane) state isolation — where one
+  shared lane carries independent Open/Closed status per pool — was deferred: it
+  would require threading a pool key through the `StateStore` trait and its 77
+  constructor sites, and only differs when one lane is shared by multiple pools with
+  *different* breaker configs.
+
 ## [0.14.0]
 
 ### Added

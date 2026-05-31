@@ -279,6 +279,9 @@ struct FirstByteBody<S, P> {
     permit: Option<P>,
     app: Option<Arc<App>>,
     lane_idx: usize,
+    /// Resolved breaker config for the routing pool, so a mid-stream failure trips this lane using
+    /// the same thresholds the synchronous path used (defaults on the degraded path).
+    breaker_cfg: Arc<crate::store::BreakerCfg>,
     /// Usage tap for extracting Anthropic SSE usage without buffering full body
     tap: UsageTap,
     /// when Some, translate each egress SSE chunk to the caller's ingress protocol.
@@ -296,12 +299,14 @@ impl<S, P> FirstByteBody<S, P>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         inner: S,
         is_sse: bool,
         permit: P,
         app: Arc<App>,
         lane_idx: usize,
+        breaker_cfg: Arc<crate::store::BreakerCfg>,
         translate: Option<crate::proto::StreamTranslate>,
         usage_sink: Option<UsageSink>,
     ) -> Self {
@@ -312,6 +317,7 @@ where
             permit: Some(permit),
             app: Some(app),
             lane_idx,
+            breaker_cfg,
             tap: UsageTap::new(),
             translate,
             usage_sink,
@@ -363,8 +369,12 @@ where
                     if had_first && this.is_sse {
                         // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
                         if let Some(ref app) = this.app {
-                            app.store
-                                .record_transient(this.lane_idx, "mid-stream", None);
+                            app.store.record_transient(
+                                this.lane_idx,
+                                "mid-stream",
+                                &this.breaker_cfg,
+                                None,
+                            );
                         }
                         let err_json = serde_json::json!({
                             "type": "error",
@@ -384,8 +394,12 @@ where
                     // Stream ended - for SSE streams that sent at least one byte, record the failure
                     if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
                         if let Some(ref app) = this.app {
-                            app.store
-                                .record_transient(this.lane_idx, "mid-stream-end", None);
+                            app.store.record_transient(
+                                this.lane_idx,
+                                "mid-stream-end",
+                                &this.breaker_cfg,
+                                None,
+                            );
                         }
                     }
                     // emit the ingress terminator (e.g. OpenAI `data: [DONE]`) before close.
@@ -668,6 +682,16 @@ pub(crate) async fn forward_with_pool(
         None => (120, 3), // defaults: deadline_s=120, max_failover=3
     };
 
+    // Breaker config: prefer this pool's own settings, fall back to ADR-0002 defaults. Resolved
+    // once and shared (Arc) so the streaming guard can record mid-stream failures with the same
+    // thresholds the synchronous path used.
+    let breaker_cfg: std::sync::Arc<crate::store::BreakerCfg> = std::sync::Arc::new(
+        app.pool_runtime
+            .get(pool_name)
+            .and_then(|r| r.breaker.clone())
+            .unwrap_or_default(),
+    );
+
     let mut request_ctx = RequestCtx::new(deadline_secs);
 
     // Apply configured failover exclusions: members named here are excluded from this pool's
@@ -800,7 +824,7 @@ pub(crate) async fn forward_with_pool(
             Err(e) => {
                 // Pre-response error: classify and potentially failover
                 let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-                app.store.record_transient(i, err_type, None);
+                app.store.record_transient(i, err_type, &breaker_cfg, None);
                 metrics::counter!(
                     crate::metrics::UPSTREAM_FAILURES_TOTAL,
                     "pool" => pool_name.to_string(),
@@ -866,7 +890,12 @@ pub(crate) async fn forward_with_pool(
                             // Transient upstream failure → cooldown + err counter
                             // Record based on specific error type (exhaustive over remaining variants)
                             if matches!(sig.class, StatusClass::RateLimit) {
-                                app.store.record_rate_limit(i, now(), sig.retry_after);
+                                app.store.record_rate_limit(
+                                    i,
+                                    now(),
+                                    &breaker_cfg,
+                                    sig.retry_after,
+                                );
                             } else {
                                 let what = match sig.class {
                                     StatusClass::ServerError => "5xx",
@@ -883,7 +912,8 @@ pub(crate) async fn forward_with_pool(
                                         "rate_limit"
                                     }
                                 };
-                                app.store.record_transient(i, what, sig.retry_after);
+                                app.store
+                                    .record_transient(i, what, &breaker_cfg, sig.retry_after);
                             }
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
@@ -1059,6 +1089,7 @@ pub(crate) async fn forward_with_pool(
                     permit,
                     app.clone(),
                     i,
+                    breaker_cfg.clone(),
                     translate,
                     usage_sink,
                 );
@@ -1240,9 +1271,18 @@ async fn forward_once(
                 .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
                 .unwrap_or(false);
             let upstream_stream = r.bytes_stream();
-            // Degraded fallback/least-bad path: no cross-protocol translation here (scope).
-            let guarded_body =
-                FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, None, None);
+            // Degraded fallback/least-bad path: no cross-protocol translation here (scope), and no
+            // pool context to resolve per-pool breaker config — use ADR-0002 defaults.
+            let guarded_body = FirstByteBody::new(
+                upstream_stream,
+                is_sse,
+                permit,
+                app.clone(),
+                i,
+                Arc::new(crate::store::BreakerCfg::default()),
+                None,
+                None,
+            );
             let mut rb = Response::builder().status(status);
             if let Some(ct) = ct {
                 rb = rb.header(CONTENT_TYPE, ct);
@@ -1251,8 +1291,10 @@ async fn forward_once(
         }
         Err(e) => {
             // Pre-response transport error: record transient, drop permit, signal "try next".
+            // Degraded path has no pool context — use default breaker thresholds.
             let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-            app.store.record_transient(i, err_type, None);
+            app.store
+                .record_transient(i, err_type, &crate::store::BreakerCfg::default(), None);
             drop(permit);
             Err(())
         }

@@ -169,6 +169,26 @@ pools:
       mode: session              # stick to one member per session while it stays healthy
       header_name: x-session-id  # the request header carrying the session key (this is the default)
 
+  # 8) Per-pool circuit breaker: tune when a member trips out and how long it cools down. Omit the
+  #    block entirely for the ADR-0002 defaults (error_rate, 0.5 over a 30s/5-request floor).
+  #      trip.mode        — error_rate (fraction of failures in a window) | consecutive (a streak).
+  #      trip.window_s    — sliding window for error_rate.
+  #      trip.threshold   — error fraction that trips (error_rate mode).
+  #      trip.min_requests— floor: never trip on error_rate below this many outcomes in-window.
+  #      trip.n           — consecutive failures that trip (consecutive mode).
+  #      base/max_cooldown_secs — first cooldown after a trip, and the exponential-backoff ceiling.
+  #    (A server Retry-After header is always honored as a cooldown floor, on top of these.)
+  sensitive:
+    members:
+      - target: claude-sonnet
+      - target: gpt-4o
+    breaker:
+      trip:
+        mode: consecutive        # trip fast on a short streak rather than a windowed rate
+        n: 2                     # two consecutive failures trip the member out
+      base_cooldown_secs: 5      # quick first probe-back…
+      max_cooldown_secs: 60      # …backing off exponentially up to a minute
+
 # ── Observability (optional) ─────────────────────────────────────────────────────────────────────
 # Prometheus `/metrics` is always on and needs no config. These two sinks are opt-in:
 #   otlp_endpoint            — export OpenTelemetry traces (OTLP/HTTP) to a collector.

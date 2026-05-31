@@ -108,8 +108,10 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // outcome recording (the breaker's write path)
     fn record_success(&self, lane: usize);
     fn record_client_fault(&self, lane: usize);
-    fn record_transient(&self, lane: usize, what: &str, retry_after: Option<u64>);
-    fn record_rate_limit(&self, lane: usize, now: u64, retry_after: Option<u64>);
+    /// Record a transient upstream failure. `cfg` is the routing pool's resolved breaker config,
+    /// which drives the trip decision (error-rate vs consecutive thresholds) and cooldown backoff.
+    fn record_transient(&self, lane: usize, what: &str, cfg: &BreakerCfg, retry_after: Option<u64>);
+    fn record_rate_limit(&self, lane: usize, now: u64, cfg: &BreakerCfg, retry_after: Option<u64>);
     fn record_hard_down(&self, lane: usize, reason: &str);
 
     // concurrency + budget (kept as-is conceptually)
@@ -152,7 +154,6 @@ impl OutcomeWindow {
     }
 
     /// Count outcomes within `window_s` seconds of `now`.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn count_in_window(&self, now: u64, window_s: u64) -> usize {
         let start = now.saturating_sub(window_s);
         self.entries.iter().filter(|&&ts| ts >= start).count()
@@ -229,7 +230,6 @@ impl InMemoryStore {
 
     /// Evaluate trip condition for Closed → Open transition.
     /// Returns true if the lane should trip to Open.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn should_trip(lane: &LaneState, now: u64, cfg: &BreakerCfg) -> bool {
         let window = lane.outcome_window.lock().unwrap();
 
@@ -256,13 +256,6 @@ impl InMemoryStore {
                 current_streak >= cfg.trip.n
             }
         }
-    }
-
-    /// Compute escalating cooldown duration with optional Retry-After floor.
-    /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-    fn compute_cooldown(lane: &LaneState, _now: u64, cfg: &BreakerCfg) -> u64 {
-        Self::compute_cooldown_with_retry_after(lane, _now, cfg, None)
     }
 
     /// Compute escalating cooldown duration with optional Retry-After floor.
@@ -343,8 +336,9 @@ impl InMemoryStore {
     ) {
         let ls = self.get_lane(lane);
 
-        // Increment streak for escalation
-        let _new_streak = ls.streak.fetch_add(1, Ordering::Relaxed) + 1;
+        // NOTE: streak is owned by the record path (record_transient / record_rate_limit increment
+        // it once per failure; record_success resets it). open_state only reads it to escalate the
+        // cooldown, so it must NOT increment — that would double-count and inflate the backoff.
 
         // Compute cooldown with exponential backoff, respecting Retry-After floor if present
         let duration = Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
@@ -440,24 +434,47 @@ impl Default for BreakerCfg {
     }
 }
 
+impl From<&crate::config::BreakerCfg> for BreakerCfg {
+    /// Resolve the parsed config into the runtime breaker config the FSM evaluates.
+    /// `honor_retry_after` has no config knob (always honored), and an absent `trip` block
+    /// falls back to the ADR-0002 defaults.
+    fn from(c: &crate::config::BreakerCfg) -> Self {
+        let trip = c
+            .trip
+            .as_ref()
+            .map(|t| TripConfig {
+                mode: match t.mode {
+                    crate::config::BreakerTripMode::ErrorRate => TripMode::ErrorRate,
+                    crate::config::BreakerTripMode::Consecutive => TripMode::Consecutive,
+                },
+                window_s: t.window_s,
+                threshold: t.threshold,
+                min_requests: t.min_requests,
+                n: t.n,
+            })
+            .unwrap_or_default();
+        Self {
+            base_cooldown_secs: c.base_cooldown_secs,
+            max_cooldown_secs: c.max_cooldown_secs,
+            honor_retry_after: true,
+            trip,
+        }
+    }
+}
+
 /// Trip configuration mode.
 #[derive(Debug, Clone)]
 pub(crate) enum TripMode {
     ErrorRate,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     Consecutive,
 }
 
 /// Trip configuration parameters (ADR-0002 defaults).
 #[derive(Debug, Clone)]
 pub(crate) struct TripConfig {
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub mode: TripMode,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub window_s: u64,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub threshold: f64,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub min_requests: usize,
     pub n: u32, // For consecutive mode
 }
@@ -579,7 +596,13 @@ impl StateStore for InMemoryStore {
         ls.client_fault.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_transient(&self, lane: usize, _what: &str, retry_after: Option<u64>) {
+    fn record_transient(
+        &self,
+        lane: usize,
+        _what: &str,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
         let ls = self.get_lane(lane);
 
         if ls.dead.load(Ordering::Relaxed) {
@@ -592,71 +615,68 @@ impl StateStore for InMemoryStore {
         #[cfg(not(test))]
         let now_time = now();
 
+        // Record the failure: window + cumulative err + consecutive streak (streak is owned here,
+        // not by open_state). should_trip then evaluates the pool's configured trip condition.
         self.record_outcome_error_with_time(lane, now_time);
+        ls.streak.fetch_add(1, Ordering::Relaxed);
 
-        // Check trip condition
         let breaker_state = ls.breaker_state.load(Ordering::Acquire);
 
         if breaker_state == 0 {
-            // Closed -> evaluate trip
-            let cfg = BreakerCfg::default();
-
-            // For simplicity in this implementation, check if err count is high enough
-            let err_count = ls.err.load(Ordering::Relaxed);
-            if err_count >= 5 {
-                self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
+            // Closed -> evaluate the configured trip condition (error-rate or consecutive).
+            if Self::should_trip(ls, now_time, cfg) {
+                self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
             } else {
-                // Simple cooldown for transient errors (below trip threshold), honoring Retry-After floor
+                // Below the trip threshold: brief escalating cooldown, honoring Retry-After floor.
                 let duration =
-                    Self::compute_cooldown_with_retry_after(ls, now_time, &cfg, retry_after);
+                    Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
                 ls.cooldown_until
                     .store(now_time + duration, Ordering::Release);
             }
         } else if breaker_state == 2 {
             // HalfOpen -> probe failed, transition to Open with escalated cooldown
-            let cfg = BreakerCfg::default();
-            self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
+            self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
         }
-
-        ls.err.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_rate_limit(&self, lane: usize, now_time: u64, retry_after: Option<u64>) {
+    fn record_rate_limit(
+        &self,
+        lane: usize,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
         let ls = self.get_lane(lane);
 
         if ls.dead.load(Ordering::Relaxed) {
             return;
         }
 
-        // Record outcome in sliding window (rate limit counts as error)
-        let mut window = ls.outcome_window.lock().unwrap();
-        window.push(now_time);
-
-        // Increment streak for escalation
-        let _new_streak = ls.streak.fetch_add(1, Ordering::Relaxed) + 1;
+        // Record the failure: window + cumulative err + consecutive streak (a 429 is a consecutive
+        // failure for streak purposes). should_trip then applies the pool's configured trip rule.
+        {
+            let mut window = ls.outcome_window.lock().unwrap();
+            window.push(now_time);
+        }
+        ls.err.fetch_add(1, Ordering::Relaxed);
+        ls.streak.fetch_add(1, Ordering::Relaxed);
 
         let breaker_state = ls.breaker_state.load(Ordering::Acquire);
 
         if breaker_state == 0 {
-            // Closed -> evaluate trip with consecutive mode logic
-            let cfg = BreakerCfg::default();
-
-            // Use consecutive mode for rate limit (streak-based)
-            if _new_streak >= cfg.trip.n || ls.err.load(Ordering::Relaxed) >= 5 {
-                self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
+            // Closed -> evaluate the configured trip condition.
+            if Self::should_trip(ls, now_time, cfg) {
+                self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
             } else {
                 let duration =
-                    Self::compute_cooldown_with_retry_after(ls, now_time, &cfg, retry_after);
+                    Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
                 ls.cooldown_until
                     .store(now_time + duration, Ordering::Release);
             }
         } else if breaker_state == 2 {
             // HalfOpen -> probe failed
-            let cfg = BreakerCfg::default();
-            self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
+            self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
         }
-
-        ls.err.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_hard_down(&self, lane: usize, reason: &str) {
@@ -1114,6 +1134,127 @@ mod tests {
         matches!(state, BreakerState::Open { .. });
     }
 
+    // --- configured-breaker wiring: the pool's BreakerCfg actually drives the trip decision ---
+
+    /// A Consecutive-mode config with n=2 trips after exactly 2 transient failures via the public
+    /// record path — proving the configured threshold (not the hardcoded err>=5) is what fires.
+    #[test]
+    fn test_configured_consecutive_trip_fires_at_n() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(5000);
+
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                n: 2,
+            },
+        };
+
+        // One failure: streak=1 < n=2 → still Closed.
+        store.record_transient(0, "5xx", &cfg, None);
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "one failure must not trip a consecutive(n=2) breaker"
+        );
+
+        // Second consecutive failure: streak=2 >= n=2 → Open.
+        store.record_transient(0, "5xx", &cfg, None);
+        assert!(
+            matches!(store.breaker_state(0), BreakerState::Open { .. }),
+            "the configured consecutive threshold (n=2) must trip on the 2nd failure"
+        );
+    }
+
+    /// With the DEFAULT config (error-rate, min_requests=5), the same 2 failures do NOT trip —
+    /// confirming the config is what changed behavior above, not some unconditional rule.
+    #[test]
+    fn test_default_error_rate_does_not_trip_below_floor() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(6000);
+
+        let cfg = BreakerCfg::default(); // error-rate, min_requests=5
+        store.record_transient(0, "5xx", &cfg, None);
+        store.record_transient(0, "5xx", &cfg, None);
+
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "2 failures are below the default min_requests floor (5) → no trip"
+        );
+    }
+
+    /// An error-rate config with a low floor trips once enough windowed failures exceed the
+    /// configured threshold.
+    #[test]
+    fn test_configured_error_rate_trip_fires() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(7000);
+
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig {
+                mode: TripMode::ErrorRate,
+                window_s: 100,
+                threshold: 0.5,
+                min_requests: 3,
+                n: 99, // irrelevant in error-rate mode
+            },
+        };
+
+        store.record_transient(0, "5xx", &cfg, None); // count=1 < 3
+        assert_eq!(store.breaker_state(0), BreakerState::Closed);
+        store.record_transient(0, "5xx", &cfg, None); // count=2 < 3
+        assert_eq!(store.breaker_state(0), BreakerState::Closed);
+        store.record_transient(0, "5xx", &cfg, None); // count=3, fraction=1.0 >= 0.5 → trip
+        assert!(
+            matches!(store.breaker_state(0), BreakerState::Open { .. }),
+            "error-rate breaker must trip once floor is met and fraction exceeds threshold"
+        );
+    }
+
+    /// The config→runtime conversion maps every field (and defaults honor_retry_after + an absent
+    /// trip block).
+    #[test]
+    fn test_config_breaker_conversion() {
+        let ccfg = crate::config::BreakerCfg {
+            base_cooldown_secs: 7,
+            max_cooldown_secs: 99,
+            trip: Some(crate::config::BreakerTripConfig {
+                mode: crate::config::BreakerTripMode::Consecutive,
+                window_s: 42,
+                threshold: 0.8,
+                min_requests: 9,
+                n: 4,
+            }),
+        };
+        let rcfg = BreakerCfg::from(&ccfg);
+        assert_eq!(rcfg.base_cooldown_secs, 7);
+        assert_eq!(rcfg.max_cooldown_secs, 99);
+        assert!(rcfg.honor_retry_after, "always honored (no config knob)");
+        assert!(matches!(rcfg.trip.mode, TripMode::Consecutive));
+        assert_eq!(rcfg.trip.window_s, 42);
+        assert_eq!(rcfg.trip.n, 4);
+
+        // Absent trip block → ADR-0002 defaults.
+        let bare = crate::config::BreakerCfg {
+            base_cooldown_secs: 10,
+            max_cooldown_secs: 120,
+            trip: None,
+        };
+        let rbare = BreakerCfg::from(&bare);
+        assert!(matches!(rbare.trip.mode, TripMode::ErrorRate));
+        assert_eq!(rbare.trip.min_requests, 5);
+    }
+
     #[test]
     fn test_try_acquire_probe_exclusivity() {
         let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
@@ -1209,14 +1350,19 @@ mod tests {
 
         set_now_for_test(1000);
 
-        // First trip: streak=1 -> cooldown ~15s
+        // streak is owned by the record path now (open_state only reads it to escalate), so
+        // simulate the consecutive-failure count the record path would have set.
         let cfg = BreakerCfg::default();
+
+        // First trip after one failure: streak=1 -> cooldown ~15s.
+        store.get_lane(0).streak.store(1, Ordering::Relaxed);
         store.open_state(0, 1000, &cfg);
         let until1 = store.cooldown_remaining(0, 1000);
 
         set_now_for_test(2000); // Advance time past first cooldown
 
-        // Second trip: streak=2 -> cooldown ~30s (exponential backoff)
+        // Second trip after a second failure: streak=2 -> cooldown ~30s (exponential backoff).
+        store.get_lane(0).streak.store(2, Ordering::Relaxed);
         store.open_state(0, 2000, &cfg);
         let until2 = store.cooldown_remaining(0, 2000);
 
@@ -1385,7 +1531,7 @@ mod tests {
         set_now_for_test(1000);
 
         // Record rate limit with retry_after=45s (streak=1 -> computed would be ~30s)
-        store.record_rate_limit(0, 1000, Some(45));
+        store.record_rate_limit(0, 1000, &BreakerCfg::default(), Some(45));
 
         let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
         assert_eq!(
@@ -1405,7 +1551,7 @@ mod tests {
         store.get_lane(0).streak.store(0, Ordering::Relaxed);
 
         // Record transient error with retry_after=60s (streak=0 -> computed would be 15s)
-        store.record_transient(0, "timeout", Some(60));
+        store.record_transient(0, "timeout", &BreakerCfg::default(), Some(60));
 
         let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
         // Should honor retry_after floor of 60s: cooldown should be at least now + 60

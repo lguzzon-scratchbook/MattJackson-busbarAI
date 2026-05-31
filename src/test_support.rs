@@ -859,6 +859,7 @@ mod tests {
                     cap: 3,
                 }),
                 affinity: None,
+                breaker: None,
             },
         );
 
