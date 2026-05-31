@@ -38,7 +38,7 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // fields parsed but not wired (B-4xx routing)
+#[allow(dead_code)] // fields parsed but not wired into routing
 pub(crate) struct RootCfg {
     #[serde(default = "default_listen")]
     pub(crate) listen: String,
@@ -48,7 +48,7 @@ pub(crate) struct RootCfg {
     pub(crate) pools: HashMap<String, PoolCfg>,
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AuthCfg {
     #[serde(default = "default_auth_mode")]
@@ -88,7 +88,7 @@ fn default_auth_mode() -> String {
     "none".to_string()
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProviderCfg {
     #[serde(default = "default_protocol")]
@@ -108,7 +108,7 @@ fn default_protocol() -> String {
     "anthropic".to_string()
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct HealthCfg {
     pub(crate) interval_secs: Option<u64>,
@@ -127,7 +127,7 @@ fn neg1() -> i64 {
     -1
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PoolCfg {
     #[serde(default)]
@@ -142,7 +142,7 @@ pub(crate) struct PoolCfg {
     pub(crate) affinity: Option<AffinityCfg>,
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PoolMember {
     pub(crate) target: String,
@@ -231,7 +231,7 @@ fn default_max_cooldown() -> u64 {
     120
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct FailoverCfg {
     #[serde(default = "default_failover_deadline")]
@@ -250,7 +250,7 @@ fn default_cap() -> usize {
     3
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct OnExhaustedCfg {
     #[serde(default = "default_on_exhausted_action")]
@@ -339,7 +339,7 @@ impl OnExhausted {
     }
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AffinityCfg {
     #[serde(default = "default_affinity_mode")]
@@ -388,16 +388,16 @@ pub(crate) struct DeployCfg {
     pub(crate) providers: HashMap<String, ProviderDeploy>,
     pub(crate) models: HashMap<String, ModelCfg>,
     pub(crate) pools: HashMap<String, PoolCfg>,
-    /// B-603/B-604: optional observability sinks (OTLP traces + request-log webhook). Metrics
+    /// /: optional observability sinks (OTLP traces + request-log webhook). Metrics
     /// (`/metrics`) are always on and need no config.
     #[serde(default)]
     pub(crate) observability: Option<ObservabilityCfg>,
-    /// G-2 (0.12): optional governance (virtual keys, budgets, rate limits). Absent = disabled.
+    /// optional governance (virtual keys, budgets, rate limits). Absent = disabled.
     #[serde(default)]
     pub(crate) governance: Option<GovernanceCfg>,
 }
 
-/// Governance config (sprint 0.12). When present + enabled, callers authenticate with virtual keys
+/// Governance config. When present + enabled, callers authenticate with virtual keys
 /// (not the static auth token) and are subject to per-key allowed-pools / budgets / rate limits.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub(crate) struct GovernanceCfg {
@@ -406,11 +406,11 @@ pub(crate) struct GovernanceCfg {
     /// SQLite database path for the durable Store (ADR-0009). Defaults to `busbar-governance.db`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
-    /// G-3: flat cents charged per request for budget accounting (token-/model-priced budgets are a
+    /// flat cents charged per request for budget accounting (token-/model-priced budgets are a
     /// future refinement). Defaults to 1.
     #[serde(default = "default_price_per_request_cents")]
     pub(crate) price_per_request_cents: i64,
-    /// G-5: bearer token guarding the /admin management API. None = admin API disabled.
+    /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,
 }
@@ -423,15 +423,15 @@ fn default_price_per_request_cents() -> i64 {
     1
 }
 
-/// Observability sinks (sprint 0.11). All fields optional; absent = that sink is disabled.
+/// Observability sinks. All fields optional; absent = that sink is disabled.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub(crate) struct ObservabilityCfg {
     /// OTLP/HTTP traces endpoint (e.g. `http://localhost:4318/v1/traces`). When set, busbar
-    /// installs an OpenTelemetry tracer + exports spans (B-603).
+    /// installs an OpenTelemetry tracer + exports spans.
     #[serde(default)]
     pub(crate) otlp_endpoint: Option<String>,
     /// When set, busbar fires a best-effort (fire-and-forget) JSON request-log POST per request
-    /// to this URL (B-604).
+    /// to this URL.
     #[serde(default)]
     pub(crate) request_log_webhook_url: Option<String>,
 }
@@ -756,7 +756,7 @@ mod tests {
         assert!(provider_cfg.error_map.is_empty());
     }
 
-    // B-403: OnExhausted mode parsing tests
+    // OnExhausted mode parsing tests
     #[test]
     fn test_on_exhausted_parse_status_503_variants() {
         // Test all Status503 variants

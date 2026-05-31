@@ -589,7 +589,7 @@ impl ProtocolWriter for BedrockWriter {
     }
 
     fn upstream_path_for_stream(&self, model: &str, stream: bool) -> String {
-        // C-5: streaming uses ConverseStream (binary application/vnd.amazon.eventstream response).
+        // streaming uses ConverseStream (binary application/vnd.amazon.eventstream response).
         if stream {
             format!("/model/{}/converse-stream", model)
         } else {
@@ -602,7 +602,7 @@ impl ProtocolWriter for BedrockWriter {
         vec![]
     }
 
-    /// C-4: AWS SigV4 signing for the Converse request. The lane key encodes credentials as
+    /// AWS SigV4 signing for the Converse request. The lane key encodes credentials as
     /// `ACCESS_KEY_ID:SECRET_ACCESS_KEY` or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN`; the
     /// region is parsed from the host (`bedrock-runtime.<region>.amazonaws.com`); service=`bedrock`.
     fn sign_request(
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_bedrock_sigv4_sign_request_structure() {
-        // C-4: SigV4 header assembly + scope/region derivation. (The signing crypto itself is
+        // SigV4 header assembly + scope/region derivation. (The signing crypto itself is
         // verified against AWS's published vector in sigv4::tests.)
         let writer = BedrockWriter;
         let ctx = crate::proto::SigningContext {

@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::forward::forward_with_pool;
 use crate::state::{App, WeightedLane};
 
-/// G-2 (0.12): enforce a virtual key's allowed-pools list against the resolved target pool. No-op
+/// enforce a virtual key's allowed-pools list against the resolved target pool. No-op
 /// when governance is off (`gov.key` is None) or the key allows all pools. Returns a 403 response
 /// to short-circuit when the key may not use this pool.
 fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str) -> Option<Response> {
@@ -36,7 +36,7 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str) -> Option<Respon
     None
 }
 
-/// G-3 (0.12): reject (402) before forwarding when the resolved virtual key is already over its
+/// reject (402) before forwarding when the resolved virtual key is already over its
 /// budget for the current window. No-op when governance is off or the key has no budget cap.
 fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
@@ -53,7 +53,7 @@ fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Respo
     None
 }
 
-/// G-4 (0.12): reject (429 + Retry-After) before forwarding when the resolved virtual key is over
+/// reject (429 + Retry-After) before forwarding when the resolved virtual key is over
 /// its RPM/TPM for the current window. No-op when governance is off or the key has no rate cap.
 fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
@@ -71,7 +71,7 @@ fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Respons
     None
 }
 
-/// B-602/G-3: the ingress boundary — emit per-request observability metrics (one client request =
+/// /: the ingress boundary — emit per-request observability metrics (one client request =
 /// one call here, unlike the re-entrant forward_with_pool) AND charge the request to the virtual
 /// key's budget. Outcome is derived from the final status; duration is wall-clock.
 fn finish(
@@ -103,7 +103,7 @@ fn finish(
     )
     .record(elapsed.as_secs_f64());
 
-    // B-604: best-effort request-log webhook (no-op unless configured).
+    // best-effort request-log webhook (no-op unless configured).
     crate::observability::fire_request_log(crate::observability::build_request_log(
         crate::store::now(),
         ingress_protocol,
@@ -112,7 +112,7 @@ fn finish(
         elapsed.as_millis() as u64,
     ));
 
-    // G-3: charge the request to the virtual key's budget. Token-based cost is a future refinement
+    // charge the request to the virtual key's budget. Token-based cost is a future refinement
     // (tokens=0 here); the flat per-request price is what accrues today.
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
         g.record_request(key, crate::store::now(), 0);
@@ -121,7 +121,7 @@ fn finish(
 }
 
 // POST /v1/chat/completions — OpenAI-style ingress: model from body, same-protocol passthrough.
-// Cross-protocol translation (openai ingress → non-openai lane) is B-503 and NOT implemented here;
+// Cross-protocol translation (openai ingress → non-openai lane) is and NOT implemented here;
 // if the body's model resolves to a non-openai lane, this would send an OpenAI body upstream (wrong).
 #[tracing::instrument(name = "openai_ingress", skip_all)]
 pub(crate) async fn openai_ingress(
@@ -149,15 +149,15 @@ pub(crate) async fn openai_ingress(
         }
     };
 
-    // G-2: enforce the virtual key's allowed-pools against the requested model/pool.
+    // enforce the virtual key's allowed-pools against the requested model/pool.
     if let Some(resp) = pool_authorized(&gov, &model) {
         return resp;
     }
-    // G-3: reject over-budget keys before forwarding.
+    // reject over-budget keys before forwarding.
     if let Some(resp) = budget_check(&app, &gov) {
         return resp;
     }
-    // G-4: reject rate-limited keys before forwarding.
+    // reject rate-limited keys before forwarding.
     if let Some(resp) = rate_check(&app, &gov) {
         return resp;
     }
@@ -209,15 +209,15 @@ pub(crate) async fn named(
     // For now, caller_token is None - passthrough mode will use lane's api_key as fallback.
     let _caller_token = None;
 
-    // G-2: enforce the virtual key's allowed-pools against the named pool/model.
+    // enforce the virtual key's allowed-pools against the named pool/model.
     if let Some(resp) = pool_authorized(&gov, &name) {
         return resp;
     }
-    // G-3: reject over-budget keys before forwarding.
+    // reject over-budget keys before forwarding.
     if let Some(resp) = budget_check(&app, &gov) {
         return resp;
     }
-    // G-4: reject rate-limited keys before forwarding.
+    // reject rate-limited keys before forwarding.
     if let Some(resp) = rate_check(&app, &gov) {
         return resp;
     }
@@ -269,15 +269,15 @@ pub(crate) async fn adhoc(
     let _caller_token = None;
     let started = Instant::now();
 
-    // G-2: enforce the virtual key's allowed-pools against the ad-hoc model target.
+    // enforce the virtual key's allowed-pools against the ad-hoc model target.
     if let Some(resp) = pool_authorized(&gov, &model) {
         return resp;
     }
-    // G-3: reject over-budget keys before forwarding.
+    // reject over-budget keys before forwarding.
     if let Some(resp) = budget_check(&app, &gov) {
         return resp;
     }
-    // G-4: reject rate-limited keys before forwarding.
+    // reject rate-limited keys before forwarding.
     if let Some(resp) = rate_check(&app, &gov) {
         return resp;
     }

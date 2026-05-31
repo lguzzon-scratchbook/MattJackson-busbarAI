@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! In-crate mock-upstream test harness (B-105 / B-105b).
+//! In-crate mock-upstream test harness (/).
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -152,7 +152,7 @@ async fn mock_handler(
         state.record_auth_header(auth_header);
     }
 
-    // Record the received request body for translation / on-the-wire assertions (B-503a).
+    // Record the received request body for translation / on-the-wire assertions.
     let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .unwrap_or_default();
@@ -355,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_stream_json_relay() {
-        // B-602: ensure the Prometheus recorder is live so the forward path's counters record.
+        // ensure the Prometheus recorder is live so the forward path's counters record.
         crate::metrics::init();
         let state = Arc::new(MockServerState::new());
         state.push(MockResponse::Ok {
@@ -431,7 +431,7 @@ mod tests {
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8_lossy(&body_bytes);
         assert!(body_str.contains("Hello"));
-        // B-602: the forward path (forward → forward_with_pool) must have emitted the
+        // the forward path (forward → forward_with_pool) must have emitted the
         // upstream-attempt counter into the Prometheus exposition.
         assert!(
             crate::metrics::render().contains(crate::metrics::UPSTREAM_ATTEMPTS_TOTAL),
@@ -441,7 +441,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// C-2: GET /metrics through the REAL router (route table + auth middleware) over HTTP returns
+    /// GET /metrics through the REAL router (route table + auth middleware) over HTTP returns
     /// the Prometheus exposition with NO caller token — the endpoint is auth-exempt like /healthz.
     #[tokio::test]
     async fn test_metrics_endpoint_served_over_http_no_auth() {
@@ -494,7 +494,7 @@ mod tests {
         handle.abort();
     }
 
-    /// G-2: governance-enabled router enforces virtual-key auth + allowed-pools over real HTTP.
+    /// governance-enabled router enforces virtual-key auth + allowed-pools over real HTTP.
     #[tokio::test]
     async fn test_governance_vkey_auth_and_pool_acl() {
         use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
@@ -582,7 +582,7 @@ mod tests {
         handle.abort();
     }
 
-    /// G-3: a virtual key over its budget is rejected with 402 before forwarding.
+    /// a virtual key over its budget is rejected with 402 before forwarding.
     #[tokio::test]
     async fn test_governance_budget_402() {
         use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
@@ -646,7 +646,7 @@ mod tests {
         handle.abort();
     }
 
-    /// G-4: a virtual key over its RPM is rejected with 429 + Retry-After.
+    /// a virtual key over its RPM is rejected with 429 + Retry-After.
     #[tokio::test]
     async fn test_governance_rate_limit_429() {
         use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
@@ -725,7 +725,7 @@ mod tests {
         handle.abort();
     }
 
-    /// G-5: the /admin management API — create→list→usage→delete, admin-token gating, and a minted
+    /// the /admin management API — create→list→usage→delete, admin-token gating, and a minted
     /// secret then authenticating as a working virtual key.
     #[tokio::test]
     async fn test_governance_admin_api() {
@@ -1021,7 +1021,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-202: Pre-first-byte error triggers failover to next lane.
+    /// Pre-first-byte error triggers failover to next lane.
     #[tokio::test]
     async fn test_pre_first_byte_failover() {
         let state = Arc::new(MockServerState::new());
@@ -1150,7 +1150,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-202b: Mid-stream abort records lane breaker failure and does NOT failover.
+    /// Mid-stream abort records lane breaker failure and does NOT failover.
     #[tokio::test]
     async fn test_midstream_abort_records_and_no_failover() {
         let state = Arc::new(MockServerState::new());
@@ -1313,7 +1313,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// §6 Caveat: passthrough 401 does NOT trip breaker; token mode 401 DOES.
+    /// Caveat: passthrough 401 does NOT trip breaker; token mode 401 DOES.
     #[tokio::test]
     async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
         let state = Arc::new(MockServerState::new());
@@ -1499,7 +1499,7 @@ mod tests {
             let snap = app_token.store.snapshot(0, t);
             assert!(
                 !snap.dead,
-                "token-mode-401 → recoverable hard-down (long cooldown + probe), NOT permanent dead (B-303a)"
+                "token-mode-401 → recoverable hard-down (long cooldown + probe), NOT permanent dead"
             );
         }
 
@@ -1604,10 +1604,10 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-402: Failover exclusions test.
+    /// Failover exclusions test.
     /// 2-lane pool with transient errors → verify only max_failover attempts made, not unbounded retry of same lane.
     #[tokio::test]
-    async fn test_b402_failover_exclusions() {
+    async fn test_failover_exclusions() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -1739,10 +1739,10 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-402: Failover cap test.
+    /// Failover cap test.
     /// All lanes return TransientUpstream → max_failover attempts capped, then 503.
     #[tokio::test]
-    async fn test_b402_failover_cap() {
+    async fn test_failover_cap() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -1907,10 +1907,10 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-402: Failover deadline test.
+    /// Failover deadline test.
     /// Deadline computed once at start; verify default behavior works correctly with normal flow.
     #[tokio::test]
-    async fn test_b402_failover_deadline() {
+    async fn test_failover_deadline() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -2036,14 +2036,14 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-203: Stream inspection tap test for Anthropic SSE usage parsing.
+    /// Stream inspection tap test for Anthropic SSE usage parsing.
     ///
     /// Tests that the tap:
     /// (a) forwards byte-identical stream to client
     /// (b) extracts parsed usage from message_delta/message_stop events
     /// (c) maintains bounded memory via carry buffer cap
     #[tokio::test]
-    async fn test_b203_stream_inspection_tap_usage_parsing() {
+    async fn test_stream_inspection_tap_usage_parsing() {
         use crate::forward::{SseCarryBuffer, UsageTap};
 
         // Test 1: UsageTap extracts usage from Anthropic-style events
@@ -2251,7 +2251,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-301b: Disposition-matrix tests - prove error_map drives classification, not protocol.
+    /// Disposition-matrix tests - prove error_map drives classification, not protocol.
     /// Each assertion must FAIL against a wrong mapping to verify correctness.
     #[cfg(test)]
     mod disposition_matrix_tests {
@@ -2546,7 +2546,10 @@ mod tests {
             );
             {
                 let snap = app.store.snapshot(0, t);
-                assert!(!snap.dead, "Billing HardDown → recoverable (long cooldown + probe), not permanent dead (B-303a)");
+                assert!(
+                    !snap.dead,
+                    "Billing HardDown → recoverable (long cooldown + probe), not permanent dead"
+                );
                 assert_eq!(
                     snap.dead_reason, "billing / insufficient balance",
                     "dead reason should match"
@@ -2918,7 +2921,10 @@ mod tests {
             );
             {
                 let snap = app.store.snapshot(0, t);
-                assert!(!snap.dead, "Auth HardDown → recoverable (long cooldown + probe), not permanent dead (B-303a)");
+                assert!(
+                    !snap.dead,
+                    "Auth HardDown → recoverable (long cooldown + probe), not permanent dead"
+                );
                 assert!(
                     snap.dead_reason.contains("auth"),
                     "dead reason should mention auth"
@@ -3186,7 +3192,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_client_fault_400_relayed_verbatim_no_penalty() {
-            // B-304: ClientFault (400 invalid_request) → relay verbatim, NO breaker penalty
+            // ClientFault (400 invalid_request) → relay verbatim, NO breaker penalty
             let state = Arc::new(MockServerState::new());
             state.push(MockResponse::Ok {
                 status: StatusCode::BAD_REQUEST,
@@ -3288,7 +3294,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_client_fault_no_failover_two_lanes() {
-            // B-304: ClientFault on lane 0 → lane 1 NOT hit (no failover)
+            // ClientFault on lane 0 → lane 1 NOT hit (no failover)
             let state0 = Arc::new(MockServerState::new());
             let state1 = Arc::new(MockServerState::new());
 
@@ -3417,7 +3423,7 @@ mod tests {
         }
     }
 
-    /// B-403b: Status503 mode test - all lanes tripped, verify 503 with Retry-After header.
+    /// Status503 mode test - all lanes tripped, verify 503 with Retry-After header.
     #[tokio::test]
     async fn test_exhaustion_status_503_with_retry_after() {
         let state = Arc::new(MockServerState::new());
@@ -3547,7 +3553,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-403b: LeastBad mode — both members Open (tripped), the request is ACTUALLY served
+    /// LeastBad mode — both members Open (tripped), the request is ACTUALLY served
     /// (200) by the member with the SOONEST cooldown expiry, not the other one.
     /// Lane 0 (far cooldown) and lane 1 (soon cooldown) point at distinct mock servers that
     /// return distinguishable bodies, so we can assert WHICH member served.
@@ -3705,7 +3711,7 @@ mod tests {
         server1.shutdown().await;
     }
 
-    /// B-403b: FallbackPool loop guard — an A→B→A config (pool_a→pool_b→pool_a), every member
+    /// FallbackPool loop guard — an A→B→A config (pool_a→pool_b→pool_a), every member
     /// tripped, must TERMINATE via the visited-set and return 503 rather than recursing forever.
     /// This is the safety-critical test for multi-level fallback chains.
     #[tokio::test]
@@ -3829,9 +3835,9 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-403b: FallbackPool actually ROUTES — primary pool all tripped, mode=FallbackPool,
+    /// FallbackPool actually ROUTES — primary pool all tripped, mode=FallbackPool,
     /// the backup pool has a healthy member, and the request is genuinely SERVED (200) by the
-    /// backup, not a 503-with-header stub. This is the test B-403 skipped.
+    /// backup, not a 503-with-header stub. This is the test skipped.
     #[tokio::test]
     async fn test_fallback_pool_routes_to_backup() {
         use crate::store::now as store_now;
@@ -3962,7 +3968,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-404 Test 1: Sticky while healthy - same x-session-id should route to same member.
+    /// Test 1: Sticky while healthy - same x-session-id should route to same member.
     #[tokio::test]
     async fn test_sticky_session_while_healthy() {
         use std::collections::HashMap;
@@ -4188,7 +4194,7 @@ mod tests {
         server2.shutdown().await;
     }
 
-    /// B-404 Test 2: Sticky member tripped → yields to healthy member.
+    /// Test 2: Sticky member tripped → yields to healthy member.
     #[tokio::test]
     async fn test_sticky_yields_when_tripped() {
         use std::collections::HashMap;
@@ -4332,7 +4338,7 @@ mod tests {
         server1.shutdown().await;
     }
 
-    /// B-404 Test 3: No header → system block hash for affinity.
+    /// Test 3: No header → system block hash for affinity.
     #[tokio::test]
     async fn test_sticky_from_system_block() {
         use std::collections::HashMap;
@@ -4518,7 +4524,7 @@ mod tests {
         }
     }
 
-    /// B-501b: OpenAI ingress same-protocol passthrough test.
+    /// OpenAI ingress same-protocol passthrough test.
     #[tokio::test]
     async fn test_openai_ingress_same_protocol_passthrough() {
         use crate::route;
@@ -4635,7 +4641,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-501b: OpenAI ingress missing model → 400.
+    /// OpenAI ingress missing model → 400.
     #[tokio::test]
     async fn test_openai_ingress_missing_model() {
         use crate::route;
@@ -4681,7 +4687,7 @@ mod tests {
         assert_eq!(response.status().as_u16(), 400);
     }
 
-    /// B-501b: OpenAI ingress unknown model → 404.
+    /// OpenAI ingress unknown model → 404.
     #[tokio::test]
     async fn test_openai_ingress_unknown_model() {
         use crate::route;
@@ -4728,11 +4734,11 @@ mod tests {
         assert_eq!(response.status().as_u16(), 404);
     }
 
-    /// B-503a: Cross-protocol request translation test.
+    /// Cross-protocol request translation test.
     /// Build App with ONE anthropic lane, call forward_with_pool with OpenAI-format body and ingress_protocol="openai".
     /// Assert the MOCK UPSTREAM RECEIVED an Anthropic-shaped body (top-level "system" field, messages without system entry).
     #[tokio::test]
-    async fn test_b503a_cross_protocol_openai_to_anthropic() {
+    async fn test_cross_protocol_openai_to_anthropic() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -4849,10 +4855,10 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-503a: Same-protocol request passthrough test.
+    /// Same-protocol request passthrough test.
     /// anthropic ingress → anthropic lane (ingress_protocol="anthropic") → mock receives body with model rewritten, NO translation applied.
     #[tokio::test]
-    async fn test_b503a_same_protocol_anthropic_passthrough() {
+    async fn test_same_protocol_anthropic_passthrough() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -4940,11 +4946,11 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-503b-2: cross-protocol STREAMING response translation end-to-end. An OpenAI egress lane
+    /// cross-protocol STREAMING response translation end-to-end. An OpenAI egress lane
     /// streams OpenAI chunks; an Anthropic-ingress caller must receive ANTHROPIC SSE `event:`
     /// frames (translated on the wire), not raw OpenAI chunks.
     #[tokio::test]
-    async fn test_b503b2_cross_protocol_stream_openai_lane_to_anthropic_client() {
+    async fn test_cross_protocol_stream_openai_lane_to_anthropic_client() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -5050,11 +5056,11 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-503c-2: NON-streaming cross-protocol response translation end-to-end. An OpenAI egress
+    /// NON-streaming cross-protocol response translation end-to-end. An OpenAI egress
     /// lane returns a chat.completion JSON; an Anthropic-ingress caller must receive an
     /// Anthropic-shaped message (translated whole-response), not the raw OpenAI body.
     #[tokio::test]
-    async fn test_b503c2_cross_protocol_nonstream_openai_lane_to_anthropic_client() {
+    async fn test_cross_protocol_nonstream_openai_lane_to_anthropic_client() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -5167,10 +5173,10 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-504a: a context-length error fails over to another lane WITHOUT penalizing the breaker
+    /// a context-length error fails over to another lane WITHOUT penalizing the breaker
     /// (the lane is healthy — the request was just too big for that model).
     #[tokio::test]
-    async fn test_b504a_context_length_failover_no_penalty() {
+    async fn test_context_length_failover_no_penalty() {
         use std::collections::HashMap;
 
         // One mock server, LIFO queue: push the success LAST-but-popped-SECOND. responses.pop()
@@ -5265,12 +5271,12 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-504b: Prefers larger context on ContextLength failover.
+    /// Prefers larger context on ContextLength failover.
     /// Pool with lane0 (context_max Some(8000), returns context-length error) +
     /// lane1 (context_max Some(200000), returns 200). Request → lane0 ContextLength →
     /// failover EXCLUDES lane0 (and any ≤8000) → lane1 (200000) SERVES (assert 200 + lane1 served).
     #[tokio::test]
-    async fn test_b504b_prefers_larger_context_max() {
+    async fn test_prefers_larger_context_max() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());
@@ -5403,11 +5409,11 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-504b: Same-size pool exhausts on ContextLength failover.
+    /// Same-size pool exhausts on ContextLength failover.
     /// Two lanes both context_max Some(8000), both return context-length →
     /// failover finds no bigger lane → exhausts (returns 503/exhaustion, neither lane tripped).
     #[tokio::test]
-    async fn test_b504b_same_size_pool_exhausts() {
+    async fn test_same_size_pool_exhausts() {
         use std::collections::HashMap;
 
         let state = Arc::new(MockServerState::new());

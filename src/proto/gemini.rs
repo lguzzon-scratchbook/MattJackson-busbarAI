@@ -48,7 +48,7 @@ impl ProtocolReader for GeminiReader {
         let text = String::from_utf8_lossy(body);
         let lower = text.to_lowercase();
 
-        // B-504: context-length-exceeded via message pattern
+        // context-length-exceeded via message pattern
         if lower.contains("input is longer than the maximum number of tokens")
             || (lower.contains("maximum-tokens") && lower.contains("requested"))
         {
@@ -593,12 +593,12 @@ impl ProtocolWriter for GeminiWriter {
         "/v1beta/models"
     }
 
-    /// B-510c/C-3: Gemini's URL embeds the model AND the stream mode. Streaming requests go to
+    /// /: Gemini's URL embeds the model AND the stream mode. Streaming requests go to
     /// `:streamGenerateContent?alt=sse` (the gemini reader already decodes those SSE chunks);
     /// non-streaming to `:generateContent`.
     fn upstream_path_for_stream(&self, model: &str, stream: bool) -> String {
         if stream {
-            // C-3: SSE streaming endpoint. `alt=sse` yields `data:`-framed chunks the gemini
+            // SSE streaming endpoint. `alt=sse` yields `data:`-framed chunks the gemini
             // reader's read_response_events already decodes.
             format!("/v1beta/models/{model}:streamGenerateContent?alt=sse")
         } else {
@@ -858,7 +858,7 @@ impl ProtocolWriter for GeminiWriter {
         }
     }
 
-    #[allow(dead_code)] // Used by B-502b/B-503 tests
+    #[allow(dead_code)] // Used by / tests
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         // Build candidates array (Gemini whole-response format)
         let mut parts_arr: Vec<serde_json::Value> = Vec::new();

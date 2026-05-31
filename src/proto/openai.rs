@@ -39,7 +39,7 @@ impl ProtocolReader for OpenAiReader {
     }
 
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
-        // B-504: context-length-exceeded — the lane is healthy; this must fail over (to a
+        // context-length-exceeded — the lane is healthy; this must fail over (to a
         // larger-context model), not penalize the breaker. Detect by OpenAI code/message first.
         let code_is_context = serde_json::from_slice::<serde_json::Value>(body)
             .ok()
@@ -313,7 +313,7 @@ impl ProtocolReader for OpenAiReader {
         None
     }
 
-    /// OpenAI's flat stream → IR block-structured events (B-502c-2b). One chat.completion.chunk
+    /// OpenAI's flat stream → IR block-structured events. One chat.completion.chunk
     /// may carry role + content + finish at once → up to several IR events. State synthesizes the
     /// block boundaries OpenAI doesn't have.
     fn read_response_events(
@@ -588,7 +588,7 @@ impl ProtocolReader for OpenAiReader {
 }
 
 /// Read an OpenAI-format block from JSON.
-#[allow(dead_code)] // Used by tests only (B-502c)
+#[allow(dead_code)] // Used by tests only
 fn read_openai_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrError> {
     let obj = block_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -633,7 +633,7 @@ fn read_openai_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock
 }
 
 /// Read an OpenAI-format tool from JSON.
-#[allow(dead_code)] // Used by tests only (B-502c)
+#[allow(dead_code)] // Used by tests only
 fn read_openai_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError> {
     let obj = tool_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -867,7 +867,7 @@ impl ProtocolWriter for OpenAiWriter {
         serde_json::Value::Object(out)
     }
 
-    #[allow(dead_code)] // Used by B-502b/B-503 tests
+    #[allow(dead_code)] // Used by / tests
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
             IrStreamEvent::MessageStart { role, .. } => {

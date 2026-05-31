@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! Observability sinks beyond Prometheus `/metrics`: a best-effort request-log webhook (B-604) and
-//! OTLP trace export (B-603). Both are opt-in via the `observability` config section; with no
+//! Observability sinks beyond Prometheus `/metrics`: a best-effort request-log webhook and
+//! OTLP trace export. Both are opt-in via the `observability` config section; with no
 //! config they are no-ops. State lives in process-wide `OnceLock`s (set once at startup) so the
 //! request path can reach it without threading new fields through `App` and its many constructors.
 
@@ -57,7 +57,7 @@ pub(crate) fn fire_request_log(payload: Value) {
     });
 }
 
-/// B-603: install an OpenTelemetry tracer that exports OTLP/HTTP spans to `endpoint`, bridged into
+/// install an OpenTelemetry tracer that exports OTLP/HTTP spans to `endpoint`, bridged into
 /// the `tracing` ecosystem. Called once at startup when `observability.otlp_endpoint` is set.
 /// Resilient: a build/exporter failure logs and returns rather than crashing serving.
 pub(crate) fn init_otlp(endpoint: &str) {

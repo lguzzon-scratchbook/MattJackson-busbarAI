@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Matthew Jackson
 
 //! ADR-0006 protocol seam: agnostic core vs. protocol-specific edges.
-//! Per B-500: split the flat `Protocol` trait into Reader (wire→signal) + Writer (intent→wire),
+//! Per: split the flat `Protocol` trait into Reader (wire→signal) + Writer (intent→wire),
 //! bundle them in `Protocol`, and add a string-keyed registry for provider lookup.
 
 use axum::http::{header::HeaderValue, HeaderName, StatusCode};
@@ -12,12 +12,12 @@ use std::sync::Arc;
 pub(crate) use crate::breaker::CanonicalSignal;
 pub(crate) use crate::breaker::StatusClass;
 
-// Import types needed for response/stream IR (B-502b)
+// Import types needed for response/stream IR
 use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
 
-/// IrError is an alias for CanonicalSignal (B-500 scaffolding).
-/// Per ADR-0007: keep it compatible with CanonicalSignal; B-502 may promote to a richer struct.
-#[allow(dead_code)] // Used by B-501/B-502 for IR bridge
+/// IrError is an alias for CanonicalSignal (scaffolding).
+/// Per ADR-0007: keep it compatible with CanonicalSignal; may promote to a richer struct.
+#[allow(dead_code)] // Used by / for IR bridge
 pub(crate) type IrError = crate::breaker::CanonicalSignal;
 
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
@@ -27,26 +27,26 @@ pub(crate) trait ProtocolReader: Send + Sync {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError;
 
     /// Classify a response into a canonical signal (two-stage pipeline).
-    #[allow(dead_code)] // Used by B-502a/B-503
+    #[allow(dead_code)] // Used by /
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal;
 
     /// Read an IR request from wire JSON.
-    #[allow(dead_code)] // Used by B-502a/B-503
+    #[allow(dead_code)] // Used by /
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError>;
 
-    /// Read a response/stream event from already-de-framed SSE data (B-502b).
-    #[allow(dead_code)] // Used by B-502b/B-503
+    /// Read a response/stream event from already-de-framed SSE data.
+    #[allow(dead_code)] // Used by /
     fn read_response_event(
         &self,
         event_type: &str,
         data: &serde_json::Value,
     ) -> Option<IrStreamEvent>;
 
-    /// Fan-out variant (B-502c-2b): one wire event/chunk → 0..n IR stream events, threading
+    /// Fan-out variant: one wire event/chunk → 0..n IR stream events, threading
     /// per-request decode state. Anthropic is 1:1 (wraps the singular, ignores state); OpenAI's
     /// flat stream synthesizes block boundaries via the state. This is the general translation
-    /// API the live response-translation path (B-503) calls.
-    #[allow(dead_code)] // Used by B-503
+    /// API the live response-translation path calls.
+    #[allow(dead_code)] // Used by
     fn read_response_events(
         &self,
         event_type: &str,
@@ -55,15 +55,15 @@ pub(crate) trait ProtocolReader: Send + Sync {
     ) -> Vec<IrStreamEvent>;
 
     /// Read a whole (non-streaming) response from wire JSON.
-    #[allow(dead_code)] // Used by B-503c-1
+    #[allow(dead_code)] // Used by
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError>;
 
     /// Clone this reader as a trait object.
-    #[allow(dead_code)] // Used by B-502a for Protocol cloning
+    #[allow(dead_code)] // Used by for Protocol cloning
     fn clone_box(&self) -> Box<dyn ProtocolReader>;
 }
 
-/// Per-request signing context (C-4). Most protocols' `auth_headers` ignore this; protocols that
+/// Per-request signing context. Most protocols' `auth_headers` ignore this; protocols that
 /// sign the whole request (AWS SigV4 for Bedrock) need the method/host/path/body/time.
 pub(crate) struct SigningContext<'a> {
     /// Upstream host (no scheme), e.g. `bedrock-runtime.us-east-1.amazonaws.com`.
@@ -81,7 +81,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Returns the upstream path suffix (e.g., "/v1/messages").
     fn upstream_path(&self) -> &str;
 
-    /// B-510c: the upstream path for a specific model. Most protocols ignore the model and
+    /// the upstream path for a specific model. Most protocols ignore the model and
     /// return a fixed path (the default); Gemini's path embeds the model
     /// (`/v1beta/models/{model}:generateContent`). `forward` uses this to build the URL.
     fn upstream_path_for(&self, _model: &str) -> String {
@@ -90,7 +90,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
 
     /// Per-request upstream path that also knows whether the caller wants a streamed response.
     /// Defaults to `upstream_path_for` (most protocols use one path for both stream and non-stream).
-    /// Gemini overrides it: streaming uses `:streamGenerateContent?alt=sse` (C-3), non-streaming
+    /// Gemini overrides it: streaming uses `:streamGenerateContent?alt=sse`, non-streaming
     /// `:generateContent`.
     fn upstream_path_for_stream(&self, model: &str, _stream: bool) -> String {
         self.upstream_path_for(model)
@@ -100,30 +100,30 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)>;
 
     /// Per-request auth, given the signing context. Defaults to the static `auth_headers` (bearer /
-    /// api-key protocols ignore `ctx`). Bedrock overrides this to compute AWS SigV4 headers (C-4),
+    /// api-key protocols ignore `ctx`). Bedrock overrides this to compute AWS SigV4 headers,
     /// which depend on the method/host/path/body/timestamp.
     fn sign_request(&self, key: &str, _ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
         self.auth_headers(key)
     }
 
     /// Rewrites the model field in the request body.
-    #[allow(dead_code)] // Used by B-502a/B-503
+    #[allow(dead_code)] // Used by /
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str);
 
     /// Write an IR request to wire JSON.
-    #[allow(dead_code)] // Used by B-502a/B-503
+    #[allow(dead_code)] // Used by /
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value;
 
-    /// Write a response/stream event to wire (event_type, data) (B-502b).
-    #[allow(dead_code)] // Used by B-502b/B-503
+    /// Write a response/stream event to wire (event_type, data).
+    #[allow(dead_code)] // Used by /
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)>;
 
     /// Write a whole (non-streaming) response to wire JSON.
-    #[allow(dead_code)] // Used by B-503c-1
+    #[allow(dead_code)] // Used by
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value;
 
     /// Clone this writer as a trait object.
-    #[allow(dead_code)] // Used by B-502a for Protocol cloning
+    #[allow(dead_code)] // Used by for Protocol cloning
     fn clone_box(&self) -> Box<dyn ProtocolWriter>;
 }
 
@@ -170,7 +170,7 @@ impl Protocol {
     }
 
     /// Returns the protocol name ("anthropic", "openai", etc.).
-    #[allow(dead_code)] // Reserved for future extensibility (B-501)
+    #[allow(dead_code)] // Reserved for future extensibility
     pub(crate) fn name(&self) -> &str {
         self.name
     }
@@ -196,45 +196,45 @@ impl Protocol {
     }
 
     /// Construct a Gemini protocol instance.
-    #[allow(dead_code)] // Reserved for B-510 integration (later cycle)
+    #[allow(dead_code)] // Reserved for integration (later cycle)
     pub(crate) fn gemini() -> Self {
         Self::new("gemini", GeminiReader, GeminiWriter)
     }
 
     /// Construct an OpenAI Responses protocol instance.
-    #[allow(dead_code)] // Reserved for B-540b integration (later cycle)
+    #[allow(dead_code)] // Reserved for integration (later cycle)
     pub(crate) fn responses() -> Self {
         Self::new("responses", ResponsesReader, ResponsesWriter)
     }
 
     /// Construct a Bedrock protocol instance.
-    #[allow(dead_code)] // Reserved for B-530b/B-530c integration (later cycle)
+    #[allow(dead_code)] // Reserved for / integration (later cycle)
     pub(crate) fn bedrock() -> Self {
         Self::new("bedrock", BedrockReader, BedrockWriter)
     }
 }
 
 /// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
-#[allow(dead_code)] // used by forward (B-503a)
+#[allow(dead_code)] // used by forward
 pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
         "anthropic" => Some(Protocol::anthropic()),
         "bedrock" => Some(Protocol::bedrock()),
-        #[allow(dead_code)] // Reserved for B-510 integration (later cycle)
+        #[allow(dead_code)] // Reserved for integration (later cycle)
         "gemini" => Some(Protocol::gemini()),
         "openai" => Some(Protocol::openai()),
-        #[allow(dead_code)] // Reserved for B-540b integration (later cycle)
+        #[allow(dead_code)] // Reserved for integration (later cycle)
         "responses" => Some(Protocol::responses()),
         _ => None,
     }
 }
 
-/// B-503b: pure cross-protocol response-stream translator. Feed EGRESS-protocol SSE bytes,
+/// pure cross-protocol response-stream translator. Feed EGRESS-protocol SSE bytes,
 /// get the equivalent INGRESS-protocol SSE bytes — composing `egress.reader().read_response_events`
 /// (wire → IR, stateful fan-out) with `ingress.writer().write_response_event` (IR → wire). Holds
 /// a reassembly buffer for frames split across chunks and the IR decode state across the stream.
-/// The async wiring into the live stream path (FirstByteBody) is B-503b-2.
-#[allow(dead_code)] // wired into FirstByteBody by B-503b-2
+/// The async wiring into the live stream path (FirstByteBody) is.
+#[allow(dead_code)] // wired into FirstByteBody by
 pub(crate) struct StreamTranslate {
     ingress: Protocol,
     egress: Protocol,
@@ -242,11 +242,11 @@ pub(crate) struct StreamTranslate {
     buf: Vec<u8>,
     /// ingress == "openai" → the stream must terminate with `data: [DONE]\n\n`.
     emit_done: bool,
-    /// C-5: egress == "bedrock" → frames are binary `application/vnd.amazon.eventstream`, not SSE.
+    /// egress == "bedrock" → frames are binary `application/vnd.amazon.eventstream`, not SSE.
     egress_eventstream: bool,
 }
 
-#[allow(dead_code)] // wired into FirstByteBody by B-503b-2
+#[allow(dead_code)] // wired into FirstByteBody by
 impl StreamTranslate {
     /// Build a translator for an ingress→egress pair. `None` if either protocol is unknown OR
     /// ingress == egress (no translation needed — the caller does native passthrough).
@@ -285,7 +285,7 @@ impl StreamTranslate {
         let mut out: Vec<u8> = Vec::new();
 
         if self.egress_eventstream {
-            // C-5: egress is binary AWS event-stream framing (Bedrock ConverseStream). The event
+            // egress is binary AWS event-stream framing (Bedrock ConverseStream). The event
             // name lives in the frame's `:event-type` header, not the JSON payload; the Bedrock
             // reader keys off a `type` field, so fold the header into the payload.
             for (event_type, payload) in crate::eventstream::drain_frames(&mut self.buf) {
@@ -378,14 +378,14 @@ pub(crate) use responses::{ResponsesReader, ResponsesWriter};
 /// String-keyed registry for protocol lookup (ADR-0008). Shared infrastructure: lives in the
 /// proto module root, not any single protocol's file. `with_builtins` registers every protocol.
 #[derive(Default)]
-#[allow(dead_code)] // Scaffolding: not wired into App/Lane yet (B-501)
+#[allow(dead_code)] // Scaffolding: not wired into App/Lane yet
 pub(crate) struct ProtocolRegistry {
     map: std::collections::HashMap<String, Arc<Protocol>>,
 }
 
 impl ProtocolRegistry {
     /// Create a new registry with built-in protocols.
-    #[allow(dead_code)] // Used by B-501 for provider resolution
+    #[allow(dead_code)] // Used by for provider resolution
     pub(crate) fn with_builtins() -> Self {
         let mut map = std::collections::HashMap::new();
         map.insert("anthropic".to_string(), Arc::new(Protocol::anthropic()));
@@ -397,7 +397,7 @@ impl ProtocolRegistry {
     }
 
     /// Get a protocol by name.
-    #[allow(dead_code)] // Used by B-501 for provider resolution
+    #[allow(dead_code)] // Used by for provider resolution
     pub(crate) fn get(&self, name: &str) -> Option<Arc<Protocol>> {
         self.map.get(name).cloned()
     }
@@ -1188,7 +1188,7 @@ mod tests {
         #[test]
         fn test_anthropic_request_decode_assertions() {
             // DECODE assertions on rich canonical fixture - exact field values that a doctored
-            // fixture cannot fake (anti-fab / TREND #9 + #10)
+            // fixture cannot fake (anti-fab / + #10)
             let registry = ProtocolRegistry::with_builtins();
             let protocol = registry.get("anthropic").expect("anthropic should exist");
             let reader = protocol.reader();
@@ -1314,7 +1314,7 @@ mod tests {
             // Round-trip identity: semantic equivalence via decoded IR (NOT byte-identical) because
             // serializer adds is_error:false for tool_result blocks that had no is_error field in input.
             // This is documented semantic equivalence per anti-fab spec - assert on DECODED IR directly
-            // which is the ground truth that a doctored fixture cannot fake (TREND #9 + #10).
+            // which is the ground truth that a doctored fixture cannot fake (+ #10).
             let registry = ProtocolRegistry::with_builtins();
             let protocol = registry.get("anthropic").expect("anthropic should exist");
             let reader = protocol.reader();
@@ -1430,7 +1430,7 @@ mod tests {
         #[test]
         fn test_openai_request_decode_assertions() {
             // DECODE assertions on canonical OpenAI fixture - exact field values that a doctored
-            // fixture cannot fake (anti-fab / TREND #9 + #10)
+            // fixture cannot fake (anti-fab / + #10)
             let registry = ProtocolRegistry::with_builtins();
             let protocol = registry.get("openai").expect("openai should exist");
             let reader = protocol.reader();
@@ -1829,7 +1829,7 @@ mod tests {
                 assert_eq!(usage.cache_creation_input_tokens, Some(30));
                 assert_eq!(usage.cache_read_input_tokens, Some(200));
 
-                // Verify they weren't collapsed: input != sum of cache tokens (anti-fab TREND #9)
+                // Verify they weren't collapsed: input != sum of cache tokens (anti-fab)
                 let cache_sum = 30 + 200;
                 assert_ne!(
                     100, cache_sum,
@@ -2082,7 +2082,7 @@ mod stream_fanout_tests {
     use crate::ir::{IrBlockMeta, IrDelta, IrRole, IrStreamEvent, IrUsage, StreamDecodeState};
     use serde_json::json;
 
-    // B-502c-2b: OpenAI flat stream → Anthropic-shaped IR events. Exact-sequence decode asserts
+    // OpenAI flat stream → Anthropic-shaped IR events. Exact-sequence decode asserts
     // (ungameable: the expected Vec is derived from the state-machine spec, not from output).
     #[test]
     fn test_openai_read_fanout_text() {
@@ -2240,7 +2240,7 @@ mod stream_fanout_tests {
 mod stream_translate_tests {
     use super::*;
 
-    /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for C-5 tests.
+    /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for tests.
     fn es_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         let name = b":event-type";
         let mut headers = vec![name.len() as u8];
@@ -2259,7 +2259,7 @@ mod stream_translate_tests {
         f
     }
 
-    /// C-5: a Bedrock ConverseStream (binary event-stream egress) translates to Anthropic SSE for
+    /// a Bedrock ConverseStream (binary event-stream egress) translates to Anthropic SSE for
     /// the caller — proving the eventstream decoder → IR → ingress-writer path end to end.
     #[test]
     fn test_translate_bedrock_eventstream_egress_to_anthropic_ingress() {
@@ -2444,7 +2444,7 @@ mod stream_translate_tests {
     }
 
     // ============================================================
-    // B-503c-1: Whole-response (non-streaming) R/W tests
+    // Whole-response (non-streaming) R/W tests
     // ============================================================
 
     #[test]
@@ -2699,7 +2699,7 @@ mod stream_translate_tests {
         assert_eq!(ir1, ir2, "decoded IR must be identical after round-trip");
     }
 
-    // B-510a: Gemini decode test - systemInstruction + contents with mixed blocks + tools
+    // Gemini decode test - systemInstruction + contents with mixed blocks + tools
     #[test]
     fn test_gemini_decode() {
         let j = serde_json::json!({
@@ -2828,7 +2828,7 @@ mod stream_translate_tests {
         assert!(ir.stream);
     }
 
-    // B-510a: Gemini round-trip test - write_request(read_request(j)) == j for canonical fixture
+    // Gemini round-trip test - write_request(read_request(j)) == j for canonical fixture
     #[test]
     fn test_gemini_roundtrip_identity() {
         let j = serde_json::json!({
@@ -2855,7 +2855,7 @@ mod stream_translate_tests {
         assert_eq!(roundtrip, j, "round-trip must be byte-identical");
     }
 
-    // B-510a: Protocol::gemini() resolves correctly with working reader/writer
+    // Protocol::gemini resolves correctly with working reader/writer
     #[test]
     fn test_gemini_protocol_resolves() {
         let proto = Protocol::gemini();
@@ -2875,7 +2875,7 @@ mod stream_translate_tests {
         let output = writer.write_request(&ir);
         assert!(output.as_object().unwrap().contains_key("contents"));
 
-        // Verify other protocol methods. B-510c: the real per-request path embeds the model via
+        // Verify other protocol methods.: the real per-request path embeds the model via
         // upstream_path_for(); upstream_path() is just the model-independent base.
         assert_eq!(writer.upstream_path(), "/v1beta/models");
         assert_eq!(
@@ -2919,7 +2919,7 @@ mod stream_translate_tests {
         assert_eq!(headers[0].0.as_str(), "authorization");
         assert_eq!(headers[0].1.to_str().unwrap(), "Bearer sk-test");
 
-        // C-3: Gemini selects the streaming vs non-streaming endpoint by request intent.
+        // Gemini selects the streaming vs non-streaming endpoint by request intent.
         let gemini = Protocol::gemini();
         assert_eq!(
             gemini
@@ -2939,8 +2939,8 @@ mod stream_translate_tests {
             Protocol::openai().writer().upstream_path_for("x")
         );
 
-        // Bedrock: model-in-path Converse URL + native SigV4 auth (C-4) + ConverseStream
-        // event-stream decoding (C-5). Fully first-class.
+        // Bedrock: model-in-path Converse URL + native SigV4 auth + ConverseStream
+        // event-stream decoding. Fully first-class.
         let bedrock = Protocol::bedrock();
         assert_eq!(bedrock.name(), "bedrock");
         assert_eq!(
@@ -2955,7 +2955,7 @@ mod gemini_tests {
     use super::*;
     use crate::ir::{IrBlockMeta, IrDelta, IrRole, IrStreamEvent};
 
-    // B-510b: read_response decode - Gemini generateContent response with text + functionCall
+    // read_response decode - Gemini generateContent response with text + functionCall
     #[test]
     fn test_gemini_read_response_decode() {
         let j = serde_json::json!({
@@ -3010,7 +3010,7 @@ mod gemini_tests {
         assert_eq!(resp.usage.output_tokens, 8);
     }
 
-    // B-510b: whole-response round-trip - write_response(read_response(j)) == j
+    // whole-response round-trip - write_response(read_response(j)) == j
     #[test]
     fn test_gemini_read_write_response_roundtrip() {
         let j = serde_json::json!({
@@ -3037,7 +3037,7 @@ mod gemini_tests {
         assert_eq!(roundtrip, j, "whole-response round-trip must be identical");
     }
 
-    // B-510b: stream fan-out - feed Gemini chunk sequence through StreamDecodeState
+    // stream fan-out - feed Gemini chunk sequence through StreamDecodeState
     #[test]
     fn test_gemini_read_response_events_stream_fanout() {
         let reader = GeminiReader;
@@ -3131,7 +3131,7 @@ mod gemini_tests {
         assert!(matches!(events[6], IrStreamEvent::MessageStop));
     }
 
-    // B-510b: write_response_event - BlockDelta TextDelta → candidates[0].content.parts[0].text
+    // write_response_event - BlockDelta TextDelta → candidates[0].content.parts[0].text
     #[test]
     fn test_gemini_write_response_event_text_delta() {
         let writer = GeminiWriter;
@@ -3162,7 +3162,7 @@ mod gemini_tests {
         assert_eq!(part.get("text").and_then(|t| t.as_str()), Some("hi"));
     }
 
-    // B-510b: write_response_event - MessageDelta{end_turn} → finishReason "STOP"
+    // write_response_event - MessageDelta{end_turn} → finishReason "STOP"
     #[test]
     fn test_gemini_write_response_event_message_delta() {
         let writer = GeminiWriter;
@@ -3196,7 +3196,7 @@ mod gemini_tests {
         assert!(chunk.get("usageMetadata").is_some());
     }
 
-    // B-510b: stream fan-out with functionCall - ToolUse via functionCall
+    // stream fan-out with functionCall - ToolUse via functionCall
     #[test]
     fn test_gemini_read_response_events_function_call() {
         let reader = GeminiReader;
@@ -3341,7 +3341,7 @@ mod context_length_tests {
 mod gemini_integration_tests {
     use super::*;
 
-    // B-510c: Gemini's URL embeds the model; non-Gemini protocols keep their fixed path.
+    // Gemini's URL embeds the model; non-Gemini protocols keep their fixed path.
     #[test]
     fn test_gemini_upstream_path_for_embeds_model() {
         assert_eq!(
@@ -3359,7 +3359,7 @@ mod gemini_integration_tests {
         );
     }
 
-    // B-510c: gemini is now a registered, buildable protocol.
+    // gemini is now a registered, buildable protocol.
     #[test]
     fn test_gemini_registered_in_builtins() {
         let reg = ProtocolRegistry::with_builtins();

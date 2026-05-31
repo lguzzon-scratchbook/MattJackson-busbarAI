@@ -8,10 +8,10 @@ use tokio::sync::Semaphore;
 
 #[allow(dead_code)] // Used by record_transient and other methods
 const COOLDOWN_BASE_SECS: u64 = 15;
-#[allow(dead_code)] // B-305: no longer used directly (now uses compute_cooldown_with_retry_after)
+#[allow(dead_code)] // no longer used directly (now uses compute_cooldown_with_retry_after)
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
-// B-303a (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
-// and recovers via the B-302 half-open probe — NOT a permanent `dead` kill. A human likely
+// (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
+// and recovers via the half-open probe — NOT a permanent `dead` kill. A human likely
 // has to fix the key, so fast re-probes are pointless; default 30 min.
 const HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
 
@@ -86,7 +86,7 @@ pub(crate) struct LaneSnapshot {
     pub free_slots: usize,
     pub ok: u64,
     pub err: u64,
-    #[allow(dead_code)] // Tracked for B-603 /stats expansion (client fault vs upstream fault)
+    #[allow(dead_code)] // Tracked for /stats expansion (client fault vs upstream fault)
     pub client_fault: u64,
     pub usable: bool,
     pub dead: bool,
@@ -118,7 +118,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     #[allow(dead_code)] // Used for future budget tracking
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
-    // weighted member selection (B-401 SWRR algorithm)
+    // weighted member selection (SWRR algorithm)
     /// Select a candidate from the given list using smooth weighted round-robin over healthy members.
     /// `candidates` are indices into the store's lane array.
     /// `weights` is the per-member weight for each candidate (must match candidates length).
@@ -193,7 +193,7 @@ struct LaneState {
     breaker_state: AtomicU64, // 0=Closed, 1=Open, 2=HalfOpen (stored as u64 for CAS)
     probe_in_flight: AtomicBool,
     outcome_window: std::sync::Mutex<OutcomeWindow>,
-    // SWRR state per lane (B-401)
+    // SWRR state per lane
     current_weight: AtomicI64,
 }
 
@@ -307,7 +307,7 @@ impl InMemoryStore {
             );
         }
 
-        // B-305: Honor Retry-After as cooldown floor if present and configured
+        // Honor Retry-After as cooldown floor if present and configured
         match (cfg.honor_retry_after, retry_after) {
             (true, Some(ra)) => duration.max(ra), // Server's explicit Retry-After always respected
             (_, Some(ra)) => ra,                  // If not honoring, still use server value
@@ -441,7 +441,7 @@ impl Default for BreakerCfg {
         Self {
             base_cooldown_secs: 15,
             max_cooldown_secs: 120,
-            honor_retry_after: true, // B-305: default to honoring Retry-After header
+            honor_retry_after: true, // default to honoring Retry-After header
             trip: TripConfig::default(),
         }
     }
@@ -579,7 +579,7 @@ impl StateStore for InMemoryStore {
     fn record_client_fault(&self, lane: usize) {
         let ls = self.get_lane(lane);
         // Client faults do NOT increment err, streak, or trigger cooldowns.
-        // They are tracked separately for observability (B-603).
+        // They are tracked separately for observability.
         ls.client_fault.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -610,7 +610,7 @@ impl StateStore for InMemoryStore {
             if err_count >= 5 {
                 self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
             } else {
-                // B-305: Simple cooldown for transient errors (below trip threshold), honoring Retry-After floor
+                // Simple cooldown for transient errors (below trip threshold), honoring Retry-After floor
                 let duration =
                     Self::compute_cooldown_with_retry_after(ls, now_time, &cfg, retry_after);
                 ls.cooldown_until
@@ -671,8 +671,8 @@ impl StateStore for InMemoryStore {
         #[cfg(not(test))]
         let now_time = now();
 
-        // B-303a (A7): hard-down is RECOVERABLE — long sticky cooldown + Open state, so the
-        // B-302 half-open probe re-probes it once the cooldown expires. We do NOT set `dead`
+        // (A7): hard-down is RECOVERABLE — long sticky cooldown + Open state, so the
+        // half-open probe re-probes it once the cooldown expires. We do NOT set `dead`
         // (that would permanently block recovery in usable()). Budget exhaustion is a SEPARATE
         // permanent disable, handled in usable() via `budget <= 0` (it never sets `dead` and
         // never probes), so hard-down and budget-kill stay distinct.
@@ -727,7 +727,7 @@ impl StateStore for InMemoryStore {
         }
     }
 
-    // B-401: SWRR selection over healthy subset (ADR-0001 algorithm)
+    // SWRR selection over healthy subset (ADR-0001 algorithm)
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize> {
         // Filter to usable members only and build (lane_idx, effective_weight) pairs
         let mut healthy: Vec<(usize, i64)> = Vec::with_capacity(candidates.len());
@@ -738,7 +738,7 @@ impl StateStore for InMemoryStore {
         }
 
         if healthy.is_empty() {
-            return None; // No healthy members -> pool exhaustion (B-403 handles this)
+            return None; // No healthy members -> pool exhaustion (handles this)
         }
 
         // SWRR algorithm over healthy subset only (ADR-0001):
@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn test_hard_down_long_cooldown_and_recovery() {
-        // B-303a (A7): hard-down → long sticky cooldown + Open, recoverable via the B-302
+        // (A7): hard-down → long sticky cooldown + Open, recoverable via the
         // probe, NOT a permanent `dead` kill.
         let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
         set_now_for_test(1000);
@@ -1078,7 +1078,7 @@ mod tests {
         );
     }
 
-    // (test_dead_lane_never_usable removed — B-303a: hard-down no longer sets `dead`/permanent
+    // (test_dead_lane_never_usable removed —: hard-down no longer sets `dead`/permanent
     // kill; it is now a recoverable long-cooldown. Coverage is in
     // test_hard_down_long_cooldown_and_recovery. `dead` is reserved for future budget-kill.)
 
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(snap.err, 0);
     }
 
-    // B-305: Honor Retry-After on transient cooldown
+    // Honor Retry-After on transient cooldown
     #[test]
     fn test_retry_after_429_with_computed_backoff_lower() {
         let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
@@ -1418,7 +1418,7 @@ mod tests {
         );
     }
 
-    // B-401: SWRR convergence test - 3-member pool with weights 1/2/3 should distribute exactly in that ratio
+    // SWRR convergence test - 3-member pool with weights 1/2/3 should distribute exactly in that ratio
     #[test]
     fn test_swrr_convergence_1_2_3() {
         let (lane0, w0) = make_lane_data_with_weight(0, 10);
@@ -1461,7 +1461,7 @@ mod tests {
         assert_eq!(total, N, "total picks should equal N");
     }
 
-    // B-401: Rebalance on trip - when member 0 trips (Open), distribution should renormalize to survivors
+    // Rebalance on trip - when member 0 trips (Open), distribution should renormalize to survivors
     #[test]
     fn test_swrr_rebalance_on_trip() {
         let (lane0, w0) = make_lane_data_with_weight(0, 10);
@@ -1493,7 +1493,7 @@ mod tests {
         );
     }
 
-    // B-401: No Open selection - verify select_weighted never returns an unusable member
+    // No Open selection - verify select_weighted never returns an unusable member
     #[test]
     fn test_swrr_no_open_selection() {
         let (lane0, w0) = make_lane_data_with_weight(0, 10);
@@ -1523,7 +1523,7 @@ mod tests {
         // Member 0 and 2 should both get picked (renormalized to 10:3 ratio)
     }
 
-    // B-401: All-down - when every member is Open, select_weighted returns None
+    // All-down - when every member is Open, select_weighted returns None
     #[test]
     fn test_swrr_all_down_returns_none() {
         let (lane0, w0) = make_lane_data_with_weight(0, 10);

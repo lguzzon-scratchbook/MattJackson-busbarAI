@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-/// G-4: per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted —
+/// per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted —
 /// ADR-0009: single-node rate windows; cross-node distributed limits are a future Redis concern).
 #[derive(Default)]
 struct RateState {
@@ -27,17 +27,17 @@ struct RateState {
 pub(crate) struct GovState {
     store: Arc<dyn Store>,
     by_hash: RwLock<HashMap<String, VirtualKey>>,
-    /// G-3 cost model: flat cents charged per request. Budgets are enforced against accumulated
+    /// cost model: flat cents charged per request. Budgets are enforced against accumulated
     /// request-cost. (Token-/model-priced budgets are a documented future refinement; this keeps
     /// the budget real + enforceable without parsing every response body.)
     price_per_request_cents: i64,
-    /// G-4: per-key RPM/TPM windows (ephemeral).
+    /// per-key RPM/TPM windows (ephemeral).
     rate: RwLock<HashMap<String, RateState>>,
-    /// G-5: bearer token guarding the /admin management API (None = admin API disabled).
+    /// bearer token guarding the /admin management API (None = admin API disabled).
     admin_token: Option<String>,
 }
 
-/// G-5: parameters for minting a new virtual key (from the management API).
+/// parameters for minting a new virtual key (from the management API).
 pub(crate) struct NewKeySpec {
     pub name: String,
     pub allowed_pools: Vec<String>,
@@ -47,7 +47,7 @@ pub(crate) struct NewKeySpec {
     pub tpm_limit: Option<u32>,
 }
 
-#[allow(dead_code)] // refresh/store used by the management API (G-5)
+#[allow(dead_code)] // refresh/store used by the management API
 impl GovState {
     pub(crate) fn new(
         store: Arc<dyn Store>,
@@ -64,12 +64,12 @@ impl GovState {
         })
     }
 
-    /// G-5: the configured admin token (None = admin API disabled).
+    /// the configured admin token (None = admin API disabled).
     pub(crate) fn admin_token(&self) -> Option<&str> {
         self.admin_token.as_deref()
     }
 
-    /// G-5: mint a new virtual key, persist it, refresh the cache, and return (key, plaintext
+    /// mint a new virtual key, persist it, refresh the cache, and return (key, plaintext
     /// secret). The secret is shown to the caller ONCE here and never stored (only its hash is).
     pub(crate) fn create_key(
         &self,
@@ -95,18 +95,18 @@ impl GovState {
         Ok((key, secret))
     }
 
-    /// G-5: all virtual keys (metadata; callers must strip `key_hash` before returning).
+    /// all virtual keys (metadata; callers must strip `key_hash` before returning).
     pub(crate) fn all_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         self.store.list_keys()
     }
 
-    /// G-5: delete a key by id + refresh the cache.
+    /// delete a key by id + refresh the cache.
     pub(crate) fn delete_key(&self, id: &str) -> StoreResult<()> {
         self.store.delete_key(id)?;
         self.refresh()
     }
 
-    /// G-5: current-window usage for a key (None if the key doesn't exist).
+    /// current-window usage for a key (None if the key doesn't exist).
     pub(crate) fn usage_for(&self, id: &str, now: u64) -> StoreResult<Option<Usage>> {
         match self.store.get_key(id)? {
             Some(key) => {
@@ -117,7 +117,7 @@ impl GovState {
         }
     }
 
-    /// G-4: check + consume one request slot against the key's RPM/TPM for the current 60s window.
+    /// check + consume one request slot against the key's RPM/TPM for the current 60s window.
     /// `Ok(())` admits the request (and counts it); `Err(retry_after_secs)` rejects it (429). RPM is
     /// enforced precisely; TPM is enforced against tokens accrued so far this window (tokens are
     /// added post-response via `record_request`, so TPM trails RPM until token accounting lands).
@@ -150,7 +150,7 @@ impl GovState {
         Ok(())
     }
 
-    /// G-4: add tokens to the key's current rate window (for TPM). Called from `record_request`.
+    /// add tokens to the key's current rate window (for TPM). Called from `record_request`.
     fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64) {
         if tokens == 0 {
             return;
@@ -164,7 +164,7 @@ impl GovState {
         }
     }
 
-    /// G-3: is this key already at/over its budget for the current window? (No cap → never.)
+    /// is this key already at/over its budget for the current window? (No cap → never.)
     pub(crate) fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
         let Some(limit) = key.max_budget_cents else {
             return false;
@@ -176,7 +176,7 @@ impl GovState {
             .unwrap_or(false)
     }
 
-    /// G-3: charge one request (flat per-request cost + token count) to the key's current window.
+    /// charge one request (flat per-request cost + token count) to the key's current window.
     /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving).
     pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
         let window = budget_window(&key.budget_period, now);
@@ -186,7 +186,7 @@ impl GovState {
         {
             eprintln!("busbar: usage record failed for key {}: {e}", key.id);
         }
-        // G-4: also feed the rate window's TPM counter.
+        // also feed the rate window's TPM counter.
         self.add_rate_tokens(&key.id, now, tokens);
     }
 
@@ -208,7 +208,7 @@ impl GovState {
         self.store.clone()
     }
 
-    /// Reload the cache from the store (after a management-API mutation, G-5).
+    /// Reload the cache from the store (after a management-API mutation,).
     pub(crate) fn refresh(&self) -> StoreResult<()> {
         let fresh = Self::load(self.store.as_ref())?;
         *self.by_hash.write().unwrap() = fresh;
@@ -223,7 +223,7 @@ pub(crate) struct GovCtx {
     pub key: Option<VirtualKey>,
 }
 
-/// G-5: generate a virtual-key secret. Prefers 16 cryptographic bytes from `/dev/urandom`; falls
+/// generate a virtual-key secret. Prefers 16 cryptographic bytes from `/dev/urandom`; falls
 /// back to a time-derived value (non-crypto) only if that read fails. No `rand` dependency.
 fn generate_secret() -> String {
     use std::io::Read;
@@ -244,7 +244,7 @@ pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
     key.allowed_pools.is_empty() || key.allowed_pools.iter().any(|p| p == pool)
 }
 
-/// The epoch start of the budget window containing `now` for a given period (G-3). "total" = a
+/// The epoch start of the budget window containing `now` for a given period. "total" = a
 /// single all-time window (0); "daily" = UTC midnight; "monthly" = UTC first-of-month.
 pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
     match period {
@@ -330,7 +330,7 @@ impl From<rusqlite::Error> for StoreError {
 
 /// The durable governance store seam (ADR-0009). Swappable: `SqliteStore` today, `PostgresStore`
 /// later behind the same trait.
-#[allow(dead_code)] // CRUD surface; wired by G-2..G-5
+#[allow(dead_code)] // CRUD surface; wired by..
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
@@ -377,7 +377,7 @@ pub(crate) struct SqliteStore {
     conn: Mutex<Connection>,
 }
 
-#[allow(dead_code)] // open/open_in_memory used by main (G-2) + tests
+#[allow(dead_code)] // open/open_in_memory used by main + tests
 impl SqliteStore {
     pub(crate) fn open(path: &str) -> StoreResult<Self> {
         let store = Self {

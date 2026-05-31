@@ -20,12 +20,12 @@ use crate::proto::{convert_headers, StatusClass};
 use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
-/// B-203: Non-buffering stream inspection tap for Anthropic SSE usage parsing.
+/// Non-buffering stream inspection tap for Anthropic SSE usage parsing.
 ///
 /// This accumulator extracts the final `message_delta` / `message_stop` usage object
 /// from a streaming Anthropic response without buffering the entire body. It maintains
 /// only small parsed fields and a bounded carry buffer for frame reassembly across chunks.
-#[allow(dead_code)] // Usage exposed via FirstByteBody::usage() for B-601 cost accounting
+#[allow(dead_code)] // Usage exposed via FirstByteBody::usage for cost accounting
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UsageTap {
     /// Extracted input tokens (from message_delta.usage.input_tokens or message_stop.usage.input_tokens)
@@ -128,7 +128,7 @@ impl UsageTap {
     }
 
     /// Check if any usage data was extracted.
-    #[allow(dead_code)] // Used for future B-601 integration
+    #[allow(dead_code)] // Used for future integration
     pub(crate) fn has_usage(&self) -> bool {
         self.input_tokens.is_some() || self.output_tokens.is_some()
     }
@@ -168,11 +168,11 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
     None
 }
 
-/// B-203: Carry buffer for SSE frame reassembly across chunk boundaries.
+/// Carry buffer for SSE frame reassembly across chunk boundaries.
 ///
 /// This is a bounded accumulator that holds at most MAX_CARRY_BYTES to prevent
 /// memory unboundedness when frames span multiple chunks. It never retains the full body.
-#[allow(dead_code)] // Methods used in tests and for future B-601 integration
+#[allow(dead_code)] // Methods used in tests and for future integration
 pub(crate) struct SseCarryBuffer {
     /// Accumulated bytes from incomplete SSE frame
     buffer: Vec<u8>,
@@ -226,11 +226,11 @@ impl Default for SseCarryBuffer {
     }
 }
 
-/// Body wrapper that implements the before-first-byte failover boundary (B-202).
+/// Body wrapper that implements the before-first-byte failover boundary.
 /// Tracks when the first byte is sent and handles mid-stream errors by emitting
 /// SSE error events instead of allowing failover. Also holds the permit until stream ends.
 ///
-/// B-203: Integrated UsageTap for non-buffering usage extraction from streaming responses.
+/// Integrated UsageTap for non-buffering usage extraction from streaming responses.
 struct FirstByteBody<S, P> {
     inner: S,
     first_byte_sent: Arc<AtomicBool>,
@@ -238,9 +238,9 @@ struct FirstByteBody<S, P> {
     permit: Option<P>,
     app: Option<Arc<App>>,
     lane_idx: usize,
-    /// B-203: Usage tap for extracting Anthropic SSE usage without buffering full body
+    /// Usage tap for extracting Anthropic SSE usage without buffering full body
     tap: UsageTap,
-    /// B-503b-2: when Some, translate each egress SSE chunk to the caller's ingress protocol.
+    /// when Some, translate each egress SSE chunk to the caller's ingress protocol.
     /// None = native passthrough (same-protocol or non-SSE).
     translate: Option<crate::proto::StreamTranslate>,
     /// Set once the stream has fully ended (after any translation terminator), so a later poll
@@ -274,7 +274,7 @@ where
     }
 
     /// Get a reference to the extracted usage data after stream completion.
-    #[allow(dead_code)] // Exposed for B-601 cost accounting integration
+    #[allow(dead_code)] // Exposed for cost accounting integration
     pub(crate) fn usage(&self) -> &UsageTap {
         &self.tap
     }
@@ -300,9 +300,9 @@ where
                     if !this.first_byte_sent.load(Ordering::Relaxed) {
                         this.first_byte_sent.store(true, Ordering::Relaxed);
                     }
-                    // B-203: Feed chunk to tap for usage extraction (non-buffering)
+                    // Feed chunk to tap for usage extraction (non-buffering)
                     this.tap.feed(&chunk);
-                    // B-503b-2: cross-protocol → translate egress SSE bytes to the ingress format.
+                    // cross-protocol → translate egress SSE bytes to the ingress format.
                     if let Some(t) = this.translate.as_mut() {
                         let out = t.feed(&chunk);
                         if out.is_empty() {
@@ -342,7 +342,7 @@ where
                                 .record_transient(this.lane_idx, "mid-stream-end", None);
                         }
                     }
-                    // B-503b-2: emit the ingress terminator (e.g. OpenAI `data: [DONE]`) before close.
+                    // emit the ingress terminator (e.g. OpenAI `data: [DONE]`) before close.
                     let done = this
                         .translate
                         .as_mut()
@@ -426,7 +426,7 @@ impl RequestCtx {
     }
 }
 
-/// B-401 / B-402 / B-404: pick_among using weighted selection (SWRR) over healthy subset.
+/// / /: pick_among using weighted selection (SWRR) over healthy subset.
 /// `cands` is now Vec<WeightedLane> where each lane has its weight from config.
 /// `request_ctx` provides accumulated exclusions to avoid retrying failed lanes.
 /// `_affinity_key` enables sticky routing as a preference (not a hard constraint).
@@ -438,7 +438,7 @@ async fn pick_among(
 ) -> Option<(usize, Permit)> {
     let t = now();
 
-    // B-404: Session affinity preference - try sticky lane first if usable
+    // Session affinity preference - try sticky lane first if usable
     if let Some(k) = _affinity_key {
         if !cands.is_empty() {
             let mut h = DefaultHasher::new();
@@ -465,7 +465,7 @@ async fn pick_among(
     let candidates: Vec<usize> = filtered_cands.iter().map(|wl| wl.idx).collect();
     let weights: Vec<u32> = filtered_cands.iter().map(|wl| wl.weight).collect();
 
-    // Use SWRR selection over healthy members only (B-401)
+    // Use SWRR selection over healthy members only
     let picked_lane_idx = app.store.select_weighted(&candidates, &weights, t)?;
 
     // Try to acquire the selected lane immediately
@@ -484,13 +484,13 @@ async fn pick_among(
 
 /// Original forward function without pool context - uses default Status503 mode.
 /// True for content types that carry an incremental streamed response: SSE (text/event-stream,
-/// used by Anthropic/OpenAI/Gemini-SSE) and AWS event-stream (Bedrock ConverseStream, C-5). Both
+/// used by Anthropic/OpenAI/Gemini-SSE) and AWS event-stream (Bedrock ConverseStream,). Both
 /// must engage the streaming body path rather than being buffered.
 fn is_streaming_content_type(ct: &str) -> bool {
     ct.starts_with("text/event-stream") || ct.starts_with("application/vnd.amazon.eventstream")
 }
 
-/// C-4: extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
+/// extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
 /// header. base_urls are already trailing-slash-trimmed and carry no path.
 fn host_from_base(base: &str) -> String {
     base.strip_prefix("https://")
@@ -539,7 +539,7 @@ pub(crate) async fn forward_with_pool(
         }
     };
 
-    // C-3: capture the caller's stream intent from the ingress body BEFORE any cross-protocol
+    // capture the caller's stream intent from the ingress body BEFORE any cross-protocol
     // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
@@ -553,7 +553,7 @@ pub(crate) async fn forward_with_pool(
             .map(String::from)
     };
 
-    // Before-first-byte failover boundary (B-202):
+    // Before-first-byte failover boundary:
     // Failover is allowed ONLY until the first upstream byte reaches the client.
     // After that point, an upstream failure must NOT trigger failover because
     // the client already has a partial response. Instead:
@@ -561,7 +561,7 @@ pub(crate) async fn forward_with_pool(
     // - Record the breaker failure for that lane (the member tripped)
     // The client must restart the request itself after receiving the error event.
 
-    // B-402: Get failover config from app
+    // Get failover config from app
     let (deadline_secs, max_cap) = if let Some(ref f) = app.failover_cfg {
         (f.deadline_secs, f.cap)
     } else {
@@ -604,7 +604,7 @@ pub(crate) async fn forward_with_pool(
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
 
-        // B-602: count this upstream attempt (re-entrant across failover hops — each is a real attempt).
+        // count this upstream attempt (re-entrant across failover hops — each is a real attempt).
         metrics::counter!(
             crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
             "pool" => pool_name.to_string(),
@@ -615,7 +615,7 @@ pub(crate) async fn forward_with_pool(
 
         let egress_name = app.lanes[i].protocol.name();
         if ingress_protocol != egress_name {
-            // B-602: one cross-protocol translation hop for this request.
+            // one cross-protocol translation hop for this request.
             metrics::counter!(
                 crate::metrics::TRANSLATIONS_TOTAL,
                 "from" => ingress_protocol.to_string(),
@@ -657,7 +657,7 @@ pub(crate) async fn forward_with_pool(
             crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
         };
 
-        // C-4: per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
+        // per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
         let writer = app.lanes[i].protocol.writer();
         let url_path = writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream);
         let signing_ctx = crate::proto::SigningContext {
@@ -708,7 +708,7 @@ pub(crate) async fn forward_with_pool(
 
                 // For non-2xx responses, read the body to classify (failover allowed)
                 if !status.is_success() {
-                    // §6 caveat: passthrough 401/403 is caller's key failing, not busbar's
+                    // caveat: passthrough 401/403 is caller's key failing, not busbar's
                     // Do NOT trip breaker / change member health; relay verbatim to caller
                     let auth_mode = app.auth_mode;
                     let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
@@ -735,11 +735,11 @@ pub(crate) async fn forward_with_pool(
                     let sig = normalize_raw_error(&raw, &app.lanes[i].error_map);
                     let disposition = classify_disposition(&sig);
 
-                    // Exhaustive match on Disposition - NO _ => allowed per B-301 requirements
+                    // Exhaustive match on Disposition - NO _ => allowed per requirements
                     match disposition {
                         Disposition::ClientFault => {
                             // ADR-0002: Client fault (caller's bad input) → relay verbatim, no penalty
-                            // Track client_fault separately from upstream err (B-603)
+                            // Track client_fault separately from upstream err
                             app.store.record_client_fault(i);
                             use axum::body::Body;
                             let mut rb = Response::builder().status(status);
@@ -788,7 +788,7 @@ pub(crate) async fn forward_with_pool(
                             continue;
                         }
                         Disposition::HardDown => {
-                            // Hard down → permanent dead state (with probe recovery per B-303)
+                            // Hard down → permanent dead state (with probe recovery per)
                             // Only Billing and Auth reach this arm per breaker::classify
                             let reason = match sig.class {
                                 StatusClass::Billing => {
@@ -807,7 +807,7 @@ pub(crate) async fn forward_with_pool(
                                 StatusClass::ContextLength => unreachable!(),
                             };
                             app.store.record_hard_down(i, &reason);
-                            // B-602: a hard-down is a breaker trip for this lane.
+                            // a hard-down is a breaker trip for this lane.
                             metrics::counter!(
                                 crate::metrics::BREAKER_TRIPS_TOTAL,
                                 "pool" => pool_name.to_string(),
@@ -844,8 +844,8 @@ pub(crate) async fn forward_with_pool(
                             continue;
                         }
                         Disposition::ContextLength => {
-                            // B-504: the request is too large for THIS model's context window.
-                            // B-504b: exclude from this request any candidate lane whose context_max
+                            // the request is too large for THIS model's context window.
+                            // exclude from this request any candidate lane whose context_max
                             // is Some(c) with c <= failed_lane_context_max (and the failed lane itself).
                             // Rationale: those lanes share or undercut the limit that just failed,
                             // so don't waste attempts on them — failover lands on a larger-context
@@ -884,14 +884,14 @@ pub(crate) async fn forward_with_pool(
                     }
                 }
 
-                // SUCCESS case: stream the response body incrementally with first-byte boundary tracking (B-202)
+                // SUCCESS case: stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
                 let is_sse = ct
                     .as_ref()
                     .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
                     .unwrap_or(false);
 
-                // B-503c-2: non-streaming cross-protocol response → buffer the whole JSON and
+                // non-streaming cross-protocol response → buffer the whole JSON and
                 // translate egress.read_response → IR → ingress.write_response. (Streaming
                 // cross-protocol is handled in FirstByteBody below; same-protocol passes through.)
                 if ingress_protocol != app.lanes[i].protocol.name() && !is_sse {
@@ -919,8 +919,8 @@ pub(crate) async fn forward_with_pool(
                     return rb.body(Body::from(bytes)).unwrap();
                 }
 
-                // B-202: Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
-                // B-503b-2: on a cross-protocol SSE response, translate egress frames → ingress frames.
+                // Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
+                // on a cross-protocol SSE response, translate egress frames → ingress frames.
                 let translate = if is_sse {
                     crate::proto::StreamTranslate::new(
                         ingress_protocol,
@@ -1028,8 +1028,8 @@ fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64) -> Respon
 /// whatever the upstream returns verbatim. On a pre-response transport error the lane's
 /// transient counter is recorded and `Err(())` is returned so the caller can try another
 /// candidate (or give up). The concurrency `permit` is held for the lifetime of a streamed
-/// success body (B-201 invariant) and dropped on error.
-/// NOTE: Cross-protocol request translation on this degraded path is deferred to B-503b.
+/// success body (invariant) and dropped on error.
+/// NOTE: Cross-protocol request translation on this degraded path is deferred to.
 #[tracing::instrument(name = "forward_once", skip_all, fields(lane = i))]
 async fn forward_once(
     app: &Arc<App>,
@@ -1047,7 +1047,7 @@ async fn forward_once(
         }
     };
 
-    // C-3: stream intent for the stream-aware upstream path (Gemini).
+    // stream intent for the stream-aware upstream path (Gemini).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     app.lanes[i]
@@ -1063,7 +1063,7 @@ async fn forward_once(
         crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
     };
 
-    // C-4: per-request auth (SigV4 for Bedrock; static otherwise).
+    // per-request auth (SigV4 for Bedrock; static otherwise).
     let writer = app.lanes[i].protocol.writer();
     let url_path = writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream);
     let signing_ctx = crate::proto::SigningContext {
@@ -1107,7 +1107,7 @@ async fn forward_once(
                 .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
                 .unwrap_or(false);
             let upstream_stream = r.bytes_stream();
-            // Degraded fallback/least-bad path: no cross-protocol translation here (B-503b scope).
+            // Degraded fallback/least-bad path: no cross-protocol translation here (scope).
             let guarded_body =
                 FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, None);
             let mut rb = Response::builder().status(status);
@@ -1214,7 +1214,7 @@ async fn handle_least_bad(
     };
 
     eprintln!(
-        "[WARN] B-403: LEAST-BAD MODE — routing to degraded member {} (cooldown {}s remaining)",
+        "[WARN] LEAST-BAD MODE — routing to degraded member {} (cooldown {}s remaining)",
         soonest_idx,
         app.store.cooldown_remaining(soonest_idx, now)
     );

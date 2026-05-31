@@ -43,7 +43,7 @@ impl AuthMiddleware {
             }
         };
 
-        // Expand env vars in client_tokens (B-102 interpolation pass)
+        // Expand env vars in client_tokens (interpolation pass)
         let tokens: Vec<String> = cfg
             .client_tokens
             .iter()
@@ -123,7 +123,7 @@ pub(crate) async fn auth_middleware(
         .and_then(|v| v.to_str().ok());
 
     // /healthz and /metrics are always open: liveness and Prometheus scraping must not require a
-    // caller token (operators protect /metrics at the network layer if needed). (B-601)
+    // caller token (operators protect /metrics at the network layer if needed).
     let path = req.uri().path();
     if path == "/healthz" || path == "/metrics" {
         return Ok(next.run(req).await);
@@ -141,7 +141,7 @@ pub(crate) async fn auth_middleware(
     let bearer_token: Option<String> =
         auth_header.and_then(|h| h.strip_prefix("Bearer ").map(String::from));
 
-    // G-5: the /admin management API is guarded by the configured admin token (Bearer or
+    // the /admin management API is guarded by the configured admin token (Bearer or
     // X-Admin-Token) — NOT a virtual key. Disabled (401) when no admin token is configured.
     if is_admin {
         let configured = app.governance.as_ref().and_then(|g| g.admin_token());
@@ -159,7 +159,7 @@ pub(crate) async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // G-2 (0.12): when governance is enabled, the caller's Bearer token MUST resolve to an enabled
+    // when governance is enabled, the caller's Bearer token MUST resolve to an enabled
     // virtual key; the resolved key is attached for downstream allowed-pools enforcement. This
     // supersedes the static AuthMode token check. When governance is disabled, the existing
     // AuthMode (None/Token/Passthrough) applies unchanged.

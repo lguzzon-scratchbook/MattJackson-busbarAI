@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! B-301: Protocol-agnostic classifier for breaker dispositions.
+//! Protocol-agnostic classifier for breaker dispositions.
 //!
 //! Stage 2 of the two-stage disposition pipeline:
 //! - Stage 1 (src/proto.rs): per-protocol normalizer → CanonicalSignal with typed StatusClass
 //! - Stage 2 (this module): protocol-agnostic classifier → Disposition
 //!
-//! Mapping (§7 + ADR-0002):
+//! Mapping (+ ADR-0002):
 //!   RateLimit|Overloaded|ServerError|Timeout|Network → TransientUpstream
 //!   Auth|Billing → HardDown
 //!   ClientError → ClientFault
@@ -37,12 +37,12 @@ pub(crate) enum StatusClass {
     /// Client error (4xx other than 401/403) — client fault, do not penalize lane
     ClientError,
     /// Request exceeds this model's context window — the LANE is healthy; fail over (ideally to
-    /// a larger-context model) WITHOUT penalizing the breaker. (B-504)
+    /// a larger-context model) WITHOUT penalizing the breaker.
     ContextLength,
 }
 
 /// Final disposition that drives the StateStore write path.
-/// Per ADR-0002 + B-504:
+/// Per ADR-0002 +:
 ///   - ClientFault: caller's bad input → relay verbatim, record NOTHING
 ///   - TransientUpstream: transient failure → cooldown + err counter
 ///   - HardDown: definitive signal → permanent dead state (with probe recovery)
@@ -115,7 +115,7 @@ pub(crate) fn normalize_raw_error(
                 };
             }
         }
-        // B-504: built-in recognition of the canonical context-length code (the operator
+        // built-in recognition of the canonical context-length code (the operator
         // error_map above overrides; this is the default when unmapped). The lane is healthy —
         // ContextLength → fail over without penalty.
         if code == "context_length_exceeded" {
@@ -162,7 +162,7 @@ pub(crate) fn normalize_raw_error(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalSignal {
     pub(crate) class: StatusClass,
-    #[allow(dead_code)] // provider_signal retained for future extensibility (B-301, ADR-0005)
+    #[allow(dead_code)] // provider_signal retained for future extensibility (, ADR-0005)
     pub(crate) provider_signal: Option<String>,
     pub(crate) retry_after: Option<u64>,
 }

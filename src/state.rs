@@ -22,11 +22,11 @@ pub(crate) struct Lane {
     pub(crate) max: usize,
     // error_map cloned into each lane at startup for Stage 1b normalization
     pub(crate) error_map: Arc<std::collections::HashMap<String, String>>,
-    /// Optional maximum context window size for this lane's model (B-504b).
+    /// Optional maximum context window size for this lane's model.
     pub(crate) context_max: Option<usize>,
 }
 
-/// A pool lane with its associated weight (B-401).
+/// A pool lane with its associated weight.
 #[derive(Clone)]
 pub(crate) struct WeightedLane {
     pub(crate) idx: usize,  // index into lanes array
@@ -37,22 +37,22 @@ pub(crate) struct App {
     pub(crate) lanes: Vec<Lane>,
     pub(crate) store: Arc<dyn StateStore>,
     pub(crate) by_model: HashMap<String, usize>,
-    /// Pools now carry weights alongside lane indices (B-401).
+    /// Pools now carry weights alongside lane indices.
     pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
-    /// Round-robin counter - no longer used after B-401 but kept for potential fallback.
+    /// Round-robin counter - no longer used after but kept for potential fallback.
     #[allow(dead_code)] // No longer used; SWRR handles selection
     pub(crate) rr: AtomicUsize,
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
     pub(crate) auth_mode: crate::auth::AuthMode,
-    /// B-402: Default failover config (deadline_s and max_failover cap).
+    /// Default failover config (deadline_s and max_failover cap).
     #[allow(dead_code)] // Used by forward.rs for default policy
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
-    /// B-403: Fallback pools mapping (pool name -> WeightedLane vec) for fallback mode.
+    /// Fallback pools mapping (pool name -> WeightedLane vec) for fallback mode.
     pub(crate) fallback_pools: HashMap<String, Vec<WeightedLane>>,
-    /// B-403: OnExhausted config per pool name.
+    /// OnExhausted config per pool name.
     #[allow(dead_code)] // Used by forward.rs for exhaustion handling
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
-    /// G-2 (0.12): governance runtime (virtual keys + budgets/limits store). `None` = disabled.
+    /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
 }

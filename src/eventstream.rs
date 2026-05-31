@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! AWS event-stream (`application/vnd.amazon.eventstream`) frame decoder (C-5) — just enough to
+//! AWS event-stream (`application/vnd.amazon.eventstream`) frame decoder — just enough to
 //! pull `(:event-type, payload)` pairs out of Bedrock ConverseStream responses so they can feed the
 //! Bedrock reader's existing `read_response_events`. Incremental: leaves a trailing partial frame in
 //! the buffer. CRCs are not validated (we are a client decoder consuming well-formed AWS frames).

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! AWS Signature Version 4 request signing (C-4) — hand-rolled with RustCrypto (sha2 + hmac), no
+//! AWS Signature Version 4 request signing — hand-rolled with RustCrypto (sha2 + hmac), no
 //! AWS SDK. Used by the Bedrock protocol writer to sign Converse requests. The core algorithm is
 //! verified against AWS's published worked example (GET iam ListUsers, 20150830) in the tests, so
 //! the canonical-request → string-to-sign → signature chain is known-correct.

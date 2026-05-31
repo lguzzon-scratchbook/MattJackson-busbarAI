@@ -62,7 +62,7 @@ use store::{InMemoryStore, LaneData};
 
 #[tokio::main]
 async fn main() {
-    // Install the Prometheus recorder before anything emits metrics (B-601).
+    // Install the Prometheus recorder before anything emits metrics.
     metrics::init();
 
     // Read providers.yaml (shipped definitions)
@@ -83,9 +83,9 @@ async fn main() {
     let deploy: config::DeployCfg =
         serde_yaml::from_str(&interpolated_config).expect("parse config.yaml as DeployCfg");
 
-    // Observability sinks (B-603/B-604): grab before `deploy` is borrowed by resolve().
+    // Observability sinks (/): grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
-    // Governance (G-2): grab before `deploy` is borrowed by resolve().
+    // Governance: grab before `deploy` is borrowed by resolve.
     let governance_cfg = deploy.governance.clone();
 
     // Resolve deployment + definitions into resolved RootCfg
@@ -182,7 +182,7 @@ async fn main() {
 
     let mut pools = HashMap::new();
     for (name, pool) in &cfg.pools {
-        // Wire per-member weights from config into the pool structure (B-401).
+        // Wire per-member weights from config into the pool structure.
         // Each pool member has a weight; default is 1 if not specified.
         let weighted_members: Vec<WeightedLane> = pool
             .members
@@ -228,7 +228,7 @@ async fn main() {
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
     let store = Arc::new(InMemoryStore::new(lanes_data.clone()));
 
-    // B-402: Extract default failover config (use first pool's config or defaults)
+    // Extract default failover config (use first pool's config or defaults)
     let failover_cfg =
         cfg.pools
             .values()
@@ -239,10 +239,10 @@ async fn main() {
                 cap: 3,
             }));
 
-    // B-403: Build fallback_pools map (same as pools for now; can diverge later)
+    // Build fallback_pools map (same as pools for now; can diverge later)
     let fallback_pools = pools.clone();
 
-    // B-403: Parse on_exhausted configs per pool
+    // Parse on_exhausted configs per pool
     let mut on_exhausted_cfgs = std::collections::HashMap::new();
     for (pool_name, pool_cfg) in &cfg.pools {
         if let Some(ref on_exc) = pool_cfg.on_exhausted {
@@ -264,7 +264,7 @@ async fn main() {
         }
     }
 
-    // G-2: open the governance store + load the virtual-key cache when enabled.
+    // open the governance store + load the virtual-key cache when enabled.
     let governance = match governance_cfg {
         Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
             Ok(store) => {
@@ -310,12 +310,12 @@ async fn main() {
         governance,
     });
 
-    // B-604: configure the request-log webhook (reusing the pooled client). No-op if unset.
+    // configure the request-log webhook (reusing the pooled client). No-op if unset.
     observability::configure_webhook(
         observability_cfg.request_log_webhook_url.clone(),
         app.client.clone(),
     );
-    // B-603: install the OTLP tracer when an endpoint is configured (no-op otherwise).
+    // install the OTLP tracer when an endpoint is configured (no-op otherwise).
     if let Some(endpoint) = observability_cfg.otlp_endpoint.as_deref() {
         observability::init_otlp(endpoint);
     }
@@ -328,13 +328,13 @@ async fn main() {
 }
 
 /// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full
-/// route table + auth middleware can be exercised end-to-end in tests (C-2).
+/// route table + auth middleware can be exercised end-to-end in tests.
 pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
     Router::new()
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
         .route("/metrics", get(metrics::handler))
-        // G-5: virtual-key management API (admin-token guarded in auth_middleware).
+        // virtual-key management API (admin-token guarded in auth_middleware).
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route("/admin/keys/:id", axum::routing::delete(admin::delete_key))
         .route("/admin/keys/:id/usage", get(admin::key_usage))

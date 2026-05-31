@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! ADR-0005 superset IR — request + response/stream sides (B-502a/B-502b).
+//! ADR-0005 superset IR — request + response/stream sides (/).
 
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) struct IrRequest {
     pub system: Vec<IrBlock>,
     pub messages: Vec<IrMessage>,
@@ -53,14 +53,14 @@ pub(crate) struct IrResponse {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) struct IrMessage {
     pub role: IrRole,
     pub content: Vec<IrBlock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) enum IrRole {
     System,
     User,
@@ -69,7 +69,7 @@ pub(crate) enum IrRole {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) enum IrBlock {
     Text {
         text: String,
@@ -97,19 +97,19 @@ pub(crate) enum IrBlock {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) struct CacheControl {
     pub kind: CacheKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) enum CacheKind {
     Ephemeral,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only (B-502a)
+#[allow(dead_code)] // Used by tests only
 pub(crate) struct IrTool {
     pub name: String,
     pub description: Option<String>,
@@ -117,7 +117,7 @@ pub(crate) struct IrTool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // B-502b: response/stream IR types (used by tests in proto.rs)
+#[allow(dead_code)] // response/stream IR types (used by tests in proto.rs)
 pub(crate) struct IrUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -126,7 +126,7 @@ pub(crate) struct IrUsage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // B-502b: response/stream IR types (used by tests in proto.rs)
+#[allow(dead_code)] // response/stream IR types (used by tests in proto.rs)
 pub(crate) enum IrBlockMeta {
     Text,
     Thinking,
@@ -135,7 +135,7 @@ pub(crate) enum IrBlockMeta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code, clippy::enum_variant_names)] // B-502b: response/stream IR types (used by tests in proto.rs)
+#[allow(dead_code, clippy::enum_variant_names)] // response/stream IR types (used by tests in proto.rs)
 pub(crate) enum IrDelta {
     TextDelta(String),
     ThinkingDelta(String),
@@ -143,12 +143,12 @@ pub(crate) enum IrDelta {
     SignatureDelta(String),
 }
 
-/// Per-request decode state for stateful stream fan-out (B-502c-2b).
+/// Per-request decode state for stateful stream fan-out.
 /// Anthropic events are 1:1 and ignore this; OpenAI's flat stream uses it to synthesize the
 /// IR's block boundaries (one chunk → 0..n events): whether MessageStart was emitted, whether
 /// the text block (index 0) is open, and which OpenAI tool_call indices have been opened.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // consumed by ProtocolReader::read_response_events (B-502c-2b / B-503)
+#[allow(dead_code)] // consumed by ProtocolReader::read_response_events (/)
 pub(crate) struct StreamDecodeState {
     pub started: bool,
     pub text_block_open: bool,

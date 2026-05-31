@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! Prometheus metrics: a process-wide recorder + the `/metrics` exposition (B-601, sprint 0.11).
+//! Prometheus metrics: a process-wide recorder + the `/metrics` exposition (, sprint 0.11).
 //!
 //! `init()` installs a single global `metrics-exporter-prometheus` recorder. Emission elsewhere
-//! (forward.rs, B-602) uses the `metrics` facade macros (`counter!`/`histogram!`/`gauge!`), which
+//! (forward.rs,) uses the `metrics` facade macros (`counter!`/`histogram!`/`gauge!`), which
 //! route to that recorder. `render()` produces the current Prometheus text exposition, served by
 //! `handler()` on `GET /metrics`.
 
@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 /// The canonical busbar metric taxonomy. Names are referenced here so the emission sites
-/// (B-602, forward.rs) and the descriptions below stay in one authoritative list.
+/// (, forward.rs) and the descriptions below stay in one authoritative list.
 pub(crate) const REQUESTS_TOTAL: &str = "busbar_requests_total"; // labels: ingress_protocol, pool, outcome
 pub(crate) const UPSTREAM_ATTEMPTS_TOTAL: &str = "busbar_upstream_attempts_total"; // labels: pool, lane
 pub(crate) const UPSTREAM_FAILURES_TOTAL: &str = "busbar_upstream_failures_total"; // labels: pool, lane, disposition
