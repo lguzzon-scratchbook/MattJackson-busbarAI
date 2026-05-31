@@ -121,9 +121,11 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     fn breaker_state(&self, lane: usize) -> BreakerState;
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
     fn cooldown_remaining_in(&self, pool: &str, lane: usize, now: u64) -> u64;
-    /// True if this lane is tripped in ANY cell (default or any pool). Used by the health prober:
-    /// a probe tests the shared upstream, so "tripped anywhere" gates whether to probe at all.
-    fn lane_tripped_anywhere(&self, lane: usize) -> bool;
+    /// True if the breaker is suppressing this lane in ANY cell (default or any pool) — either a
+    /// non-Closed (Open/HalfOpen) state OR a Closed lane with a pending soft cooldown
+    /// (`cooldown_until > now`). Gates the health prober: both states make the lane unusable, and a
+    /// probe tests the shared upstream, so either should be recovered early.
+    fn lane_needs_probe(&self, lane: usize, now: u64) -> bool;
 
     // ── Outcome recording (the breaker's write path) ─────────────────────────────────────────────
     #[cfg_attr(not(test), allow(dead_code))]
@@ -985,27 +987,37 @@ impl StateStore for InMemoryStore {
 
     fn recover_lane(&self, lane: usize) {
         // A health probe tests the UPSTREAM, which is shared across pools — so a successful probe
-        // recovers EVERY cell for this lane (the default/direct-route cell and all per-pool cells).
+        // recovers EVERY cell for this lane (the default/direct-route cell and all per-pool cells),
+        // clearing both a tripped (non-Closed) breaker AND a soft cooldown on a Closed cell.
+        let now = Self::now_secs();
+        let suppressed = |c: &dyn BreakerCellAccess| {
+            c.breaker_state().load(Ordering::Acquire) != ST_CLOSED
+                || c.cooldown_until().load(Ordering::Acquire) > now
+        };
         let ls = self.get_lane(lane);
-        if ls.breaker_state.load(Ordering::Acquire) != ST_CLOSED {
+        if suppressed(ls.as_ref()) {
             Self::cell_closed(ls.as_ref());
         }
         let cells = self.pool_cells.lock().unwrap();
         for ((_, l), cell) in cells.iter() {
-            if *l == lane && cell.breaker_state.load(Ordering::Acquire) != ST_CLOSED {
+            if *l == lane && suppressed(cell.as_ref()) {
                 Self::cell_closed(cell.as_ref());
             }
         }
     }
 
-    fn lane_tripped_anywhere(&self, lane: usize) -> bool {
-        if self.get_lane(lane).breaker_state.load(Ordering::Acquire) != ST_CLOSED {
+    fn lane_needs_probe(&self, lane: usize, now: u64) -> bool {
+        let suppressed = |c: &dyn BreakerCellAccess| {
+            c.breaker_state().load(Ordering::Acquire) != ST_CLOSED
+                || c.cooldown_until().load(Ordering::Acquire) > now
+        };
+        if suppressed(self.get_lane(lane).as_ref()) {
             return true;
         }
         let cells = self.pool_cells.lock().unwrap();
-        cells.iter().any(|((_, l), cell)| {
-            *l == lane && cell.breaker_state.load(Ordering::Acquire) != ST_CLOSED
-        })
+        cells
+            .iter()
+            .any(|((_, l), cell)| *l == lane && suppressed(cell.as_ref()))
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
@@ -1611,14 +1623,14 @@ mod tests {
             "the lane-default cell must be unaffected by pool A's trip"
         );
         assert!(
-            store.lane_tripped_anywhere(0),
-            "lane is tripped in at least one cell (pool A)"
+            store.lane_needs_probe(0, 8000),
+            "lane is suppressed in at least one cell (pool A)"
         );
 
         // A successful health probe recovers EVERY cell for the lane.
         store.recover_lane(0);
         assert!(
-            !store.lane_tripped_anywhere(0),
+            !store.lane_needs_probe(0, 8000),
             "recover_lane must clear every cell (probe tests the shared upstream)"
         );
         assert!(store.usable_in("A", 0, 8000), "pool A recovered");
@@ -1759,6 +1771,51 @@ mod tests {
             BreakerState::Closed,
             "stale out-of-window errors must not trip a lane on clean recent traffic"
         );
+    }
+
+    /// Regression: a sub-threshold transient leaves the breaker Closed but arms a soft cooldown
+    /// (lane unusable). Dead-mode probing must still SEE it (`lane_needs_probe`) and `recover_lane`
+    /// must clear the cooldown — previously a soft-cooldown lane was Closed, so the tripped-only
+    /// gate skipped it and a single 5xx benched the lane for the full cooldown.
+    #[test]
+    fn test_soft_cooldown_is_probeable_and_recoverable() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(9000);
+        // Never trips (min_requests unreachable), so the transient only arms a soft cooldown.
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig {
+                mode: TripMode::ErrorRate,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: usize::MAX,
+                n: u32::MAX,
+            },
+        };
+
+        store.record_transient(0, "5xx", &cfg, None);
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "sub-threshold transient must NOT trip the breaker"
+        );
+        assert!(
+            !store.usable(0, 9000),
+            "but the soft cooldown makes the lane unusable"
+        );
+        assert!(
+            store.lane_needs_probe(0, 9000),
+            "dead-mode probing must see a soft-cooldown lane"
+        );
+
+        store.recover_lane(0);
+        assert!(
+            store.usable(0, 9000),
+            "a successful probe must clear the soft cooldown"
+        );
+        assert!(!store.lane_needs_probe(0, 9000));
     }
 
     #[test]

@@ -67,8 +67,10 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
                 ticker.tick().await;
                 let should = match mode {
                     HealthMode::Active => true,
-                    // Only re-probe lanes tripped in ANY cell (probing tests the shared upstream).
-                    HealthMode::Dead => app.store.lane_tripped_anywhere(i),
+                    // Re-probe a lane the breaker is suppressing in ANY cell — whether fully tripped
+                    // (Open) OR just in a soft cooldown (Closed but a sub-threshold transient armed a
+                    // cooldown). Both make the lane unusable; dead mode's job is to recover either early.
+                    HealthMode::Dead => app.store.lane_needs_probe(i, now()),
                     HealthMode::None => false,
                 };
                 if should {
@@ -122,8 +124,9 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
 
     let healthy = matches!(&res, Ok(r) if r.status().is_success());
     if healthy {
-        if app.store.lane_tripped_anywhere(i) {
-            // Probe tests the shared upstream → recover the lane in every cell (all pools + default).
+        if app.store.lane_needs_probe(i, now()) {
+            // Probe tests the shared upstream → recover the lane in every cell (all pools + default),
+            // clearing both Open trips and soft cooldowns.
             app.store.recover_lane(i);
             tracing::info!(lane = %lane.model, "lane recovered via health probe");
         }

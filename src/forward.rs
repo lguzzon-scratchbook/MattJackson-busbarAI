@@ -1460,8 +1460,29 @@ async fn handle_least_bad(
 
 #[cfg(test)]
 mod usage_tap_tests {
-    use super::UsageTap;
+    use super::{find_matching_brace, stable_hash, UsageTap};
     use bytes::Bytes;
+
+    #[test]
+    fn test_find_matching_brace_underflow_safe() {
+        // A closing brace with no opener must return None, not underflow/panic (hostile upstream).
+        assert_eq!(find_matching_brace(b"}"), None);
+        assert_eq!(find_matching_brace(b"}}}}"), None);
+        // Balanced object still parses to its end.
+        assert_eq!(find_matching_brace(br#"{"a":1}tail"#), Some(7));
+        // A `}` inside a string is ignored.
+        assert_eq!(find_matching_brace(br#"{"a":"}"}"#), Some(9));
+        // Feeding such bytes through the tap must not panic.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from_static(b"}}} garbage {not json"));
+    }
+
+    #[test]
+    fn test_stable_hash_is_deterministic() {
+        // Stable across calls (unlike DefaultHasher) so session affinity survives restarts.
+        assert_eq!(stable_hash("session-abc"), stable_hash("session-abc"));
+        assert_ne!(stable_hash("session-abc"), stable_hash("session-xyz"));
+    }
 
     #[test]
     fn test_tap_extracts_usage_across_protocols() {

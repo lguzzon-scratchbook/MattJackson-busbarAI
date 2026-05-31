@@ -267,6 +267,29 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_bearer_token_malformed_no_panic() {
+        // A multibyte char in the scheme position must not panic (was a `h[..7]` UTF-8 boundary bug).
+        assert_eq!(AuthMiddleware::extract_bearer_token(Some("Béarer x")), None);
+        assert_eq!(AuthMiddleware::extract_bearer_token(Some("🔑🔑🔑")), None);
+        assert_eq!(AuthMiddleware::extract_bearer_token(Some("Bearer ")), None); // empty token
+        assert_eq!(
+            AuthMiddleware::extract_bearer_token(Some("Basic abc")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_auth_mode_from_config_str() {
+        assert_eq!(AuthMode::from_config_str("token"), Some(AuthMode::Token));
+        assert_eq!(
+            AuthMode::from_config_str("  PassThrough "),
+            Some(AuthMode::Passthrough)
+        );
+        assert_eq!(AuthMode::from_config_str("NONE"), Some(AuthMode::None));
+        assert_eq!(AuthMode::from_config_str("bogus"), None);
+    }
+
+    #[test]
     fn test_auth_mode_token_valid() {
         let cfg = AuthCfg {
             mode: "token".to_string(),

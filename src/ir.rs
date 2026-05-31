@@ -143,10 +143,16 @@ pub(crate) enum IrDelta {
 /// Per-request decode state for stateful stream fan-out.
 /// Anthropic events are 1:1 and ignore this; OpenAI's flat stream uses it to synthesize the
 /// IR's block boundaries (one chunk → 0..n events): whether MessageStart was emitted, whether
-/// the text block (index 0) is open, and which OpenAI tool_call indices have been opened.
+/// the text/thinking blocks are open, and which OpenAI tool_call indices have been opened.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StreamDecodeState {
     pub started: bool,
     pub text_block_open: bool,
     pub open_tools: std::collections::BTreeSet<usize>,
+    /// Set once a reasoning (chain-of-thought) delta is seen on the OpenAI stream. When true, the
+    /// thinking block occupies IR index 0 and the text/tool block indices shift up by one so the
+    /// thinking block precedes the answer (used by the OpenAI reader only).
+    pub reasoning_seen: bool,
+    /// Whether the reasoning Thinking block (index 0) is currently open.
+    pub thinking_block_open: bool,
 }

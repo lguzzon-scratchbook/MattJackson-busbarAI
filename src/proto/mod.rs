@@ -453,6 +453,128 @@ mod tests {
         }
     }
 
+    /// OpenAI-compatible reasoning models put the chain-of-thought in `reasoning_content`; it must
+    /// map to a Thinking block (ahead of the answer) so it survives translation to Anthropic.
+    #[test]
+    fn test_openai_reasoning_content_maps_to_thinking() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "step 1: think; step 2: answer",
+                    "content": "the answer"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+        });
+        let ir = OpenAiReader.read_response(&body).expect("read_response");
+        assert!(
+            matches!(ir.content.first(), Some(crate::ir::IrBlock::Thinking { text, .. }) if text == "step 1: think; step 2: answer"),
+            "first block should be the reasoning as a Thinking block"
+        );
+        assert!(
+            ir.content.iter().any(
+                |b| matches!(b, crate::ir::IrBlock::Text { text, .. } if text == "the answer")
+            ),
+            "the answer text should follow"
+        );
+        // And it should render as an Anthropic thinking block on write.
+        let wire = AnthropicWriter.write_response(&ir);
+        let blocks = wire.get("content").and_then(|c| c.as_array()).unwrap();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")),
+            "Anthropic output should contain a thinking block"
+        );
+    }
+
+    /// Streaming reasoning: `delta.reasoning_content` must open a Thinking block at index 0 and
+    /// close it before the text block (which shifts to index 1).
+    #[test]
+    fn test_openai_streaming_reasoning_blocks() {
+        use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent};
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let mut ev = Vec::new();
+        ev.extend(reader.read_response_events(
+            "",
+            &serde_json::json!({"choices":[{"delta":{"reasoning_content":"mulling"}}]}),
+            &mut st,
+        ));
+        ev.extend(reader.read_response_events(
+            "",
+            &serde_json::json!({"choices":[{"delta":{"content":"answer"}}]}),
+            &mut st,
+        ));
+        ev.extend(reader.read_response_events(
+            "",
+            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}),
+            &mut st,
+        ));
+
+        let think_start = ev.iter().position(|e| {
+            matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Thinking
+                }
+            )
+        });
+        let think_delta = ev.iter().any(|e| matches!(e, IrStreamEvent::BlockDelta { index: 0, delta: IrDelta::ThinkingDelta(t) } if t == "mulling"));
+        let think_stop = ev
+            .iter()
+            .position(|e| matches!(e, IrStreamEvent::BlockStop { index: 0 }));
+        let text_start = ev.iter().position(|e| {
+            matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 1,
+                    block: IrBlockMeta::Text
+                }
+            )
+        });
+        let text_delta = ev.iter().any(|e| matches!(e, IrStreamEvent::BlockDelta { index: 1, delta: IrDelta::TextDelta(t) } if t == "answer"));
+
+        assert!(
+            think_start.is_some() && think_delta,
+            "reasoning opens a Thinking block at index 0"
+        );
+        assert!(
+            text_start.is_some() && text_delta,
+            "text opens at index 1 after reasoning"
+        );
+        assert!(
+            think_stop < text_start,
+            "the thinking block must close before the text block opens"
+        );
+    }
+
+    /// Regression: a normal (no-reasoning) OpenAI stream keeps text at index 0 (offset unchanged).
+    #[test]
+    fn test_openai_streaming_no_reasoning_text_index_zero() {
+        use crate::ir::{IrBlockMeta, IrStreamEvent};
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let ev = reader.read_response_events(
+            "",
+            &serde_json::json!({"choices":[{"delta":{"content":"hi"}}]}),
+            &mut st,
+        );
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text
+                }
+            )),
+            "without reasoning, text stays at index 0"
+        );
+    }
+
     fn rich_fixture() -> serde_json::Value {
         // temperature is a natural 0.7 — IrRequest.temperature is f64 so it round-trips exactly.
         serde_json::json!({

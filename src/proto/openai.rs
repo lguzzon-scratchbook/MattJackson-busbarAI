@@ -343,33 +343,70 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|a| a.first());
         let delta = choice0.and_then(|c| c.get("delta"));
 
-        // 3. Text content → open text block (index 0) on first content, then a TextDelta.
+        // 2. Reasoning (chain-of-thought) → a Thinking block at index 0, ahead of the answer. When
+        //    present it shifts the text/tool indices up by one (`offset`) so the thinking block
+        //    precedes them. Reasoning streams before content on these models.
+        if let Some(reasoning) = delta
+            .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+            .and_then(|r| r.as_str())
+        {
+            if !reasoning.is_empty() {
+                state.reasoning_seen = true;
+                if !state.thinking_block_open {
+                    state.thinking_block_open = true;
+                    out.push(IrStreamEvent::BlockStart {
+                        index: 0,
+                        block: crate::ir::IrBlockMeta::Thinking,
+                    });
+                }
+                out.push(IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: crate::ir::IrDelta::ThinkingDelta(reasoning.to_string()),
+                });
+            }
+        }
+
+        // Index offset: a thinking block (when present) owns index 0, so text/tools shift up by one.
+        let offset = usize::from(state.reasoning_seen);
+        let text_index = offset;
+
+        // 3. Text content → close any open thinking block first, then open the text block + a
+        //    TextDelta. Text owns index `offset` (0 normally, 1 when a thinking block precedes it).
         if let Some(content) = delta
             .and_then(|d| d.get("content"))
             .and_then(|c| c.as_str())
         {
+            if state.thinking_block_open {
+                state.thinking_block_open = false;
+                out.push(IrStreamEvent::BlockStop { index: 0 });
+            }
             if !state.text_block_open {
                 state.text_block_open = true;
                 out.push(IrStreamEvent::BlockStart {
-                    index: 0,
+                    index: text_index,
                     block: crate::ir::IrBlockMeta::Text,
                 });
             }
             out.push(IrStreamEvent::BlockDelta {
-                index: 0,
+                index: text_index,
                 delta: crate::ir::IrDelta::TextDelta(content.to_string()),
             });
         }
 
-        // 4. Tool calls → IR block index = oai_idx + 1 (text owns 0). BlockStart on first sight
-        //    (id+name present), InputJsonDelta for streamed arguments.
+        // 4. Tool calls → IR block index = oai_idx + 1 + offset (text owns `offset`). BlockStart on
+        //    first sight (id+name present), InputJsonDelta for streamed arguments.
         if let Some(tcs) = delta
             .and_then(|d| d.get("tool_calls"))
             .and_then(|t| t.as_array())
         {
+            // A tool call means the answer phase has begun; close any still-open thinking block.
+            if state.thinking_block_open {
+                state.thinking_block_open = false;
+                out.push(IrStreamEvent::BlockStop { index: 0 });
+            }
             for tc in tcs {
                 let oai_idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                let ir_idx = oai_idx + 1;
+                let ir_idx = oai_idx + 1 + offset;
                 let func = tc.get("function");
                 if let Some(name) = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
                     if !state.open_tools.contains(&oai_idx) {
@@ -405,12 +442,19 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|c| c.get("finish_reason"))
             .and_then(|r| r.as_str())
         {
-            if state.text_block_open {
-                state.text_block_open = false;
+            // Close in order: thinking (0, if it never yielded to text), then text, then tools.
+            if state.thinking_block_open {
+                state.thinking_block_open = false;
                 out.push(IrStreamEvent::BlockStop { index: 0 });
             }
+            if state.text_block_open {
+                state.text_block_open = false;
+                out.push(IrStreamEvent::BlockStop { index: text_index });
+            }
             for oai_idx in std::mem::take(&mut state.open_tools) {
-                out.push(IrStreamEvent::BlockStop { index: oai_idx + 1 });
+                out.push(IrStreamEvent::BlockStop {
+                    index: oai_idx + 1 + offset,
+                });
             }
             let stop_reason = Some(match fr {
                 "stop" => "end_turn".to_string(),
@@ -491,6 +535,23 @@ impl ProtocolReader for OpenAiReader {
 
         // Parse content (may be null)
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+
+        // Reasoning models on OpenAI-compatible providers (e.g. GLM, DeepSeek) emit the
+        // chain-of-thought in a separate `reasoning_content` (or `reasoning`) field. Map it to a
+        // Thinking block — ahead of the answer — so it survives translation to protocols that have
+        // one (e.g. Anthropic). (Protocols without a thinking concept drop it on write, as before.)
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(r) = message_val.get(key).and_then(|v| v.as_str()) {
+                if !r.is_empty() {
+                    content.push(crate::ir::IrBlock::Thinking {
+                        text: r.to_string(),
+                        signature: None,
+                    });
+                    break;
+                }
+            }
+        }
+
         if let Some(content_val) = message_val.get("content") {
             if content_val.is_string() && !content_val.as_str().unwrap_or("").is_empty() {
                 content.push(crate::ir::IrBlock::Text {
