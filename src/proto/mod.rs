@@ -112,6 +112,32 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Write a whole (non-streaming) response to wire JSON.
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value;
 
+    /// Build a minimal, protocol-correct request body for an active health probe of `model`.
+    /// Serializes a one-token "ping" through this protocol's own `write_request`, so every protocol
+    /// gets a valid probe body for free — no per-protocol probe code, no extra dependency.
+    fn probe_body(&self, model: &str) -> Vec<u8> {
+        use crate::ir::{IrBlock, IrMessage, IrRequest, IrRole};
+        let ir = IrRequest {
+            system: vec![],
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: "ping".to_string(),
+                    cache_control: None,
+                    citations: vec![],
+                }],
+            }],
+            tools: vec![],
+            max_tokens: Some(1),
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let mut body = self.write_request(&ir);
+        self.rewrite_model(&mut body, model);
+        serde_json::to_vec(&body).unwrap_or_default()
+    }
+
     /// Clone this writer as a trait object.
     fn clone_box(&self) -> Box<dyn ProtocolWriter>;
 }
@@ -402,6 +428,28 @@ pub(crate) fn convert_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every protocol's writer must produce a non-empty, valid-JSON probe body that carries the
+    /// requested model (or, for path-model protocols like Gemini/Bedrock, at least valid JSON) —
+    /// this is what the active health prober sends.
+    #[test]
+    fn test_probe_body_valid_for_all_protocols() {
+        for name in [
+            "anthropic",
+            "openai",
+            "gemini",
+            "bedrock",
+            "responses",
+            "cohere",
+        ] {
+            let proto = protocol_for(name).unwrap();
+            let body = proto.writer().probe_body("my-model");
+            assert!(!body.is_empty(), "{name}: probe body must be non-empty");
+            let v: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{name}: invalid JSON: {e}"));
+            assert!(v.is_object(), "{name}: probe body must be a JSON object");
+        }
+    }
 
     fn rich_fixture() -> serde_json::Value {
         // temperature is a natural 0.7 — IrRequest.temperature is f64 so it round-trips exactly.

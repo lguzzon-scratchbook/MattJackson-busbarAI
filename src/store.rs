@@ -101,7 +101,6 @@ pub(crate) struct LaneSnapshot {
 pub(crate) trait StateStore: Send + Sync + 'static {
     // health queries
     fn usable(&self, lane: usize, now: u64) -> bool;
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn breaker_state(&self, lane: usize) -> BreakerState;
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
 
@@ -113,6 +112,9 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     fn record_transient(&self, lane: usize, what: &str, cfg: &BreakerCfg, retry_after: Option<u64>);
     fn record_rate_limit(&self, lane: usize, now: u64, cfg: &BreakerCfg, retry_after: Option<u64>);
     fn record_hard_down(&self, lane: usize, reason: &str);
+    /// A successful out-of-band health probe: recover the lane to Closed if it was tripped. No-op
+    /// on an already-healthy (Closed) lane, so probes never disturb normal state.
+    fn recover_lane(&self, lane: usize);
 
     // concurrency + budget (kept as-is conceptually)
     fn try_acquire(&self, lane: usize) -> Option<Permit>;
@@ -710,6 +712,18 @@ impl StateStore for InMemoryStore {
         let until = now_time + HARD_DOWN_COOLDOWN_SECS;
         ls.cooldown_until.store(until, Ordering::Release);
         ls.breaker_state.store(1, Ordering::Release); // Open
+    }
+
+    fn recover_lane(&self, lane: usize) {
+        let ls = self.get_lane(lane);
+        // Only act on a tripped lane (Open/HalfOpen); a Closed lane is already healthy.
+        if ls.breaker_state.load(Ordering::Acquire) != 0 {
+            #[cfg(test)]
+            let now_time = crate::store::now_for_test();
+            #[cfg(not(test))]
+            let now_time = now();
+            self.closed_state(lane, now_time);
+        }
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {

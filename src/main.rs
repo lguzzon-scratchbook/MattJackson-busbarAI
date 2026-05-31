@@ -36,6 +36,7 @@ mod eventstream;
 mod forward;
 mod governance;
 mod handlers;
+mod health;
 mod ir;
 mod metrics;
 mod observability;
@@ -178,6 +179,7 @@ async fn main() {
             context_max: model_context_max.get(&ld.model).copied().flatten(),
             path: provider_cfg.path.clone(),
             auth: provider_cfg.auth.clone(),
+            health: provider_cfg.health.clone(),
         });
     }
 
@@ -334,6 +336,10 @@ async fn main() {
     if let Some(endpoint) = observability_cfg.otlp_endpoint.as_deref() {
         observability::init_otlp(endpoint);
     }
+
+    // Spawn the active health probers (one per lane with a probing mode). No-op when every lane is
+    // `mode: none` / has no `health:` block.
+    health::spawn_probers(app.clone());
 
     let router = build_router(app);
 

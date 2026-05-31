@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.15.0] — unreleased
 
 ### Added
+- **Active health checks are now live.** A provider's `health:` block has a `mode`:
+  `none` (default — passive health only), `dead` (periodically re-probe only tripped
+  lanes so a recovered upstream is picked back up promptly), or `active` (probe every
+  lane so a silently-dead upstream trips before real traffic hits it). Probes are a
+  one-token request built by the lane's protocol writer (`probe_body`), so all six
+  protocols work with no per-protocol code; `interval_secs`/`timeout_secs` are honored.
+  One background task per probing lane; lanes with no key are skipped.
 - **Per-pool circuit-breaker config is now live.** A pool's `breaker:` block
   (`trip.mode` error_rate|consecutive, `trip.window_s`/`threshold`/`min_requests`/`n`,
   `base_cooldown_secs`/`max_cooldown_secs`) is resolved at startup and drives the

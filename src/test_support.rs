@@ -391,6 +391,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -490,6 +491,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         let app = Arc::new(App {
             lanes: vec![lane],
@@ -606,6 +608,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         let app = Arc::new(App {
             lanes: vec![lane],
@@ -718,6 +721,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         let app = Arc::new(App {
             lanes: vec![lane],
@@ -847,6 +851,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let mut pool_runtime = HashMap::new();
@@ -1371,6 +1376,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1465,6 +1471,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1586,6 +1593,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -1599,6 +1607,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1726,6 +1735,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -1739,6 +1749,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1867,6 +1878,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1961,6 +1973,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let auth_cfg_token = AuthCfg {
@@ -2061,6 +2074,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2185,6 +2199,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -2198,6 +2213,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2342,6 +2358,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -2355,6 +2372,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane2 = Lane {
@@ -2368,6 +2386,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2498,6 +2517,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -2511,6 +2531,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2735,6 +2756,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2946,6 +2968,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3044,6 +3067,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3144,6 +3168,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3239,6 +3264,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3335,6 +3361,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3431,6 +3458,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3545,6 +3573,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             // Lane 2: NO mapping for any code → HTTP status classification only
@@ -3578,6 +3607,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let setup_app = |lane_data: LaneData, lane: Lane, _error_map_name: &str| {
@@ -3786,6 +3816,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3895,6 +3926,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             // Lane 1 setup (should NOT be called)
@@ -3926,6 +3958,7 @@ mod tests {
                 context_max: None,
                 path: None,
                 auth: None,
+                health: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4047,6 +4080,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -4060,6 +4094,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4194,6 +4229,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -4207,6 +4243,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4326,6 +4363,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4473,6 +4511,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4641,6 +4680,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -4654,6 +4694,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane2 = Lane {
@@ -4667,6 +4708,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4852,6 +4894,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -4865,6 +4908,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4930,6 +4974,163 @@ mod tests {
 
         server0.shutdown().await;
         server1.shutdown().await;
+    }
+
+    /// Active health probe: a 2xx response to the probe recovers a tripped lane (→ Closed).
+    #[tokio::test]
+    async fn test_health_probe_recovers_tripped_lane() {
+        use std::collections::HashMap;
+
+        let state0 = Arc::new(MockServerState::new());
+        let server0 = MockServer::new(state0.clone()).await;
+        state0.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": [] }),
+        });
+
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "p".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            model: "test-model".to_string(),
+            provider: "p".to_string(),
+            base_url: server0.base_url(),
+            api_key: "test-key".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+            health: Some(crate::config::HealthCfg {
+                mode: crate::config::HealthMode::Dead,
+                interval_secs: None,
+                timeout_secs: None,
+            }),
+        };
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model: HashMap::from([("test-model".to_string(), 0)]),
+            pools: HashMap::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            pool_runtime: HashMap::new(),
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: None,
+        });
+
+        // Trip the lane out of band (hard-down → Open with a sticky cooldown).
+        app.store.record_hard_down(0, "test trip");
+        assert_ne!(
+            app.store.breaker_state(0),
+            crate::store::BreakerState::Closed,
+            "lane should be tripped before the probe"
+        );
+
+        crate::health::probe_lane(&app, 0, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            app.store.breaker_state(0),
+            crate::store::BreakerState::Closed,
+            "a 2xx health probe must recover the tripped lane"
+        );
+        server0.shutdown().await;
+    }
+
+    /// Active health probe: a failing probe records a transient error against the lane.
+    #[tokio::test]
+    async fn test_health_probe_failure_records_transient() {
+        use std::collections::HashMap;
+
+        let state0 = Arc::new(MockServerState::new());
+        let server0 = MockServer::new(state0.clone()).await;
+        state0.push(MockResponse::ServerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: json!({ "error": "down" }),
+        });
+
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "p".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            model: "test-model".to_string(),
+            provider: "p".to_string(),
+            base_url: server0.base_url(),
+            api_key: "test-key".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+            health: Some(crate::config::HealthCfg {
+                mode: crate::config::HealthMode::Active,
+                interval_secs: None,
+                timeout_secs: None,
+            }),
+        };
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model: HashMap::from([("test-model".to_string(), 0)]),
+            pools: HashMap::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            pool_runtime: HashMap::new(),
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: None,
+        });
+
+        let before = app.store.snapshot(0, crate::store::now()).err;
+        crate::health::probe_lane(&app, 0, Duration::from_secs(5)).await;
+        let after = app.store.snapshot(0, crate::store::now()).err;
+        assert_eq!(
+            after,
+            before + 1,
+            "a failing health probe must record a transient error"
+        );
+        server0.shutdown().await;
     }
 
     /// Test 3: No header → system block hash for affinity.
@@ -5001,6 +5202,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -5014,6 +5216,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -5192,6 +5395,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -5381,6 +5585,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("m".to_string(), 0)]);
@@ -5510,6 +5715,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         // Model is in by_model but NOT in any pool — the branch the bug lived in.
         let app = Arc::new(App {
@@ -5595,6 +5801,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("m".to_string(), 0)]);
@@ -5691,6 +5898,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
@@ -5804,6 +6012,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
@@ -5925,6 +6134,7 @@ mod tests {
             context_max: None,
             path: None,
             auth: None,
+            health: None,
         };
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![mk_ld(), mk_ld()]));
@@ -6050,6 +6260,7 @@ mod tests {
             context_max: Some(8000), // Small context limit
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -6063,6 +6274,7 @@ mod tests {
             context_max: Some(200000), // Large context limit
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("small-model".to_string(), 0)]);
@@ -6186,6 +6398,7 @@ mod tests {
             context_max: Some(8000), // Same limit as lane 1
             path: None,
             auth: None,
+            health: None,
         };
 
         let lane1 = Lane {
@@ -6199,6 +6412,7 @@ mod tests {
             context_max: Some(8000), // Same limit as lane 0
             path: None,
             auth: None,
+            health: None,
         };
 
         let by_model = HashMap::from([("model-8k".to_string(), 0)]);

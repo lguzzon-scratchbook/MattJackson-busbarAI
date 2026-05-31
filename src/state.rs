@@ -30,6 +30,9 @@ pub(crate) struct Lane {
     /// the protocol's native auth (used by Azure OpenAI). `None` / `Some("bearer")` use the
     /// protocol's `sign_request` (bearer, x-goog-api-key, or SigV4).
     pub(crate) auth: Option<String>,
+    /// Optional active health-probe settings (from the provider's `health:` block). `None` or
+    /// `mode: none` means no background probing for this lane.
+    pub(crate) health: Option<crate::config::HealthCfg>,
 }
 
 /// A pool lane with its associated weight.

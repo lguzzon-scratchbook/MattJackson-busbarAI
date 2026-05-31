@@ -559,7 +559,7 @@ fn is_streaming_content_type(ct: &str) -> bool {
 
 /// extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
 /// header. base_urls are already trailing-slash-trimmed and carry no path.
-fn host_from_base(base: &str) -> String {
+pub(crate) fn host_from_base(base: &str) -> String {
     base.strip_prefix("https://")
         .or_else(|| base.strip_prefix("http://"))
         .unwrap_or(base)
@@ -572,7 +572,7 @@ fn host_from_base(base: &str) -> String {
 /// `api-key: <key>` header instead — the deployment and `?api-version=` live in the provider's
 /// `path` override, so no new protocol is needed. An un-encodable key yields no auth header (the
 /// upstream then rejects with 401, classified by the breaker like any other auth failure).
-fn lane_auth_headers(
+pub(crate) fn lane_auth_headers(
     lane: &crate::state::Lane,
     key: &str,
     ctx: &crate::proto::SigningContext,
@@ -1477,6 +1477,7 @@ mod auth_style_tests {
                 "/openai/deployments/gpt-4o/chat/completions?api-version=2024-06-01".to_string(),
             ),
             auth: auth.map(String::from),
+            health: None,
         }
     }
 

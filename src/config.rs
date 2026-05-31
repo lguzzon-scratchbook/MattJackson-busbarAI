@@ -92,8 +92,8 @@ pub(crate) struct ProviderCfg {
     pub(crate) protocol: String,
     pub(crate) base_url: String,
     pub(crate) api_key_env: String,
+    /// Active health-probe settings for this provider's lanes (mode + interval + timeout).
     #[serde(default)]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) health: Option<HealthCfg>,
     // error_map is REQUIRED on every provider — NO default (fail loud if missing)
     pub(crate) error_map: HashMap<String, String>,
@@ -112,11 +112,33 @@ fn default_protocol() -> String {
     "anthropic".to_string()
 }
 
+/// Active health-probe mode for a provider's lanes.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HealthMode {
+    /// No active probing. Health is inferred purely from organic traffic (the breaker trips on
+    /// real failures and recovers via the half-open probe). This is the default.
+    #[default]
+    None,
+    /// Periodically re-probe ONLY lanes that are currently tripped (Open/HalfOpen), so a recovered
+    /// upstream is picked back up promptly instead of waiting for organic traffic to probe it.
+    Dead,
+    /// Periodically probe EVERY lane, so a silently-dead upstream is tripped out before real
+    /// traffic hits it. Sends a tiny billable request per interval — opt-in.
+    Active,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct HealthCfg {
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Probing strategy (see `HealthMode`). Defaults to `none` — a `health:` block with only an
+    /// interval does nothing until a mode is chosen.
+    #[serde(default)]
+    pub(crate) mode: HealthMode,
+    /// Seconds between probes for this provider's lanes (default 30, floored at 1).
+    #[serde(default)]
     pub(crate) interval_secs: Option<u64>,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Per-probe request timeout in seconds (default 5, floored at 1).
+    #[serde(default)]
     pub(crate) timeout_secs: Option<u64>,
 }
 

@@ -36,6 +36,15 @@ auth:
 providers:
   anthropic:
     api_key_env: ANTHROPIC_KEY
+    # Optional active health probing for this provider's lanes (default: no probing — health is
+    # inferred from real traffic via the breaker + half-open probe).
+    #   mode: none   — passive only (default).
+    #        dead   — periodically re-probe ONLY tripped lanes so they recover faster.
+    #        active — periodically probe EVERY lane (sends a tiny billable request per interval).
+    # health:
+    #   mode: dead
+    #   interval_secs: 30   # default 30
+    #   timeout_secs: 5     # default 5
   openai:
     api_key_env: OPENAI_KEY
   gemini:
