@@ -63,28 +63,93 @@ const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Max idle keep-alive connections the shared HTTP client pools per upstream host.
 const POOL_MAX_IDLE_PER_HOST: usize = 64;
 
+/// Handle CLI flags before any environment or file access, so they work without a configured
+/// deployment. Returns `Some(exit_code)` when the process should exit (after printing), `None` to
+/// proceed to normal startup. busbar takes no positional arguments and is configured via
+/// environment + YAML; an unrecognized flag is a usage error rather than a silent server start.
+fn handle_cli_flags() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => None, // no args → run the gateway
+        Some("--version" | "-V") => {
+            println!("busbar {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "busbar {ver} — native-protocol LLM gateway
+
+USAGE:
+    busbar              run the gateway (configured entirely via environment + YAML)
+    busbar --help       print this help
+    busbar --version    print the version
+
+ENVIRONMENT:
+    BUSBAR_PROVIDERS    path to providers.yaml  (default: /etc/busbar/providers.yaml)
+    BUSBAR_CONFIG       path to config.yaml     (default: /etc/busbar/config.yaml)
+    RUST_LOG            log level: error|warn|info|debug|trace  (default: info)
+
+ENDPOINTS (once running, listen address from config.yaml `listen`):
+    POST /<model>/v1/messages              Anthropic-format ingress (single model)
+    POST /<pool>/v1/messages               route to a configured pool
+    POST /<provider>/<model>/v1/messages   ad-hoc direct route
+    POST /v1/chat/completions              OpenAI-format ingress
+    GET  /stats  /healthz  /metrics
+
+Docs: https://github.com/MattJackson/busbarAI",
+                ver = env!("CARGO_PKG_VERSION")
+            );
+            Some(0)
+        }
+        Some(other) => {
+            eprintln!("busbar: unrecognized argument '{other}'. Try 'busbar --help'.");
+            Some(2)
+        }
+    }
+}
+
+/// Print a clean startup error to stderr and exit non-zero. Used for misconfiguration and other
+/// boot-time failures so the operator sees a one-line message instead of a Rust panic backtrace.
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("[error] {msg}");
+    std::process::exit(1);
+}
+
 #[tokio::main]
 async fn main() {
+    // CLI flags first — these must work without a configured deployment (no env/file access).
+    if let Some(code) = handle_cli_flags() {
+        std::process::exit(code);
+    }
+
     // Install the Prometheus recorder before anything emits metrics.
     metrics::init();
 
     // Read providers.yaml (shipped definitions)
     let providers_path =
         std::env::var("BUSBAR_PROVIDERS").unwrap_or_else(|_| "/etc/busbar/providers.yaml".into());
-    let raw_providers = std::fs::read_to_string(&providers_path).expect("read BUSBAR_PROVIDERS");
-    let interpolated_providers =
-        config::interpolate_env(&raw_providers).expect("expand ${ENV} variables in providers.yaml");
-    let defs: HashMap<String, config::ProviderDef> =
-        serde_yaml::from_str(&interpolated_providers).expect("parse providers.yaml");
+    let raw_providers = std::fs::read_to_string(&providers_path).unwrap_or_else(|e| {
+        die(format!(
+            "cannot read providers file '{providers_path}': {e} (set BUSBAR_PROVIDERS)"
+        ))
+    });
+    let interpolated_providers = config::interpolate_env(&raw_providers)
+        .unwrap_or_else(|e| die(format!("providers.yaml: {e}")));
+    let defs: HashMap<String, config::ProviderDef> = serde_yaml::from_str(&interpolated_providers)
+        .unwrap_or_else(|e| die(format!("providers.yaml: invalid YAML: {e}")));
 
     // Read config.yaml (deployment)
     let config_path =
         std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
-    let raw_config = std::fs::read_to_string(&config_path).expect("read BUSBAR_CONFIG");
+    let raw_config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        die(format!(
+            "cannot read config file '{config_path}': {e} (set BUSBAR_CONFIG)"
+        ))
+    });
     let interpolated_config =
-        config::interpolate_env(&raw_config).expect("expand ${ENV} variables in config");
-    let deploy: config::DeployCfg =
-        serde_yaml::from_str(&interpolated_config).expect("parse config.yaml as DeployCfg");
+        config::interpolate_env(&raw_config).unwrap_or_else(|e| die(format!("config.yaml: {e}")));
+    let deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
+        .unwrap_or_else(|e| die(format!("config.yaml: invalid YAML: {e}")));
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
@@ -96,8 +161,8 @@ async fn main() {
     observability::init_logging(observability_cfg.otlp_endpoint.as_deref());
 
     // Resolve deployment + definitions into resolved RootCfg
-    let cfg =
-        config::resolve(&deploy, &defs).expect("resolve provider deployments from providers.yaml");
+    let cfg = config::resolve(&deploy, &defs)
+        .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
     let auth_cfg = cfg
         .auth
         .as_ref()
@@ -115,10 +180,12 @@ async fn main() {
     let mut lanes_data = Vec::new();
     let mut by_model = HashMap::new();
     for (model, mc) in cfg.models {
-        let provider_cfg = cfg
-            .providers
-            .get(&mc.provider)
-            .unwrap_or_else(|| panic!("model {model} -> unknown provider {}", mc.provider));
+        let provider_cfg = cfg.providers.get(&mc.provider).unwrap_or_else(|| {
+            die(format!(
+                "model '{model}' references unknown provider '{}'",
+                mc.provider
+            ))
+        });
         let key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
         if key.is_empty() {
             eprintln!(
@@ -167,12 +234,15 @@ async fn main() {
 
     let mut lanes = Vec::new();
     for ld in &lanes_data {
-        let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
+        let provider_cfg = cfg
+            .providers
+            .get(&ld.provider)
+            .expect("lane provider exists in resolved config (validated above)");
         let protocol = registry.get(&provider_cfg.protocol).unwrap_or_else(|| {
-            panic!(
-                "unknown protocol '{}' for provider {}",
-                provider_cfg.protocol, ld.provider
-            )
+            die(format!(
+                "provider '{}' uses unknown protocol '{}' (supported: anthropic, openai, gemini, bedrock, responses, cohere)",
+                ld.provider, provider_cfg.protocol
+            ))
         });
         lanes.push(Lane {
             model: ld.model.clone(),
@@ -198,7 +268,10 @@ async fn main() {
             .iter()
             .map(|m| {
                 let lane_idx = *by_model.get(&m.target).unwrap_or_else(|| {
-                    panic!("pool {} references unknown model {}", name, m.target)
+                    die(format!(
+                        "pool '{name}' references unknown model '{}'",
+                        m.target
+                    ))
                 });
                 WeightedLane {
                     idx: lane_idx,
@@ -271,15 +344,13 @@ async fn main() {
         if let Some(ref on_exc) = pool_cfg.on_exhausted {
             match crate::config::OnExhausted::parse(&on_exc.action) {
                 Ok(mode) => {
-                    eprintln!("  pool /{}: on_exhausted = {:?}", pool_name, mode);
+                    tracing::info!(pool = %pool_name, on_exhausted = ?mode, "pool exhaustion policy");
                     on_exhausted_cfgs.insert(pool_name.clone(), mode);
                 }
-                Err(e) => {
-                    panic!(
-                        "pool '{}' has invalid on_exhausted action '{}': {}",
-                        pool_name, on_exc.action, e
-                    );
-                }
+                Err(e) => die(format!(
+                    "pool '{pool_name}' has invalid on_exhausted action '{}': {e}",
+                    on_exc.action
+                )),
             }
         } else {
             // Default to Status503 if not specified
@@ -346,9 +417,13 @@ async fn main() {
 
     let router = build_router(app);
 
-    let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind");
-    eprintln!("busbar listening on {listen}");
-    axum::serve(listener, router).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .unwrap_or_else(|e| die(format!("cannot bind listen address '{listen}': {e}")));
+    tracing::info!(%listen, "busbar listening");
+    if let Err(e) = axum::serve(listener, router).await {
+        die(format!("server error: {e}"));
+    }
 }
 
 /// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full
