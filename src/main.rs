@@ -271,6 +271,7 @@ async fn main() {
                 match governance::GovState::new(
                     Arc::new(store),
                     g.price_per_request_cents,
+                    g.price_per_1k_tokens_cents,
                     g.admin_token.clone(),
                 ) {
                     Ok(gs) => {

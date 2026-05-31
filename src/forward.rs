@@ -60,6 +60,7 @@ impl UsageTap {
                     if let Ok(obj) = serde_json::from_slice::<Value>(json_bytes) {
                         self.extract_usage_from_delta(&obj);
                         self.extract_usage_from_stop(&obj);
+                        self.extract_usage_any(&obj);
                     }
                     pos = start + end;
                 } else {
@@ -123,6 +124,38 @@ impl UsageTap {
             }
             if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
                 self.cache_read_input_tokens = Some(v);
+            }
+        }
+    }
+
+    /// Protocol-agnostic usage extraction: recognizes the `usage` / `usageMetadata` shapes across
+    /// all wire protocols, in both streamed final frames and whole non-stream bodies. This is what
+    /// makes token-based budget accounting work for every protocol (not just Anthropic SSE).
+    ///   - Anthropic / OpenAI Responses: usage.input_tokens / output_tokens
+    ///   - OpenAI chat completions:       usage.prompt_tokens / completion_tokens
+    ///   - AWS Bedrock (Converse):        usage.inputTokens / outputTokens
+    ///   - Google Gemini:                 usageMetadata.promptTokenCount / candidatesTokenCount
+    fn extract_usage_any(&mut self, obj: &Value) {
+        if let Some(u) = obj.get("usage") {
+            for k in ["input_tokens", "prompt_tokens", "inputTokens"] {
+                if let Some(v) = u.get(k).and_then(|v| v.as_u64()) {
+                    self.input_tokens = Some(v);
+                    break;
+                }
+            }
+            for k in ["output_tokens", "completion_tokens", "outputTokens"] {
+                if let Some(v) = u.get(k).and_then(|v| v.as_u64()) {
+                    self.output_tokens = Some(v);
+                    break;
+                }
+            }
+        }
+        if let Some(u) = obj.get("usageMetadata") {
+            if let Some(v) = u.get("promptTokenCount").and_then(|v| v.as_u64()) {
+                self.input_tokens = Some(v);
+            }
+            if let Some(v) = u.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+                self.output_tokens = Some(v);
             }
         }
     }
@@ -230,6 +263,14 @@ impl Default for SseCarryBuffer {
 /// Tracks when the first byte is sent and handles mid-stream errors by emitting
 /// SSE error events instead of allowing failover. Also holds the permit until stream ends.
 ///
+/// Where to charge a request's token usage when its response stream completes (the resolved virtual
+/// key + its budget period + the governance store). `None` when governance is off or no key resolved.
+pub(crate) struct UsageSink {
+    pub gov: Arc<crate::governance::GovState>,
+    pub key_id: String,
+    pub period: String,
+}
+
 /// Integrated UsageTap for non-buffering usage extraction from streaming responses.
 struct FirstByteBody<S, P> {
     inner: S,
@@ -243,6 +284,9 @@ struct FirstByteBody<S, P> {
     /// when Some, translate each egress SSE chunk to the caller's ingress protocol.
     /// None = native passthrough (same-protocol or non-SSE).
     translate: Option<crate::proto::StreamTranslate>,
+    /// When set, the token usage tapped from this response is charged to a virtual key's budget at
+    /// stream end (token-accurate accounting). Taken (fired) exactly once when the stream completes.
+    usage_sink: Option<UsageSink>,
     /// Set once the stream has fully ended (after any translation terminator), so a later poll
     /// returns None instead of re-polling a finished inner stream.
     ended: bool,
@@ -259,6 +303,7 @@ where
         app: Arc<App>,
         lane_idx: usize,
         translate: Option<crate::proto::StreamTranslate>,
+        usage_sink: Option<UsageSink>,
     ) -> Self {
         Self {
             inner,
@@ -269,6 +314,7 @@ where
             lane_idx,
             tap: UsageTap::new(),
             translate,
+            usage_sink,
             ended: false,
         }
     }
@@ -350,6 +396,13 @@ where
                         .unwrap_or_default();
                     drop(this.permit.take());
                     this.ended = true;
+                    // Charge this request's token usage to the virtual key's budget (once).
+                    if let Some(sink) = this.usage_sink.take() {
+                        let tokens = this.tap.input_tokens.unwrap_or(0)
+                            + this.tap.output_tokens.unwrap_or(0);
+                        sink.gov
+                            .record_tokens(&sink.key_id, &sink.period, now(), tokens);
+                    }
                     if !done.is_empty() {
                         return Poll::Ready(Some(Ok(Bytes::from(done))));
                     }
@@ -504,6 +557,7 @@ pub(crate) async fn forward(
     cands: Vec<WeightedLane>,
     body: Bytes,
     caller_token: Option<&str>,
+    usage_sink: Option<UsageSink>,
 ) -> Response {
     forward_with_pool(
         app,
@@ -513,11 +567,15 @@ pub(crate) async fn forward(
         "__default__",
         None,
         "anthropic",
+        usage_sink,
     )
     .await
 }
 
 /// Forward with pool name context for on_exhausted config lookup.
+// Plumbing function: each parameter is an independent request input (state, candidates, body,
+// caller token, pool name, affinity key, ingress protocol, usage sink) with no natural grouping.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "forward",
     skip_all,
@@ -531,6 +589,7 @@ pub(crate) async fn forward_with_pool(
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
+    usage_sink: Option<UsageSink>,
 ) -> Response {
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -930,8 +989,15 @@ pub(crate) async fn forward_with_pool(
                     None
                 };
                 let upstream_stream = r.bytes_stream();
-                let guarded_body =
-                    FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, translate);
+                let guarded_body = FirstByteBody::new(
+                    upstream_stream,
+                    is_sse,
+                    permit,
+                    app.clone(),
+                    i,
+                    translate,
+                    usage_sink,
+                );
                 let axum_body = guarded_body.into_body();
 
                 let mut rb = Response::builder().status(status);
@@ -1109,7 +1175,7 @@ async fn forward_once(
             let upstream_stream = r.bytes_stream();
             // Degraded fallback/least-bad path: no cross-protocol translation here (scope).
             let guarded_body =
-                FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, None);
+                FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, None, None);
             let mut rb = Response::builder().status(status);
             if let Some(ct) = ct {
                 rb = rb.header(CONTENT_TYPE, ct);
@@ -1236,6 +1302,47 @@ async fn handle_least_bad(
     {
         Ok(resp) => resp,
         Err(()) => handle_status_503(app, cands, now),
+    }
+}
+
+#[cfg(test)]
+mod usage_tap_tests {
+    use super::UsageTap;
+    use bytes::Bytes;
+
+    #[test]
+    fn test_tap_extracts_usage_across_protocols() {
+        // OpenAI chat completions: prompt_tokens / completion_tokens.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        ));
+        assert_eq!(t.input_tokens, Some(10));
+        assert_eq!(t.output_tokens, Some(5));
+
+        // Anthropic / OpenAI Responses: input_tokens / output_tokens.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"usage":{"input_tokens":8,"output_tokens":4}}"#,
+        ));
+        assert_eq!(t.input_tokens, Some(8));
+        assert_eq!(t.output_tokens, Some(4));
+
+        // AWS Bedrock Converse: inputTokens / outputTokens.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"usage":{"inputTokens":6,"outputTokens":2}}"#,
+        ));
+        assert_eq!(t.input_tokens, Some(6));
+        assert_eq!(t.output_tokens, Some(2));
+
+        // Gemini: usageMetadata.promptTokenCount / candidatesTokenCount.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#,
+        ));
+        assert_eq!(t.input_tokens, Some(7));
+        assert_eq!(t.output_tokens, Some(3));
     }
 }
 

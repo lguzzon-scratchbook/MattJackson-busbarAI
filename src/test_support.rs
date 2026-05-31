@@ -423,6 +423,7 @@ mod tests {
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -516,7 +517,7 @@ mod tests {
                 created_at: 0,
             })
             .unwrap();
-        let gov = Arc::new(GovState::new(store, 1, None).unwrap());
+        let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -606,7 +607,7 @@ mod tests {
             .unwrap();
         // Pre-seed usage past the 100c budget (window 0 = "total").
         store.add_usage("kb", 0, 250, 0).unwrap();
-        let gov = Arc::new(GovState::new(store, 1, None).unwrap());
+        let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -668,7 +669,7 @@ mod tests {
                 created_at: 0,
             })
             .unwrap();
-        let gov = Arc::new(GovState::new(store, 0, None).unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -733,7 +734,7 @@ mod tests {
 
         crate::metrics::init();
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let gov = Arc::new(GovState::new(store, 1, Some("admintok".to_string())).unwrap());
+        let gov = Arc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -910,6 +911,7 @@ mod tests {
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -1001,6 +1003,7 @@ mod tests {
             app.clone(),
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
+            None,
             None,
         )
         .await;
@@ -1138,6 +1141,7 @@ mod tests {
             ],
             req_body.into(),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -1273,6 +1277,7 @@ mod tests {
             ],
             req_body.into(),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -1395,6 +1400,7 @@ mod tests {
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -1480,6 +1486,7 @@ mod tests {
             app_token.clone(),
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
+            None,
             None,
         )
         .await;
@@ -1587,6 +1594,7 @@ mod tests {
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
             Some(caller_bearer_token),
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -1718,6 +1726,7 @@ mod tests {
                 crate::state::WeightedLane { idx: 1, weight: 1 },
             ],
             req_body.into(),
+            None,
             None,
         )
         .await;
@@ -1887,6 +1896,7 @@ mod tests {
             ],
             req_body.into(),
             None,
+            None,
         )
         .await;
 
@@ -2026,6 +2036,7 @@ mod tests {
                 crate::state::WeightedLane { idx: 1, weight: 1 },
             ],
             req_body.into(),
+            None,
             None,
         )
         .await;
@@ -2234,6 +2245,7 @@ mod tests {
             vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             req_body.into(),
             None,
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -2440,6 +2452,7 @@ mod tests {
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
                 None,
+                None,
             )
             .await;
 
@@ -2534,6 +2547,7 @@ mod tests {
                 app.clone(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
+                None,
                 None,
             )
             .await;
@@ -2632,6 +2646,7 @@ mod tests {
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
                 None,
+                None,
             )
             .await;
 
@@ -2723,6 +2738,7 @@ mod tests {
                 app.clone(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
+                None,
                 None,
             )
             .await;
@@ -2817,6 +2833,7 @@ mod tests {
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
                 None,
+                None,
             )
             .await;
 
@@ -2909,6 +2926,7 @@ mod tests {
                 app.clone(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
+                None,
                 None,
             )
             .await;
@@ -3057,6 +3075,7 @@ mod tests {
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.clone().into(),
                 None,
+                None,
             )
             .await;
             let t = now();
@@ -3071,6 +3090,7 @@ mod tests {
                 app_2.clone(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
+                None,
                 None,
             )
             .await;
@@ -3262,6 +3282,7 @@ mod tests {
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
                 None,
+                None,
             )
             .await;
 
@@ -3402,6 +3423,7 @@ mod tests {
                 ],
                 req_body.into(),
                 None,
+                None,
             )
             .await;
 
@@ -3532,6 +3554,7 @@ mod tests {
                 crate::state::WeightedLane { idx: 1, weight: 1 },
             ],
             req_body.into(),
+            None,
             None,
         )
         .await;
@@ -3683,6 +3706,7 @@ mod tests {
             "leastbad",
             None,
             "anthropic",
+            None,
         )
         .await;
 
@@ -3823,6 +3847,7 @@ mod tests {
             "pool_a",
             None,
             "anthropic",
+            None,
         )
         .await;
 
@@ -3948,6 +3973,7 @@ mod tests {
             "primary",
             None,
             "anthropic",
+            None,
         )
         .await;
 
@@ -4132,6 +4158,7 @@ mod tests {
             "sticky-test",
             Some("session-abc"),
             "anthropic",
+            None,
         )
         .await;
 
@@ -4153,6 +4180,7 @@ mod tests {
             "sticky-test",
             Some("session-abc"),
             "anthropic",
+            None,
         )
         .await;
 
@@ -4180,6 +4208,7 @@ mod tests {
             "sticky-test",
             Some("session-xyz"),
             "anthropic",
+            None,
         )
         .await;
 
@@ -4317,6 +4346,7 @@ mod tests {
             "failover-test",
             Some("session-to-lane-0"),
             "anthropic",
+            None,
         )
         .await;
 
@@ -4468,6 +4498,7 @@ mod tests {
             "system-test",
             None, // No header - should derive from system block
             "anthropic",
+            None,
         )
         .await;
 
@@ -4488,6 +4519,7 @@ mod tests {
             "system-test",
             None, // No header - should derive from system block
             "anthropic",
+            None,
         )
         .await;
 
@@ -4819,6 +4851,7 @@ mod tests {
             "m",
             None,
             "openai",
+            None,
         )
         .await;
 
@@ -4938,6 +4971,7 @@ mod tests {
             "m",
             None,
             "anthropic",
+            None,
         )
         .await;
 
@@ -5022,6 +5056,7 @@ mod tests {
             "m",
             None,
             "anthropic",
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -5131,6 +5166,7 @@ mod tests {
             "m",
             None,
             "anthropic",
+            None,
         )
         .await;
         assert_eq!(response.status().as_u16(), 200);
@@ -5247,6 +5283,7 @@ mod tests {
                 crate::state::WeightedLane { idx: 1, weight: 1 },
             ],
             body.to_string().into(),
+            None,
             None,
         )
         .await;
@@ -5393,6 +5430,7 @@ mod tests {
             ],
             req_body.into(),
             None,
+            None,
         )
         .await;
 
@@ -5523,6 +5561,7 @@ mod tests {
                 crate::state::WeightedLane { idx: 1, weight: 1 },
             ],
             req_body.into(),
+            None,
             None,
         )
         .await;

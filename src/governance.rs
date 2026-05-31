@@ -27,10 +27,11 @@ struct RateState {
 pub(crate) struct GovState {
     store: Arc<dyn Store>,
     by_hash: RwLock<HashMap<String, VirtualKey>>,
-    /// cost model: flat cents charged per request. Budgets are enforced against accumulated
-    /// request-cost. (Token-/model-priced budgets are a documented future refinement; this keeps
-    /// the budget real + enforceable without parsing every response body.)
+    /// Flat cents charged per request (one half of the cost model; the other is per-token, below).
+    /// Total budget spend = per-request fee + tokens/1000 * price_per_1k_tokens_cents.
     price_per_request_cents: i64,
+    /// cents per 1000 tokens (input + output), accrued from response usage at stream end.
+    price_per_1k_tokens_cents: i64,
     /// per-key RPM/TPM windows (ephemeral).
     rate: RwLock<HashMap<String, RateState>>,
     /// bearer token guarding the /admin management API (None = admin API disabled).
@@ -52,6 +53,7 @@ impl GovState {
     pub(crate) fn new(
         store: Arc<dyn Store>,
         price_per_request_cents: i64,
+        price_per_1k_tokens_cents: i64,
         admin_token: Option<String>,
     ) -> StoreResult<Self> {
         let by_hash = Self::load(store.as_ref())?;
@@ -59,9 +61,27 @@ impl GovState {
             store,
             by_hash: RwLock::new(by_hash),
             price_per_request_cents,
+            price_per_1k_tokens_cents,
             rate: RwLock::new(HashMap::new()),
             admin_token,
         })
+    }
+
+    /// Accrue token-based usage from a completed response to a key's current budget window: adds
+    /// `tokens/1000 * price_per_1k_tokens_cents` to spend, plus the raw tokens (for TPM). Called
+    /// once per request at stream end from the response usage tap. Best-effort (store errors logged).
+    pub(crate) fn record_tokens(&self, key_id: &str, budget_period: &str, now: u64, tokens: u64) {
+        if tokens == 0 {
+            // Still feed the (zero) rate counter to be explicit; nothing to spend.
+            return;
+        }
+        let window = budget_window(budget_period, now);
+        let spend =
+            (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64) / 1000) as i64;
+        if let Err(e) = self.store.add_usage(key_id, window, spend, tokens) {
+            eprintln!("busbar: token usage record failed for key {key_id}: {e}");
+        }
+        self.add_rate_tokens(key_id, now, tokens);
     }
 
     /// the configured admin token (None = admin API disabled).
@@ -120,7 +140,7 @@ impl GovState {
     /// check + consume one request slot against the key's RPM/TPM for the current 60s window.
     /// `Ok(())` admits the request (and counts it); `Err(retry_after_secs)` rejects it (429). RPM is
     /// enforced precisely; TPM is enforced against tokens accrued so far this window (tokens are
-    /// added post-response via `record_request`, so TPM trails RPM until token accounting lands).
+    /// fed post-response from the response usage tap, so TPM reflects the prior window's tokens).
     pub(crate) fn check_rate(&self, key: &VirtualKey, now: u64) -> Result<(), u64> {
         if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
             return Ok(());
@@ -591,7 +611,7 @@ mod tests {
         k.allowed_pools = vec!["prod".to_string()];
         store.put_key(&k).unwrap();
 
-        let gov = GovState::new(store, 1, None).unwrap();
+        let gov = GovState::new(store, 1, 0, None).unwrap();
         // hashed-secret lookup hits the cache.
         assert_eq!(gov.lookup(secret).unwrap().id, "k1");
         assert!(gov.lookup("wrong-secret").is_none());
@@ -627,7 +647,7 @@ mod tests {
         k.max_budget_cents = Some(100);
         k.budget_period = "total".to_string();
         store.put_key(&k).unwrap();
-        let gov = GovState::new(store, 30, None).unwrap(); // 30 cents/request
+        let gov = GovState::new(store, 30, 0, None).unwrap(); // 30 cents/request
 
         assert!(!gov.is_over_budget(&k, 1_700_000_000));
         for _ in 0..3 {
@@ -643,9 +663,20 @@ mod tests {
     }
 
     #[test]
+    fn test_record_tokens_cost() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        // 50 cents per 1000 tokens, no per-request fee.
+        let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
+        gov.record_tokens("k1", "total", 1_700_000_000, 2000); // 2000 * 50 / 1000 = 100 cents
+        let u = store.get_usage("k1", 0).unwrap();
+        assert_eq!(u.spend_cents, 100);
+        assert_eq!(u.tokens, 2000);
+    }
+
+    #[test]
     fn test_check_rate_rpm_window() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let gov = GovState::new(store, 1, None).unwrap();
+        let gov = GovState::new(store, 1, 0, None).unwrap();
         let mut k = sample_key("k1", "h1");
         k.rpm_limit = Some(2);
         k.tpm_limit = None;

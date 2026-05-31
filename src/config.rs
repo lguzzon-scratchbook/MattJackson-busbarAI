@@ -406,10 +406,13 @@ pub(crate) struct GovernanceCfg {
     /// SQLite database path for the durable Store (ADR-0009). Defaults to `busbar-governance.db`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
-    /// flat cents charged per request for budget accounting (token-/model-priced budgets are a
-    /// future refinement). Defaults to 1.
+    /// Flat cents charged per request for budget accounting. Defaults to 1.
     #[serde(default = "default_price_per_request_cents")]
     pub(crate) price_per_request_cents: i64,
+    /// Cents charged per 1000 tokens (input + output), accrued from response usage. Defaults to 0.
+    /// Total budget spend per request = price_per_request_cents + tokens/1000 * price_per_1k_tokens_cents.
+    #[serde(default)]
+    pub(crate) price_per_1k_tokens_cents: i64,
     /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,

@@ -36,6 +36,23 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str) -> Option<Respon
     None
 }
 
+/// Build the token-usage sink for a request: when governance is on and a virtual key resolved, the
+/// response stream charges its tapped token usage to that key's budget at completion (token-accurate
+/// accounting). `None` disables it (governance off / no key).
+fn usage_sink(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+) -> Option<crate::forward::UsageSink> {
+    match (&app.governance, &gov.key) {
+        (Some(g), Some(key)) => Some(crate::forward::UsageSink {
+            gov: g.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// reject (402) before forwarding when the resolved virtual key is already over its
 /// budget for the current window. No-op when governance is off or the key has no budget cap.
 fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
@@ -112,8 +129,8 @@ fn finish(
         elapsed.as_millis() as u64,
     ));
 
-    // charge the request to the virtual key's budget. Token-based cost is a future refinement
-    // (tokens=0 here); the flat per-request price is what accrues today.
+    // charge the flat per-request fee now; the response's token usage is charged separately at
+    // stream end via the UsageSink (token-accurate spend = per-request fee + token fee).
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
         g.record_request(key, crate::store::now(), 0);
     }
@@ -173,6 +190,7 @@ pub(crate) async fn openai_ingress(
             &model,
             _affinity_key,
             "openai",
+            usage_sink(&app, &gov),
         )
         .await;
         return finish(&app, &gov, "openai", &model, started, resp);
@@ -184,6 +202,7 @@ pub(crate) async fn openai_ingress(
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
             None,
+            usage_sink(&app, &gov),
         )
         .await;
         return finish(&app, &gov, "openai", &model, started, resp);
@@ -235,6 +254,7 @@ pub(crate) async fn named(
             &name,
             affinity_key,
             "anthropic",
+            usage_sink(&app, &gov),
         )
         .await;
         return finish(&app, &gov, "anthropic", &name, started, resp);
@@ -246,6 +266,7 @@ pub(crate) async fn named(
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
             _caller_token,
+            usage_sink(&app, &gov),
         )
         .await;
         return finish(&app, &gov, "anthropic", &name, started, resp);
@@ -290,6 +311,7 @@ pub(crate) async fn adhoc(
                 vec![WeightedLane { idx: i, weight: 1 }],
                 body,
                 _caller_token,
+                usage_sink(&app, &gov),
             )
             .await;
             finish(&app, &gov, "anthropic", &model, started, resp)
