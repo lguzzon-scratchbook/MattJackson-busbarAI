@@ -334,6 +334,12 @@ struct LaneState {
 }
 
 impl InMemoryStore {
+    /// Read a (pool, lane) cell's cumulative error counter — for concurrency/isolation tests.
+    #[cfg(test)]
+    pub(crate) fn cell_err_for_test(&self, pool: &str, lane: usize) -> u64 {
+        self.cell(pool, lane).err().load(Ordering::Relaxed)
+    }
+
     pub(crate) fn new(lanes: Vec<LaneData>) -> Self {
         let lane_states: Vec<Arc<LaneState>> = lanes
             .into_iter()
@@ -1610,6 +1616,75 @@ mod tests {
         assert!(
             !store.usable(0, 8100),
             "exhausted budget blocks direct route"
+        );
+    }
+
+    /// Concurrency stress: many OS threads hammer the store across two pools sharing one lane.
+    /// Verifies (a) the lane-global `ok` atomic is exact under contention, (b) per-pool error
+    /// counters stay isolated and exact (no lost updates, no cross-pool bleed, no panic/deadlock in
+    /// the lazy pool-cell map), exercising the per-(pool,lane) machinery under real parallelism.
+    #[test]
+    fn test_concurrent_pool_isolation_stress() {
+        use std::thread;
+
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10_000)]));
+
+        // A trip config that never trips, so transient errors increment the cell's `err` cleanly
+        // (each just arms a brief cooldown) and we can assert exact counts.
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 1,
+            max_cooldown_secs: 1,
+            honor_retry_after: false,
+            trip: TripConfig {
+                mode: TripMode::ErrorRate,
+                window_s: 1,
+                threshold: 2.0,           // unreachable fraction
+                min_requests: usize::MAX, // never meets the floor
+                n: u32::MAX,
+            },
+        };
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 500;
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let s = store.clone();
+            let c = cfg.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..ITERS {
+                    // Successes route via pool "A" (also bumps the lane-global ok counter).
+                    s.record_success_in("A", 0);
+                    // Transients route via pool "B" — must NOT affect pool A's cell.
+                    s.record_transient_in("B", 0, "5xx", &c, None);
+                    // Concurrent reads against both pools + a recovery, to stir the cells.
+                    let t = crate::store::now();
+                    let _ = s.usable_in("A", 0, t);
+                    let _ = s.usable_in("B", 0, t);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total = (THREADS * ITERS) as u64;
+        // (a) lane-global ok atomic is exact.
+        assert_eq!(
+            store.snapshot(0, crate::store::now()).ok,
+            total,
+            "lane-global ok must be exact under concurrency"
+        );
+        // (b) pool isolation held under load: B saw every transient, A saw none.
+        assert_eq!(
+            store.cell_err_for_test("B", 0),
+            total,
+            "pool B's cell must have recorded every transient (no lost updates)"
+        );
+        assert_eq!(
+            store.cell_err_for_test("A", 0),
+            0,
+            "pool A's cell must be untouched by pool B's transients (isolation under load)"
         );
     }
 
