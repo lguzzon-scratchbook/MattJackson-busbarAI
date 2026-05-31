@@ -449,11 +449,14 @@ impl ProtocolReader for AnthropicReader {
                 .and_then(|v| v.as_u64()),
         };
 
+        let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
+
         Ok(crate::ir::IrResponse {
             role,
             content,
             stop_reason,
             usage,
+            model,
         })
     }
 }
@@ -978,6 +981,11 @@ impl ProtocolWriter for AnthropicWriter {
         // role: "assistant" for responses
         obj.insert("type".to_string(), serde_json::json!("message"));
         obj.insert("role".to_string(), serde_json::json!("assistant"));
+
+        // model that served the response (preserved across cross-protocol translation)
+        if let Some(ref model) = resp.model {
+            obj.insert("model".to_string(), serde_json::json!(model));
+        }
 
         // content blocks
         let content_array: Vec<serde_json::Value> = resp.content.iter().map(write_block).collect();

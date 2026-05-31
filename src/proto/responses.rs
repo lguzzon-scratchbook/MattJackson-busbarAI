@@ -663,11 +663,14 @@ impl ProtocolReader for ResponsesReader {
             cache_read_input_tokens: None,
         };
 
+        let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
+
         Ok(crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
             usage,
+            model,
         })
     }
 
@@ -1097,6 +1100,10 @@ impl ProtocolWriter for ResponsesWriter {
         let mut obj = serde_json::Map::new();
         obj.insert("object".to_string(), serde_json::json!("response"));
         obj.insert("status".to_string(), serde_json::json!(status));
+        // model that served the response (preserved across cross-protocol translation)
+        if let Some(ref model) = resp.model {
+            obj.insert("model".to_string(), serde_json::json!(model));
+        }
         obj.insert("output".to_string(), serde_json::Value::Array(output_arr));
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 

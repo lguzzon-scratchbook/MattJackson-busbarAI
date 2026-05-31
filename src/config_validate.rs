@@ -54,6 +54,16 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 }
             }
         }
+
+        // Validate the optional auth-style override (fail loud on typos).
+        if let Some(auth) = &provider_cfg.auth {
+            if !matches!(auth.as_str(), "bearer" | "api-key") {
+                errors.push(format!(
+                    "provider '{}' has invalid auth '{}': must be 'bearer' (default) or 'api-key'",
+                    provider_name, auth
+                ));
+            }
+        }
     }
 
     // Rule 2 & 3: Validate each pool's members
@@ -127,6 +137,7 @@ mod tests {
             health: None,
             error_map,
             path: None,
+            auth: None,
             _legacy_api_key: None,
         }
     }
@@ -158,6 +169,29 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_bad_auth_style() {
+        let mut providers = HashMap::new();
+        let mut p = make_provider("openai", "https://api.example.com", "API_KEY");
+        p.auth = Some("oauth2".into()); // not a recognized auth style
+        providers.insert("bad".to_string(), p);
+        // A valid 'api-key' provider must NOT trigger an error.
+        let mut ok = make_provider("openai", "https://res.openai.azure.com", "AZ_KEY");
+        ok.auth = Some("api-key".into());
+        providers.insert("good".to_string(), ok);
+
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("bad auth must fail validation");
+        assert!(
+            errs.iter().any(|e| e.contains("invalid auth 'oauth2'")),
+            "expected an invalid-auth error for 'oauth2'; got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("invalid auth 'api-key'")),
+            "'api-key' is a valid auth style and must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_rejects_pool_name_equals_provider_name() {
         let mut providers = HashMap::new();
         // Add minimal error_map to avoid extra validation error
@@ -173,6 +207,7 @@ mod tests {
                 health: None,
                 error_map: pm_error_map,
                 path: None,
+                auth: None,
                 _legacy_api_key: None,
             },
         );
@@ -212,6 +247,7 @@ mod tests {
                 health: None,
                 error_map: mp_error_map,
                 path: None,
+                auth: None,
                 _legacy_api_key: None,
             },
         );
@@ -250,6 +286,7 @@ mod tests {
                 health: None,
                 error_map: cm_error_map,
                 path: None,
+                auth: None,
                 _legacy_api_key: None,
             },
         );
@@ -302,6 +339,7 @@ mod tests {
                 health: None,
                 error_map: anthropic_error_map,
                 path: None,
+                auth: None,
                 _legacy_api_key: None,
             },
         );
@@ -314,6 +352,7 @@ mod tests {
                 health: None,
                 error_map: openai_error_map,
                 path: None,
+                auth: None,
                 _legacy_api_key: None,
             },
         );
@@ -361,6 +400,7 @@ mod tests {
                 health: None,
                 error_map: pm_error_map,
                 path: None,
+                auth: None,
                 _legacy_api_key: None,
             },
         );

@@ -552,6 +552,43 @@ fn host_from_base(base: &str) -> String {
         .to_string()
 }
 
+/// Build outbound auth headers for a lane. Defaults to the protocol's native auth via
+/// `sign_request` (bearer for openai/anthropic/responses, `x-goog-api-key` for gemini, per-request
+/// SigV4 for bedrock). When the provider declares `auth: api-key` (Azure OpenAI), send an
+/// `api-key: <key>` header instead — the deployment and `?api-version=` live in the provider's
+/// `path` override, so no new protocol is needed. An un-encodable key yields no auth header (the
+/// upstream then rejects with 401, classified by the breaker like any other auth failure).
+fn lane_auth_headers(
+    lane: &crate::state::Lane,
+    key: &str,
+    ctx: &crate::proto::SigningContext,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    match lane.auth.as_deref() {
+        Some("api-key") => match axum::http::HeaderValue::from_str(key) {
+            Ok(v) => vec![(axum::http::HeaderName::from_static("api-key"), v)],
+            Err(_) => Vec::new(),
+        },
+        _ => lane.protocol.writer().sign_request(key, ctx),
+    }
+}
+
+/// Charge a non-streaming response's token usage to the virtual key's budget. The streaming path
+/// taps tokens incrementally inside `FirstByteBody`; buffered (non-streaming) responses have no
+/// such wrapper, so without this the per-key token counter (and any TPM limit derived from it)
+/// silently stays at zero. Taps the raw upstream body, which carries the real usage in whatever
+/// protocol shape the backend speaks (the same protocol-agnostic extraction the stream tap uses).
+fn record_nonstream_usage(upstream_body: &[u8], usage_sink: &Option<UsageSink>) {
+    if let Some(sink) = usage_sink {
+        let mut tap = UsageTap::new();
+        tap.feed(&Bytes::copy_from_slice(upstream_body));
+        let tokens = tap.input_tokens.unwrap_or(0) + tap.output_tokens.unwrap_or(0);
+        if tokens > 0 {
+            sink.gov
+                .record_tokens(&sink.key_id, &sink.period, now(), tokens);
+        }
+    }
+}
+
 pub(crate) async fn forward(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
@@ -731,7 +768,7 @@ pub(crate) async fn forward_with_pool(
             body: &payload,
             timestamp_epoch: now(),
         };
-        let auth = writer.sign_request(key, &signing_ctx);
+        let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
         let res = app
             .client
@@ -960,6 +997,8 @@ pub(crate) async fn forward_with_pool(
                 if ingress_protocol != app.lanes[i].protocol.name() && !is_sse {
                     let bytes = r.bytes().await.unwrap_or_default();
                     drop(permit); // upstream call complete; a non-streamed response holds no permit
+                                  // Token accounting: no FirstByteBody on this buffered path, so tap here.
+                    record_nonstream_usage(&bytes, &usage_sink);
                     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                         if let Ok(ir) = app.lanes[i].protocol.reader().read_response(&v) {
                             if let Some(ingress_proto) =
@@ -1147,7 +1186,7 @@ async fn forward_once(
         body: &payload,
         timestamp_epoch: now(),
     };
-    let auth = writer.sign_request(key, &signing_ctx);
+    let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
     let res = app
         .client
@@ -1350,6 +1389,63 @@ mod usage_tap_tests {
         ));
         assert_eq!(t.input_tokens, Some(7));
         assert_eq!(t.output_tokens, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod auth_style_tests {
+    use super::lane_auth_headers;
+    use crate::proto::{Protocol, SigningContext};
+    use crate::state::Lane;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn lane_with_auth(auth: Option<&str>) -> Lane {
+        Lane {
+            model: "gpt-4o".to_string(),
+            provider: "azure".to_string(),
+            base_url: "https://res.openai.azure.com".to_string(),
+            api_key: "SECRETKEY".to_string(),
+            protocol: Arc::new(Protocol::openai()),
+            max: 1,
+            error_map: Arc::new(HashMap::new()),
+            context_max: None,
+            path: Some(
+                "/openai/deployments/gpt-4o/chat/completions?api-version=2024-06-01".to_string(),
+            ),
+            auth: auth.map(String::from),
+        }
+    }
+
+    fn ctx<'a>(body: &'a [u8]) -> SigningContext<'a> {
+        SigningContext {
+            host: "res.openai.azure.com".to_string(),
+            canonical_uri: "/openai/deployments/gpt-4o/chat/completions".to_string(),
+            body,
+            timestamp_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn test_api_key_auth_sends_api_key_header() {
+        // Azure-style: `auth: api-key` sends `api-key: <key>`, NOT a bearer Authorization header.
+        let lane = lane_with_auth(Some("api-key"));
+        let headers = lane_auth_headers(&lane, "SECRETKEY", &ctx(b"{}"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0.as_str(), "api-key");
+        assert_eq!(headers[0].1.to_str().unwrap(), "SECRETKEY");
+    }
+
+    #[test]
+    fn test_default_auth_falls_back_to_protocol_bearer() {
+        // No/`bearer` auth override uses the protocol's native sign_request (openai → bearer).
+        for auth in [None, Some("bearer")] {
+            let lane = lane_with_auth(auth);
+            let headers = lane_auth_headers(&lane, "SECRETKEY", &ctx(b"{}"));
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].0.as_str(), "authorization");
+            assert_eq!(headers[0].1.to_str().unwrap(), "Bearer SECRETKEY");
+        }
     }
 }
 

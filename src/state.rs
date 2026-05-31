@@ -27,6 +27,10 @@ pub(crate) struct Lane {
     /// Optional upstream request-path override. When set, used verbatim instead of the protocol's
     /// default path (for providers that embed the API version in base_url and serve /chat/completions).
     pub(crate) path: Option<String>,
+    /// Optional auth-style override. `Some("api-key")` sends an `api-key: <key>` header instead of
+    /// the protocol's native auth (used by Azure OpenAI). `None` / `Some("bearer")` use the
+    /// protocol's `sign_request` (bearer, x-goog-api-key, or SigV4).
+    pub(crate) auth: Option<String>,
 }
 
 /// A pool lane with its associated weight.

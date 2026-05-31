@@ -102,6 +102,9 @@ pub(crate) struct ProviderCfg {
     /// Optional upstream request-path override (see ProviderDef::path).
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Optional auth-style override (see ProviderDef::auth).
+    #[serde(default)]
+    pub(crate) auth: Option<String>,
     // Future fields (parse and be inert):
     #[serde(default, rename = "api_key")]
     pub(crate) _legacy_api_key: Option<String>,
@@ -374,6 +377,13 @@ pub(crate) struct ProviderDef {
     /// `path: /chat/completions`.
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Optional auth-style override. Defaults to the protocol's native auth (bearer for
+    /// openai/anthropic/responses, `x-goog-api-key` for gemini, SigV4 for bedrock). Set to
+    /// `api-key` for backends that authenticate with an `api-key: <key>` header instead of a
+    /// bearer token — e.g. Azure OpenAI (which also carries `?api-version=` and the deployment in
+    /// its `path`). Recognized values: `bearer` (default) | `api-key`.
+    #[serde(default)]
+    pub(crate) auth: Option<String>,
 }
 
 /// Provider deployment - operator config in config.yaml (names provider + supplies key).
@@ -389,6 +399,9 @@ pub(crate) struct ProviderDeploy {
     /// Optional upstream request-path override (see ProviderDef::path).
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Optional auth-style override (see ProviderDef::auth).
+    #[serde(default)]
+    pub(crate) auth: Option<String>,
 }
 
 /// Deployment configuration - operator-owned config.yaml structure.
@@ -505,6 +518,7 @@ pub(crate) fn resolve(
                 error_map,
                 // deployment override wins over the catalog default
                 path: deploy_cfg.path.clone().or_else(|| def.path.clone()),
+                auth: deploy_cfg.auth.clone().or_else(|| def.auth.clone()),
                 _legacy_api_key: None,
             },
         );
@@ -560,6 +574,7 @@ models:
                 error_map: HashMap::new(),
                 health: None,
                 path: Some("/chat/completions".to_string()),
+                auth: None,
             },
         );
         let mut providers = HashMap::new();
@@ -571,6 +586,7 @@ models:
                 base_url: None,
                 error_map: None,
                 path: None, // inherit the catalog override
+                auth: None,
             },
         );
         let deploy = DeployCfg {
@@ -707,6 +723,7 @@ models:
                 error_map,
                 health: None,
                 path: None,
+                auth: None,
             },
         );
 
@@ -719,6 +736,7 @@ models:
                 base_url: None,
                 error_map: None,
                 path: None,
+                auth: None,
             },
         );
 
@@ -765,6 +783,7 @@ models:
                 base_url: None,
                 error_map: None,
                 path: None,
+                auth: None,
             },
         );
 
@@ -800,6 +819,7 @@ models:
                 error_map,
                 health: None,
                 path: None,
+                auth: None,
             },
         );
 
@@ -815,6 +835,7 @@ models:
                 base_url: Some("https://override.example.com".to_string()), // Override base_url
                 error_map: Some(override_error_map),  // Override error_map
                 path: None,
+                auth: None,
             },
         );
 
@@ -861,6 +882,7 @@ models:
                 error_map: HashMap::new(), // Empty but valid for resolution
                 health: None,
                 path: None,
+                auth: None,
             },
         );
 
@@ -873,6 +895,7 @@ models:
                 base_url: None,
                 error_map: None,
                 path: None,
+                auth: None,
             },
         );
 

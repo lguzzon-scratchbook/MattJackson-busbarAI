@@ -35,9 +35,10 @@ hooks (`src/proto/mod.rs`):
 
 Bedrock overrides `sign_request` to compute SigV4 from `ACCESS_KEY:SECRET[:SESSION]`
 with the region parsed from the host. **This already proves the architecture is not
-bearer-only**: today there are three distinct auth shapes in production (bearer,
-`x-goog-api-key`, SigV4). The per-provider `path` override (for version-in-base-url
-endpoints) is a second piece of the same flexibility.
+bearer-only**: today there are four distinct auth shapes in production — bearer,
+`x-goog-api-key`, SigV4, and a per-provider `auth: api-key` override (Azure OpenAI).
+The per-provider `path` override (for version-in-base-url endpoints) is another piece
+of the same flexibility.
 
 So "non-standard auth/path" backends are not a categorical exclusion — they are
 the next **auth adapters** on a seam that already exists.
@@ -53,10 +54,10 @@ the next **auth adapters** on a seam that already exists.
 These reuse existing protocols (no new wire format) gated behind an auth shim — the
 same pattern Bedrock established with SigV4:
 
-- **Azure OpenAI** — `openai` protocol, but auth is the `api-key` header (not
-  bearer), a `?api-version=` query parameter, and deployment-in-path. Needs a
-  per-provider auth style (non-bearer static header + query param). No new
-  dependency; small.
+- **Azure OpenAI** — **shipped (0.14).** The `openai` protocol with a per-provider
+  `auth: api-key` style (sends the `api-key` header instead of bearer); the
+  `?api-version=` query parameter and deployment live in the provider's `path`
+  override. No new dependency. See the template in `providers.yaml`.
 - **Google Vertex AI** — largely the `gemini` protocol (plus Claude-on-Vertex via
   the `anthropic` protocol) behind **GCP OAuth2**: a short-lived bearer minted from
   a service-account credential and refreshed, against a per-project/region host.

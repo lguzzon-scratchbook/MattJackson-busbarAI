@@ -568,6 +568,8 @@ impl ProtocolReader for BedrockReader {
             content,
             stop_reason: stop_reason_val,
             usage,
+            // Bedrock's Converse response carries no model field (the model is in the request URL).
+            model: None,
         })
     }
 

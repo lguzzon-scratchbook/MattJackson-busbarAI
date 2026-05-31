@@ -247,6 +247,19 @@ wandb:
   base_url: https://api.inference.wandb.ai
   error_map: {}
 
+# Azure OpenAI is the OpenAI chat-completions protocol behind a different auth shape: the `api-key`
+# header (not bearer), with the API version and deployment in the path. Its host and deployment are
+# per-resource, so it is not shipped as a live entry — copy this template into your config.yaml
+# providers map and fill in your values:
+#
+#   azure:
+#     protocol: openai
+#     base_url: https://YOUR-RESOURCE.openai.azure.com
+#     auth: api-key                                  # send `api-key: <key>` instead of bearer
+#     path: /openai/deployments/YOUR-DEPLOYMENT/chat/completions?api-version=2024-06-01
+#     error_map: {}
+#     api_key_env: AZURE_OPENAI_KEY
+
 # ── OpenAI Responses protocol (/v1/responses) ────────────────────────────────────────────────────
 # The newer stateful OpenAI surface, distinct from chat completions. Bearer auth + a fixed path.
 responses:

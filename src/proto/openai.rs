@@ -578,11 +578,14 @@ impl ProtocolReader for OpenAiReader {
             cache_read_input_tokens,
         };
 
+        let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
+
         Ok(crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
             usage,
+            model,
         })
     }
 }
@@ -1061,6 +1064,10 @@ impl ProtocolWriter for OpenAiWriter {
         choices_array.push(serde_json::Value::Object(choice_obj));
 
         obj.insert("object".to_string(), serde_json::json!("chat.completion"));
+        // model that served the response (preserved across cross-protocol translation)
+        if let Some(ref model) = resp.model {
+            obj.insert("model".to_string(), serde_json::json!(model));
+        }
         obj.insert(
             "choices".to_string(),
             serde_json::Value::Array(choices_array),

@@ -570,11 +570,19 @@ impl ProtocolReader for GeminiReader {
             }
         };
 
+        // Gemini reports the serving model as `modelVersion` (fall back to `model`).
+        let model = obj
+            .get("modelVersion")
+            .or_else(|| obj.get("model"))
+            .and_then(|m| m.as_str())
+            .map(String::from);
+
         Ok(crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
             usage,
+            model,
         })
     }
 
@@ -900,7 +908,7 @@ impl ProtocolWriter for GeminiWriter {
             None => "STOP".to_string(),
         };
 
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "candidates": [{
                 "content": {
                     "role": "model",
@@ -912,7 +920,12 @@ impl ProtocolWriter for GeminiWriter {
                 "promptTokenCount": resp.usage.input_tokens,
                 "candidatesTokenCount": resp.usage.output_tokens
             }
-        })
+        });
+        // model that served the response (preserved across cross-protocol translation)
+        if let Some(ref model) = resp.model {
+            out["modelVersion"] = serde_json::json!(model);
+        }
+        out
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {

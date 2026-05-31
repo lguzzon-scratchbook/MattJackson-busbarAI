@@ -50,6 +50,10 @@ pub(crate) struct IrResponse {
     pub content: Vec<IrBlock>,
     pub stop_reason: Option<String>,
     pub usage: IrUsage,
+    /// The model that actually served the response, as reported by the upstream. Preserved across
+    /// cross-protocol translation so a pool route's response still names the member that served it
+    /// (same as a direct route). `None` if the upstream body carried no model field.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
