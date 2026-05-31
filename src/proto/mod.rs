@@ -178,6 +178,12 @@ impl Protocol {
     pub(crate) fn responses() -> Self {
         Self::new("responses", ResponsesReader, ResponsesWriter)
     }
+
+    /// Construct a Bedrock protocol instance.
+    #[allow(dead_code)] // Reserved for B-530b/B-530c integration (later cycle)
+    pub(crate) fn bedrock() -> Self {
+        Self::new("bedrock", BedrockReader, BedrockWriter)
+    }
 }
 
 /// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
@@ -185,9 +191,10 @@ impl Protocol {
 pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
         "anthropic" => Some(Protocol::anthropic()),
-        "openai" => Some(Protocol::openai()),
+        "bedrock" => Some(Protocol::bedrock()),
         #[allow(dead_code)] // Reserved for B-510 integration (later cycle)
         "gemini" => Some(Protocol::gemini()),
+        "openai" => Some(Protocol::openai()),
         #[allow(dead_code)] // Reserved for B-540b integration (later cycle)
         "responses" => Some(Protocol::responses()),
         _ => None,
@@ -302,11 +309,13 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
 
 /// Anthropic reader implementation (migrated from `Protocol::extract_error` and `classify`).
 mod anthropic;
+mod bedrock;
 mod gemini;
 mod openai;
 mod responses;
 
 pub(crate) use anthropic::{AnthropicReader, AnthropicWriter};
+pub(crate) use bedrock::{BedrockReader, BedrockWriter};
 pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
 pub(crate) use responses::{ResponsesReader, ResponsesWriter};
