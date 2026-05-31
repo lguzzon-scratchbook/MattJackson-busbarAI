@@ -312,6 +312,8 @@ impl ProtocolReader for BedrockReader {
             tools,
             max_tokens,
             temperature,
+            // Bedrock has no `stream` field in the request body — streaming is selected by the
+            // endpoint (converse vs converse-stream), so there is nothing to read here.
             stream: false,
             extra,
         })

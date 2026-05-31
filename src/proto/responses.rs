@@ -329,7 +329,8 @@ impl ProtocolReader for ResponsesReader {
             .filter(|&v| v > 0)
             .map(|v| v as u32);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
-        let stream = false;
+        // The Responses API carries `stream` in the request body — read it (don't drop the intent).
+        let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let modeled_keys: std::collections::HashSet<&str> = [
             "model",
@@ -339,6 +340,7 @@ impl ProtocolReader for ResponsesReader {
             "max_output_tokens",
             "temperature",
             "metadata",
+            "stream",
         ]
         .iter()
         .cloned()
