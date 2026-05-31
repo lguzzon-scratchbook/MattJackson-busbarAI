@@ -507,6 +507,28 @@ pub(crate) fn resolve(
 mod tests {
     use super::*;
 
+    /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.
+    #[test]
+    fn test_shipped_providers_catalog_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/providers.yaml");
+        let raw = std::fs::read_to_string(path).expect("read providers.yaml");
+        let defs: HashMap<String, ProviderDef> =
+            serde_yaml::from_str(&raw).expect("parse providers.yaml");
+        assert!(defs.len() >= 10, "catalog should be non-trivial");
+        let registry = crate::proto::ProtocolRegistry::with_builtins();
+        for (name, def) in &defs {
+            assert!(
+                registry.get(&def.protocol).is_some(),
+                "provider '{name}' names unknown protocol '{}'",
+                def.protocol
+            );
+            assert!(
+                def.base_url.starts_with("https://"),
+                "provider '{name}' base_url must be https"
+            );
+        }
+    }
+
     // NOTE: env vars are process-global; tests run in parallel. Use UNIQUE per-test var
     // names so they cannot race each other (the old shared HOST/USER raced + USER even
     // collided with the real shell var). Do not reintroduce shared names.
