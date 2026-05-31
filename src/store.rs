@@ -355,7 +355,6 @@ impl InMemoryStore {
     }
 
     /// Transition to Closed state (probe success).
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn closed_state(&self, lane: usize, _now_time: u64) {
         let ls = self.get_lane(lane);
 
@@ -580,8 +579,18 @@ impl StateStore for InMemoryStore {
             #[cfg(not(test))]
             let now_time = now();
 
+            // A success arriving while the breaker is HalfOpen IS the half-open probe succeeding —
+            // complete the recovery: close the breaker, clear the cooldown, and release the
+            // single-flight probe so the lane is admitted again. Without this the lane stayed stuck
+            // in HalfOpen (probe_in_flight never cleared) and was never usable after its one probe.
+            let was_half_open = ls.breaker_state.load(Ordering::Acquire) == 2;
+
             // Resets the streak, pushes the success into the outcome window, and increments `ok`.
             self.record_outcome_success_with_time(lane, now_time);
+
+            if was_half_open {
+                self.closed_state(lane, now_time);
+            }
         } else {
             // Dead lane: still count the success for observability, but don't touch the breaker
             // window/streak (the lane is administratively down, not recovering via normal traffic).
@@ -1253,6 +1262,46 @@ mod tests {
         let rbare = BreakerCfg::from(&bare);
         assert!(matches!(rbare.trip.mode, TripMode::ErrorRate));
         assert_eq!(rbare.trip.min_requests, 5);
+    }
+
+    /// Full recovery cycle: a tripped lane whose half-open probe SUCCEEDS must return to Closed and
+    /// be usable again. Regression for the bug where record_success left the lane stuck HalfOpen
+    /// (probe_in_flight never cleared) so it was admitted exactly once then locked out forever.
+    #[test]
+    fn test_half_open_success_recovers_to_closed() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(3000);
+
+        // Lane is Open with an expired cooldown.
+        store
+            .get_lane(0)
+            .cooldown_until
+            .store(2000, Ordering::Relaxed);
+        store.get_lane(0).breaker_state.store(1, Ordering::Relaxed);
+
+        // First request after expiry transitions to HalfOpen and wins the single-flight probe.
+        assert!(store.usable(0, 3000), "first request should win the probe");
+        assert_eq!(store.breaker_state(0), BreakerState::HalfOpen);
+
+        // The probe succeeds → recovery completes: Closed, cooldown cleared, probe released.
+        store.record_success(0);
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "a successful half-open probe must close the breaker"
+        );
+        assert!(
+            store.usable(0, 3001),
+            "lane must be admitted again after recovery (not stuck HalfOpen)"
+        );
+        assert!(
+            store.usable(0, 3002),
+            "and keep being admitted — recovery is sticky, not a one-shot"
+        );
+        assert!(
+            !store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "the single-flight probe must be released on recovery"
+        );
     }
 
     #[test]
