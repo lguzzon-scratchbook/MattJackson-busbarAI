@@ -177,6 +177,7 @@ async fn main() {
             max: ld.max,
             error_map: Arc::new(provider_cfg.error_map.clone()),
             context_max: model_context_max.get(&ld.model).copied().flatten(),
+            path: provider_cfg.path.clone(),
         });
     }
 

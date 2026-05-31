@@ -22,6 +22,9 @@ anthropic:
   base_url: https://api.anthropic.com
   error_map: {}
 
+# z.ai exposes two surfaces. `z.ai` is the Anthropic-compatible coding-agent endpoint
+# (/api/anthropic + /v1/messages). `zai-api` (below, in the OpenAI section) is the general
+# pay-as-you-go API (OpenAI-compatible, version in the base path). Pick the one your key targets.
 z.ai:
   protocol: anthropic
   base_url: https://api.z.ai/api/anthropic
@@ -44,6 +47,16 @@ groq:
   base_url: https://api.groq.com/openai
   error_map:
     rate_limit_exceeded: rate_limit
+
+# z.ai general API (pay-as-you-go), OpenAI-compatible. The version lives in the base path
+# (/api/paas/v4) and the endpoint is <base>/chat/completions, so the appended path is overridden.
+zai-api:
+  protocol: openai
+  base_url: https://api.z.ai/api/paas/v4
+  path: /chat/completions
+  error_map:
+    "1113": billing
+    "1302": rate_limit
 
 together:
   protocol: openai
@@ -91,7 +104,10 @@ cerebras:
 
 deepinfra:
   protocol: openai
+  # base_url embeds the API version (/v1/openai) and serves /chat/completions directly, so override
+  # the appended path to avoid a doubled /v1.
   base_url: https://api.deepinfra.com/v1/openai
+  path: /chat/completions
   error_map:
     rate_limit_exceeded: rate_limit
 

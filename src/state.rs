@@ -24,6 +24,9 @@ pub(crate) struct Lane {
     pub(crate) error_map: Arc<std::collections::HashMap<String, String>>,
     /// Optional maximum context window size for this lane's model.
     pub(crate) context_max: Option<usize>,
+    /// Optional upstream request-path override. When set, used verbatim instead of the protocol's
+    /// default path (for providers that embed the API version in base_url and serve /chat/completions).
+    pub(crate) path: Option<String>,
 }
 
 /// A pool lane with its associated weight.

@@ -99,6 +99,9 @@ pub(crate) struct ProviderCfg {
     pub(crate) health: Option<HealthCfg>,
     // error_map is REQUIRED on every provider — NO default (fail loud if missing)
     pub(crate) error_map: HashMap<String, String>,
+    /// Optional upstream request-path override (see ProviderDef::path).
+    #[serde(default)]
+    pub(crate) path: Option<String>,
     // Future fields (parse and be inert):
     #[serde(default, rename = "api_key")]
     pub(crate) _legacy_api_key: Option<String>,
@@ -365,6 +368,12 @@ pub(crate) struct ProviderDef {
     pub(crate) error_map: HashMap<String, String>,
     #[serde(default)]
     pub(crate) health: Option<HealthCfg>,
+    /// Optional override of the upstream request path appended to `base_url`. Defaults to the
+    /// protocol's standard path. Use it for OpenAI-compatible providers that embed the API version
+    /// in `base_url` and serve `/chat/completions` (no `/v1`), e.g. `base_url: .../api/paas/v4` +
+    /// `path: /chat/completions`.
+    #[serde(default)]
+    pub(crate) path: Option<String>,
 }
 
 /// Provider deployment - operator config in config.yaml (names provider + supplies key).
@@ -377,6 +386,9 @@ pub(crate) struct ProviderDeploy {
     pub(crate) base_url: Option<String>,
     #[serde(default)]
     pub(crate) error_map: Option<HashMap<String, String>>,
+    /// Optional upstream request-path override (see ProviderDef::path).
+    #[serde(default)]
+    pub(crate) path: Option<String>,
 }
 
 /// Deployment configuration - operator-owned config.yaml structure.
@@ -488,6 +500,8 @@ pub(crate) fn resolve(
                 api_key_env: deploy_cfg.api_key_env.clone(),
                 health: def.health.clone(),
                 error_map,
+                // deployment override wins over the catalog default
+                path: deploy_cfg.path.clone().or_else(|| def.path.clone()),
                 _legacy_api_key: None,
             },
         );
@@ -509,6 +523,49 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider's `path` override flows from the catalog (and a deployment override wins) into
+    /// the resolved ProviderCfg — the knob that fixes version-in-base-url providers.
+    #[test]
+    fn test_provider_path_override_resolves() {
+        let mut defs = HashMap::new();
+        defs.insert(
+            "zai-payg".to_string(),
+            ProviderDef {
+                protocol: "openai".to_string(),
+                base_url: "https://api.z.ai/api/paas/v4".to_string(),
+                error_map: HashMap::new(),
+                health: None,
+                path: Some("/chat/completions".to_string()),
+            },
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "zai-payg".to_string(),
+            ProviderDeploy {
+                api_key_env: "ZAI_KEY".to_string(),
+                protocol: None,
+                base_url: None,
+                error_map: None,
+                path: None, // inherit the catalog override
+            },
+        );
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers,
+            models: HashMap::new(),
+            pools: HashMap::new(),
+            observability: None,
+            governance: None,
+        };
+        let cfg = resolve(&deploy, &defs).expect("resolve");
+        assert_eq!(
+            cfg.providers["zai-payg"].path.as_deref(),
+            Some("/chat/completions"),
+            "catalog path override must resolve into ProviderCfg"
+        );
+    }
 
     /// The shipped example config.yaml must parse and resolve cleanly against providers.yaml
     /// (every referenced provider/model exists; the example stays a working starting point).
@@ -626,6 +683,7 @@ mod tests {
                 base_url: "https://api.z.ai/api/anthropic".to_string(),
                 error_map,
                 health: None,
+                path: None,
             },
         );
 
@@ -637,6 +695,7 @@ mod tests {
                 protocol: None,
                 base_url: None,
                 error_map: None,
+                path: None,
             },
         );
 
@@ -682,6 +741,7 @@ mod tests {
                 protocol: None,
                 base_url: None,
                 error_map: None,
+                path: None,
             },
         );
 
@@ -716,6 +776,7 @@ mod tests {
                 base_url: "https://default.example.com".to_string(),
                 error_map,
                 health: None,
+                path: None,
             },
         );
 
@@ -730,6 +791,7 @@ mod tests {
                 protocol: Some("openai".to_string()), // Override protocol
                 base_url: Some("https://override.example.com".to_string()), // Override base_url
                 error_map: Some(override_error_map),  // Override error_map
+                path: None,
             },
         );
 
@@ -775,6 +837,7 @@ mod tests {
                 base_url: "https://api.example.com".to_string(),
                 error_map: HashMap::new(), // Empty but valid for resolution
                 health: None,
+                path: None,
             },
         );
 
@@ -786,6 +849,7 @@ mod tests {
                 protocol: None,
                 base_url: None,
                 error_map: None,
+                path: None,
             },
         );
 

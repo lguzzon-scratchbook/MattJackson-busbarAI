@@ -126,6 +126,7 @@ mod tests {
             api_key_env: api_key_env.into(),
             health: None,
             error_map,
+            path: None,
             _legacy_api_key: None,
         }
     }
@@ -171,6 +172,7 @@ mod tests {
                 api_key_env: "API_KEY".into(),
                 health: None,
                 error_map: pm_error_map,
+                path: None,
                 _legacy_api_key: None,
             },
         );
@@ -209,6 +211,7 @@ mod tests {
                 api_key_env: "API_KEY".into(),
                 health: None,
                 error_map: mp_error_map,
+                path: None,
                 _legacy_api_key: None,
             },
         );
@@ -246,6 +249,7 @@ mod tests {
                 api_key_env: "API_KEY".into(),
                 health: None,
                 error_map: cm_error_map,
+                path: None,
                 _legacy_api_key: None,
             },
         );
@@ -297,6 +301,7 @@ mod tests {
                 api_key_env: "ANTHROPIC_KEY".into(),
                 health: None,
                 error_map: anthropic_error_map,
+                path: None,
                 _legacy_api_key: None,
             },
         );
@@ -308,6 +313,7 @@ mod tests {
                 api_key_env: "OPENAI_KEY".into(),
                 health: None,
                 error_map: openai_error_map,
+                path: None,
                 _legacy_api_key: None,
             },
         );
@@ -354,6 +360,7 @@ mod tests {
                 api_key_env: "API_KEY".into(),
                 health: None,
                 error_map: pm_error_map,
+                path: None,
                 _legacy_api_key: None,
             },
         );

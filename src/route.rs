@@ -197,11 +197,17 @@ pub(crate) async fn openai_ingress(
     }
 
     if let Some(&i) = app.by_model.get(&model) {
-        let resp = crate::forward::forward(
+        // Route through forward_with_pool with the OpenAI ingress protocol so a request to a
+        // non-OpenAI backend is translated both ways. (The `forward` wrapper assumes Anthropic
+        // ingress, which is correct only for the /v1/messages routes — not here.)
+        let resp = forward_with_pool(
             app.clone(),
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
             None,
+            &model,
+            None,
+            "openai",
             usage_sink(&app, &gov),
         )
         .await;

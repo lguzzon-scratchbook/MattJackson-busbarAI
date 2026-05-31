@@ -718,7 +718,11 @@ pub(crate) async fn forward_with_pool(
 
         // per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
         let writer = app.lanes[i].protocol.writer();
-        let url_path = writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream);
+        let url_path = match &app.lanes[i].path {
+            // Provider-configured path override (e.g. version-in-base-url providers).
+            Some(p) => p.clone(),
+            None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
+        };
         let signing_ctx = crate::proto::SigningContext {
             host: host_from_base(base),
             canonical_uri: crate::sigv4::uri_encode_path(
@@ -1131,7 +1135,10 @@ async fn forward_once(
 
     // per-request auth (SigV4 for Bedrock; static otherwise).
     let writer = app.lanes[i].protocol.writer();
-    let url_path = writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream);
+    let url_path = match &app.lanes[i].path {
+        Some(p) => p.clone(),
+        None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
+    };
     let signing_ctx = crate::proto::SigningContext {
         host: host_from_base(base),
         canonical_uri: crate::sigv4::uri_encode_path(
