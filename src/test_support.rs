@@ -858,6 +858,7 @@ mod tests {
                     exclusions: Some(vec!["beta".to_string()]),
                     cap: 3,
                 }),
+                affinity: None,
             },
         );
 

@@ -321,11 +321,12 @@ impl OnExhausted {
 
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AffinityCfg {
+    /// Affinity mode. `session` (the default and only supported mode) pins a session to a lane
+    /// using the header named by `header_name`.
     #[serde(default = "default_affinity_mode")]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) mode: String,
+    /// Request header carrying the session id (defaults to `x-session-id` when unset).
     #[serde(default)]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) header_name: Option<String>,
 }
 

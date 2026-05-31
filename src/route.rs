@@ -53,6 +53,15 @@ fn usage_sink(
     }
 }
 
+/// The request header that pins a session to a lane for a pool. Defaults to `x-session-id`; a
+/// pool's `affinity` config (mode `session`) may name a different header (e.g. `x-user-id`).
+fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
+    match app.pool_runtime.get(pool).and_then(|r| r.affinity.as_ref()) {
+        Some(a) if a.mode == "session" => a.header_name.as_deref().unwrap_or("x-session-id"),
+        _ => "x-session-id",
+    }
+}
+
 /// reject (402) before forwarding when the resolved virtual key is already over its
 /// budget for the current window. No-op when governance is off or the key has no budget cap.
 fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
@@ -179,16 +188,17 @@ pub(crate) async fn openai_ingress(
         return resp;
     }
 
-    let _affinity_key: Option<&str> = headers.get("x-session-id").and_then(|v| v.to_str().ok());
-
     if let Some(cands) = app.pools.get(&model) {
+        let affinity_key = headers
+            .get(affinity_header_for(&app, &model))
+            .and_then(|v| v.to_str().ok());
         let resp = forward_with_pool(
             app.clone(),
             cands.clone(),
             body,
             None,
             &model,
-            _affinity_key,
+            affinity_key,
             "openai",
             usage_sink(&app, &gov),
         )
@@ -248,10 +258,11 @@ pub(crate) async fn named(
     }
 
     let started = Instant::now();
-    let affinity_key = headers.get("x-session-id").and_then(|v| v.to_str().ok());
 
     if let Some(cands) = app.pools.get(&name) {
-        // Convert WeightedLane vec to match forward signature (already same type now)
+        let affinity_key = headers
+            .get(affinity_header_for(&app, &name))
+            .and_then(|v| v.to_str().ok());
         let resp = forward_with_pool(
             app.clone(),
             cands.clone(),
@@ -390,6 +401,54 @@ mod tests {
             scrape.contains(crate::metrics::REQUEST_DURATION_SECONDS),
             "finish should emit the request-duration histogram; got:\n{scrape}"
         );
+    }
+
+    #[test]
+    fn test_affinity_header_defaults_to_session_id() {
+        // No pool_runtime entry → default header.
+        let app = minimal_app();
+        assert_eq!(affinity_header_for(&app, "anypool"), "x-session-id");
+    }
+
+    #[test]
+    fn test_affinity_header_honors_configured_name() {
+        let mut app = minimal_app();
+        let mut pr = std::collections::HashMap::new();
+        pr.insert(
+            "tenant-pool".to_string(),
+            crate::state::PoolRuntime {
+                failover: None,
+                affinity: Some(crate::config::AffinityCfg {
+                    mode: "session".to_string(),
+                    header_name: Some("x-user-id".to_string()),
+                }),
+            },
+        );
+        // App is behind Arc; rebuild with the populated map.
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.pool_runtime = pr;
+        assert_eq!(affinity_header_for(&app, "tenant-pool"), "x-user-id");
+        // A pool without an entry still falls back to the default.
+        assert_eq!(affinity_header_for(&app, "other"), "x-session-id");
+    }
+
+    #[test]
+    fn test_affinity_header_session_mode_without_name_uses_default() {
+        let mut app = minimal_app();
+        let mut pr = std::collections::HashMap::new();
+        pr.insert(
+            "p".to_string(),
+            crate::state::PoolRuntime {
+                failover: None,
+                affinity: Some(crate::config::AffinityCfg {
+                    mode: "session".to_string(),
+                    header_name: None,
+                }),
+            },
+        );
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.pool_runtime = pr;
+        assert_eq!(affinity_header_for(&app, "p"), "x-session-id");
     }
 
     #[test]

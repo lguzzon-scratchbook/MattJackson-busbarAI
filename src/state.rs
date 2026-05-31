@@ -46,6 +46,8 @@ pub(crate) struct WeightedLane {
 pub(crate) struct PoolRuntime {
     /// Per-pool failover settings (deadline, cap, and member exclusions).
     pub(crate) failover: Option<crate::config::FailoverCfg>,
+    /// Per-pool session-affinity settings (which request header pins a session to a lane).
+    pub(crate) affinity: Option<crate::config::AffinityCfg>,
 }
 
 pub(crate) struct App {

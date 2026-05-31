@@ -250,6 +250,7 @@ async fn main() {
             pool_name.clone(),
             state::PoolRuntime {
                 failover: pool_cfg.failover.clone(),
+                affinity: pool_cfg.affinity.clone(),
             },
         );
     }
