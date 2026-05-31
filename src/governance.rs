@@ -78,7 +78,7 @@ impl GovState {
         let spend =
             (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64) / 1000) as i64;
         if let Err(e) = self.store.add_usage(key_id, window, spend, tokens) {
-            eprintln!("busbar: token usage record failed for key {key_id}: {e}");
+            tracing::warn!(key = %key_id, error = %e, "token usage record failed");
         }
         self.add_rate_tokens(key_id, now, tokens);
     }
@@ -203,7 +203,7 @@ impl GovState {
             .store
             .add_usage(&key.id, window, self.price_per_request_cents, tokens)
         {
-            eprintln!("busbar: usage record failed for key {}: {e}", key.id);
+            tracing::warn!(key = %key.id, error = %e, "usage record failed");
         }
         // also feed the rate window's TPM counter.
         self.add_rate_tokens(&key.id, now, tokens);

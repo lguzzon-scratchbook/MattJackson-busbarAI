@@ -811,9 +811,11 @@ impl InMemoryStore {
         // probe. We do NOT set `dead` (that would block recovery). Per (pool, lane): only the
         // routing pool's view is tripped; other pools discover the bad upstream independently.
         *ls.dead_reason.lock().unwrap() = reason.to_string();
-        eprintln!(
-            "[{}] HARD-DOWN: {}; sticky cooldown {}s (recovers via probe)",
-            ls.model, reason, HARD_DOWN_COOLDOWN_SECS
+        tracing::warn!(
+            model = %ls.model,
+            reason,
+            cooldown_secs = HARD_DOWN_COOLDOWN_SECS,
+            "lane hard-down; sticky cooldown (recovers via half-open probe)"
         );
         let cell = self.cell(pool, lane);
         cell.cooldown_until().store(

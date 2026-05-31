@@ -1,31 +1,28 @@
-// busbar — central LLM gateway: round-robin across lanes like a busbar across circuits.
-// a PATH that names what they want. Anthropic `/v1/messages` format (v1).
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Matthew Jackson
 //
-// Clean user API (clients append /v1/messages themselves, per the Anthropic SDK):
-//   POST /<name>                  name = a model OR a config-defined pool
-//        /glm-4.5                 -> that single model
-//        /glm                     -> pool: round-robin glm-5.1+glm-4.6+glm-4.5
-//        /haiku                   -> claude-haiku via anthropic
-//   POST /<provider>/<model>      ad-hoc: any provider+model, no pool needed
-//        /z.ai/glm-4.6
-//   GET  /stats  /healthz
+// busbar — a native-protocol LLM gateway. It fronts many LLM providers and routes each request to
+// a model or to a weighted pool of models, translating losslessly between wire protocols and
+// protecting each backend with a circuit breaker. The name is electrical: a busbar takes one feed
+// and fans it out across many breakered circuits.
 //
-// A round-robin pool stacks its models' per-model concurrency caps into one
-// aggregate (10+10+3 = 23). Each model is a "lane" with its own semaphore +
-// smart health handling. The caller's own model/key fields are ignored — the
-// router rewrites `model` and injects the provider's key. No per-client keys.
+// Routing (clients append the protocol path themselves):
+//   POST /<model>/v1/messages            a single model (Anthropic-format ingress)
+//   POST /<pool>/v1/messages             a config-defined pool (weighted selection + failover)
+//   POST /<provider>/<model>/v1/messages ad-hoc: a specific configured provider+model
+//   POST /v1/chat/completions            OpenAI-format ingress (model from the body)
+//   GET  /stats  /healthz  /metrics
 //
-// Smart lane health:
-//   2xx                          -> relay, reset streak
-//   billing (z.ai 1113)          -> STOP lane permanently (empty wallet won't heal)
-//   auth (401/403)               -> STOP lane permanently (bad key/config)
-//   rate limit (429 / z.ai 1302) -> escalating cooldown (15s*streak, cap 120s)
-//   5xx / network / timeout      -> short cooldown (10s)
-//   other 4xx (400/404/422)      -> RELAY to caller, do NOT penalize the lane
-//   max_requests budget hit      -> disable lane (cost cap)
+// Each model is a "lane" with its own concurrency semaphore, optional lifetime request budget, and
+// per-(pool,lane) circuit-breaker health. A pool stacks its members' concurrency into one aggregate
+// and distributes via smooth weighted round-robin. Ingress and backend protocols may differ: the
+// request and response are translated through a superset intermediate representation (see
+// `proto`/`ir`), so e.g. an OpenAI-format client can drive a Gemini or Bedrock backend.
 //
-// v2: OpenAI-protocol providers (P4/A5500 /v1/chat/completions) need Anthropic
-// <-> OpenAI translation; not handled here. All v1 lanes are Anthropic-format.
+// Failure handling (see `breaker`): transient upstream faults (5xx / overload / rate-limit /
+// timeout / network) arm an escalating cooldown; billing and auth faults open the breaker with a
+// long sticky cooldown; client-supplied 4xx are relayed verbatim and never penalize the lane; an
+// exhausted lifetime budget disables the lane. Tripped lanes recover via a half-open probe.
 
 mod admin;
 mod auth;
@@ -83,10 +80,14 @@ async fn main() {
     let deploy: config::DeployCfg =
         serde_yaml::from_str(&interpolated_config).expect("parse config.yaml as DeployCfg");
 
-    // Observability sinks (/): grab before `deploy` is borrowed by resolve.
+    // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
-    // Governance: grab before `deploy` is borrowed by resolve.
+    // Governance config; grab before `deploy` is borrowed by resolve.
     let governance_cfg = deploy.governance.clone();
+
+    // Install the tracing subscriber now (stderr fmt always; OTLP export if configured) so all
+    // subsequent startup and request-path logging is captured.
+    observability::init_logging(observability_cfg.otlp_endpoint.as_deref());
 
     // Resolve deployment + definitions into resolved RootCfg
     let cfg =
@@ -220,11 +221,13 @@ async fn main() {
 
     let listen = cfg.listen.clone();
 
-    // Loud warning for auth.mode=none (open relay)
+    // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
+    // local dev) — but operators must not run this in production.
     if let Some(ref acfg) = cfg.auth {
-        let normalized = acfg.clone().normalize();
-        if normalized.mode == "none" {
-            eprintln!("[FATAL] AUTH DISABLED — open relay; this is a security risk in production");
+        if acfg.clone().normalize().mode == "none" {
+            tracing::warn!(
+                "auth is DISABLED (auth.mode=none) — this is an open relay; do not run in production"
+            );
         }
     }
 
@@ -332,10 +335,6 @@ async fn main() {
         observability_cfg.request_log_webhook_url.clone(),
         app.client.clone(),
     );
-    // install the OTLP tracer when an endpoint is configured (no-op otherwise).
-    if let Some(endpoint) = observability_cfg.otlp_endpoint.as_deref() {
-        observability::init_otlp(endpoint);
-    }
 
     // Spawn the active health probers (one per lane with a probing mode). No-op when every lane is
     // `mode: none` / has no `health:` block.

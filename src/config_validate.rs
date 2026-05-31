@@ -84,11 +84,25 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         if member_protocols.len() > 1 {
             let mut protocols: Vec<&str> = member_protocols.iter().copied().collect();
             protocols.sort();
-            eprintln!(
-                "[warn] pool '{}' is heterogeneous ({}): cross-protocol failover will translate via the IR and may not preserve all provider features",
-                pool_name,
-                protocols.join("+")
+            tracing::warn!(
+                pool = %pool_name,
+                protocols = %protocols.join("+"),
+                "heterogeneous pool: cross-protocol failover translates via the IR and may not preserve all provider features"
             );
+        }
+    }
+
+    // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup). The
+    // mode is matched case-insensitively to mirror config normalization.
+    if let Some(auth) = &cfg.auth {
+        if !matches!(
+            auth.mode.trim().to_lowercase().as_str(),
+            "token" | "passthrough" | "none"
+        ) {
+            errors.push(format!(
+                "auth.mode '{}' is invalid: must be 'token', 'passthrough', or 'none'",
+                auth.mode
+            ));
         }
     }
 

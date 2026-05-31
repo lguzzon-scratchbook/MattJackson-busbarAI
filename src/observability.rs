@@ -57,14 +57,48 @@ pub(crate) fn fire_request_log(payload: Value) {
     });
 }
 
-/// install an OpenTelemetry tracer that exports OTLP/HTTP spans to `endpoint`, bridged into
-/// the `tracing` ecosystem. Called once at startup when `observability.otlp_endpoint` is set.
-/// Resilient: a build/exporter failure logs and returns rather than crashing serving.
-pub(crate) fn init_otlp(endpoint: &str) {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::WithExportConfig as _;
+/// Install the process-wide `tracing` subscriber once at startup: always a stderr `fmt` layer
+/// (level from `RUST_LOG`, default `info`) so spans/warnings are visible out of the box, plus an
+/// OpenTelemetry OTLP/HTTP export layer when `observability.otlp_endpoint` is set. Resilient: an
+/// OTLP build failure logs and continues with stderr-only logging rather than crashing serving.
+pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+
+    // Level filter from RUST_LOG (a bare level word, e.g. `debug`); default `info`.
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.trim().parse::<tracing::Level>().ok())
+        .unwrap_or(tracing::Level::INFO);
+    let filter = tracing_subscriber::filter::LevelFilter::from_level(level);
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+
+    // Optional OTLP layer — `Option<Layer>` is itself a `Layer`, so it composes cleanly when absent.
+    let otel_layer = otlp_endpoint.and_then(build_otlp_layer);
+
+    let initialized = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(otel_layer)
+        .try_init()
+        .is_ok();
+    if !initialized {
+        eprintln!("busbar: tracing subscriber already initialized");
+    } else if let Some(endpoint) = otlp_endpoint {
+        tracing::info!(endpoint, "OTLP tracing enabled");
+    }
+}
+
+/// Build the OpenTelemetry tracing layer for OTLP/HTTP export to `endpoint`. Returns `None` (and
+/// logs to stderr — the subscriber isn't up yet) if the exporter can't be built.
+fn build_otlp_layer<S>(
+    endpoint: &str,
+) -> Option<impl tracing_subscriber::Layer<S>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig as _;
 
     let exporter = match opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -73,27 +107,16 @@ pub(crate) fn init_otlp(endpoint: &str) {
     {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("busbar: OTLP exporter init failed ({e}); tracing disabled");
-            return;
+            eprintln!("busbar: OTLP exporter init failed ({e}); continuing with stderr logging");
+            return None;
         }
     };
-
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .build();
     let tracer = provider.tracer("busbar");
     opentelemetry::global::set_tracer_provider(provider);
-
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    if tracing_subscriber::registry()
-        .with(otel_layer)
-        .try_init()
-        .is_err()
-    {
-        eprintln!("busbar: tracing subscriber already initialized; OTLP layer not attached");
-    } else {
-        eprintln!("busbar: OTLP tracing enabled → {endpoint}");
-    }
+    Some(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
 #[cfg(test)]

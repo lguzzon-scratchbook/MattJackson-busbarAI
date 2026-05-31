@@ -53,9 +53,7 @@ impl AuthMiddleware {
             .collect();
 
         if mode == AuthMode::None && tokens.is_empty() {
-            eprintln!(
-                "[warn] auth.mode=none (open relay) — only acceptable for dev; reject in production"
-            );
+            tracing::warn!("auth.mode=none (open relay) — only acceptable for dev; reject in production");
         }
 
         Self {
@@ -82,15 +80,16 @@ impl AuthMiddleware {
         result == 0
     }
 
-    /// Extract Bearer token from Authorization header if present.
+    /// Extract the token from an `Authorization: Bearer <token>` header (scheme match is
+    /// case-insensitive). Splits on the first space rather than byte-slicing, so a malformed header
+    /// with a multibyte character in the scheme position can't panic on a UTF-8 boundary.
     fn extract_bearer_token(auth_header: Option<&str>) -> Option<String> {
-        auth_header.and_then(|h| {
-            if h.len() > 7 && h[..7].eq_ignore_ascii_case("Bearer ") {
-                Some(h[7..].to_string())
-            } else {
-                None
-            }
-        })
+        let (scheme, token) = auth_header?.split_once(' ')?;
+        if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+            Some(token.to_string())
+        } else {
+            None
+        }
     }
 
     /// Validate the request's token against the allowlist.
@@ -138,8 +137,8 @@ pub(crate) async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let token_valid = app.auth.validate_token(auth_header);
-    let bearer_token: Option<String> =
-        auth_header.and_then(|h| h.strip_prefix("Bearer ").map(String::from));
+    // Use the same case-insensitive, panic-safe extraction as the client-token path.
+    let bearer_token: Option<String> = AuthMiddleware::extract_bearer_token(auth_header);
 
     // the /admin management API is guarded by the configured admin token (Bearer or
     // X-Admin-Token) — NOT a virtual key. Disabled (401) when no admin token is configured.

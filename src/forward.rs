@@ -1365,10 +1365,11 @@ async fn handle_least_bad(
         return handle_status_503(app, cands, now, pool);
     };
 
-    eprintln!(
-        "[WARN] LEAST-BAD MODE — routing to degraded member {} (cooldown {}s remaining)",
-        soonest_idx,
-        app.store.cooldown_remaining_in(pool, soonest_idx, now)
+    tracing::warn!(
+        pool = %pool,
+        lane = %app.lanes[soonest_idx].model,
+        cooldown_remaining_s = app.store.cooldown_remaining_in(pool, soonest_idx, now),
+        "least-bad mode: routing to a degraded member (pool exhausted)"
     );
 
     // Bypass breaker usability for the last-resort path; grab the concurrency permit directly.
