@@ -803,6 +803,11 @@ impl ProtocolWriter for AnthropicWriter {
         }
     }
 
+    fn requires_max_tokens(&self) -> bool {
+        // Anthropic Messages 400s with `max_tokens: Field required` when absent.
+        true
+    }
+
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
         if !req.system.is_empty() {

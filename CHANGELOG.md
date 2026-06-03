@@ -5,6 +5,23 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.4] — 2026-06-03
+
+### Fixed
+- **OpenAI→Anthropic translation no longer drops `max_tokens`.** An OpenAI-format request that omits
+  `max_tokens` (legal — the OpenAI server applies a default) was translated to the Anthropic
+  Messages API without one, which hard-rejects it (`400 max_tokens: Field required`). So any
+  OpenAI-compatible client relying on the server default 400'd on every call once pointed at an
+  Anthropic-backed lane. busbar now injects a `max_tokens` at the cross-protocol translation
+  boundary when the egress protocol requires it (Anthropic) and the source omitted it. A
+  caller-supplied value is always preserved, and same-protocol passthrough is unaffected. Bedrock
+  Converse defaults `maxTokens` server-side, so it is intentionally excluded (injecting would
+  silently cap output).
+
+### Added
+- **`default_max_tokens` per-model config (optional).** Sets the value injected for the case above;
+  unset falls back to a conservative `4096`. Validated `> 0` at startup. Documented in `config.yaml`.
+
 ## [0.17.3] — 2026-05-31
 
 Security hardening from a three-model independent review (Opus, Sonnet, qwen3.5). All three

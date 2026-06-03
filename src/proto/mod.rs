@@ -18,6 +18,13 @@ use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
 /// An IR-level error, currently an alias for `CanonicalSignal` (the normalized error signal).
 pub(crate) type IrError = crate::breaker::CanonicalSignal;
 
+/// Conservative fallback for the `max_tokens` injected at a translation boundary when the source
+/// protocol omitted it (legal for OpenAI) but the target REQUIRES it (Anthropic, Bedrock — see
+/// `ProtocolWriter::requires_max_tokens`). Used only when the lane has no configured
+/// `default_max_tokens`. 4096 is a safe output ceiling across current chat models — large enough
+/// not to truncate typical completions, small enough not to be refused.
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
+
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
 /// Methods are provider-specific normalizers that feed the breaker's Stage 2 classifier.
 pub(crate) trait ProtocolReader: Send + Sync {
@@ -107,6 +114,17 @@ pub(crate) trait ProtocolWriter: Send + Sync {
 
     /// Write an IR request to wire JSON.
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value;
+
+    /// Whether this protocol REQUIRES `max_tokens` on every request. The Anthropic Messages API
+    /// hard-rejects (400 `max_tokens: Field required`) a request without it, whereas OpenAI Chat
+    /// Completions treats it as optional (the server applies a default) — and Bedrock Converse
+    /// likewise defaults it. When this returns `true` and a cross-protocol-translated request
+    /// carries no `max_tokens`, the forward path injects the lane's `default_max_tokens` (or
+    /// `DEFAULT_MAX_TOKENS`) so source-optional clients keep working across the translation
+    /// boundary. Default: `false` (source-optional == target-optional).
+    fn requires_max_tokens(&self) -> bool {
+        false
+    }
 
     /// Write a response/stream event to wire (event_type, data).
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)>;
@@ -450,6 +468,29 @@ mod tests {
             let v: serde_json::Value = serde_json::from_slice(&body)
                 .unwrap_or_else(|e| panic!("{name}: invalid JSON: {e}"));
             assert!(v.is_object(), "{name}: probe body must be a JSON object");
+        }
+    }
+
+    /// `requires_max_tokens()` must be true exactly for the protocols whose APIs hard-reject a
+    /// request lacking `max_tokens` (Anthropic Messages) and false for the rest — including Bedrock,
+    /// which defaults maxTokens when omitted. This flag gates the translation-seam injection in
+    /// `forward`; a false positive would silently cap a backend's output.
+    #[test]
+    fn test_requires_max_tokens_per_protocol() {
+        for (name, want) in [
+            ("anthropic", true),
+            ("bedrock", false),
+            ("openai", false),
+            ("gemini", false),
+            ("responses", false),
+            ("cohere", false),
+        ] {
+            let proto = protocol_for(name).unwrap();
+            assert_eq!(
+                proto.writer().requires_max_tokens(),
+                want,
+                "{name}: requires_max_tokens() mismatch"
+            );
         }
     }
 

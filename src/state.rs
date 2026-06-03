@@ -33,6 +33,11 @@ pub(crate) struct Lane {
     /// Optional active health-probe settings (from the provider's `health:` block). `None` or
     /// `mode: none` means no background probing for this lane.
     pub(crate) health: Option<crate::config::HealthCfg>,
+    /// Optional default max output tokens, injected at the cross-protocol translation seam when the
+    /// source request omitted `max_tokens` (legal for OpenAI) but this lane's protocol REQUIRES it
+    /// (Anthropic Messages — see `ProtocolWriter::requires_max_tokens`). Falls back to
+    /// `crate::proto::DEFAULT_MAX_TOKENS` when unset.
+    pub(crate) default_max_tokens: Option<u32>,
 }
 
 /// A pool lane with its associated weight.

@@ -148,6 +148,11 @@ pub(crate) struct ModelCfg {
     pub(crate) max_requests: i64,
     pub(crate) provider: String,
     pub(crate) max_concurrent: usize,
+    /// Default max output tokens injected when a cross-protocol translation targets a backend that
+    /// REQUIRES `max_tokens` (Anthropic Messages) and the source request omitted it (legal for
+    /// OpenAI). Unset falls back to `crate::proto::DEFAULT_MAX_TOKENS`. Must be > 0 when set.
+    #[serde(default)]
+    pub(crate) default_max_tokens: Option<u32>,
 }
 
 fn neg1() -> i64 {

@@ -680,6 +680,10 @@ impl ProtocolWriter for BedrockWriter {
 
     fn rewrite_model(&self, _body: &mut serde_json::Value, _model: &str) {}
 
+    // NOTE: Bedrock Converse treats `inferenceConfig.maxTokens` as OPTIONAL (it applies the model's
+    // default when omitted, and this writer omits an empty `inferenceConfig` entirely). So Bedrock
+    // does NOT override `requires_max_tokens` — injecting a default here would silently cap output.
+
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
 

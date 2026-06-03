@@ -15,8 +15,19 @@ use serde_json::Value;
 use crate::breaker::{classify as classify_disposition, normalize_raw_error, Disposition};
 use crate::config::OnExhausted;
 use crate::proto::{convert_headers, StatusClass};
-use crate::state::{App, WeightedLane};
+use crate::state::{App, Lane, WeightedLane};
 use crate::store::{now, Permit};
+
+/// At a cross-protocol translation boundary, ensure the IR carries `max_tokens` when the egress
+/// protocol REQUIRES one (Anthropic Messages) but the source request omitted it (legal for OpenAI).
+/// Without this the upstream 400s with `max_tokens: Field required`. Uses the lane's configured
+/// `default_max_tokens`, falling back to `crate::proto::DEFAULT_MAX_TOKENS`. No-op when the IR
+/// already carries a value or the egress protocol treats `max_tokens` as optional.
+fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
+    if ir.max_tokens.is_none() && lane.protocol.writer().requires_max_tokens() {
+        ir.max_tokens = Some(lane.default_max_tokens.unwrap_or(crate::proto::DEFAULT_MAX_TOKENS));
+    }
+}
 
 /// Non-buffering stream inspection tap for usage parsing.
 ///
@@ -739,7 +750,8 @@ pub(crate) async fn forward_with_pool(
                     .into_response();
             };
             match ingress_proto.reader().read_request(&v) {
-                Ok(ir) => {
+                Ok(mut ir) => {
+                    apply_required_max_tokens(&mut ir, &app.lanes[i]);
                     v = app.lanes[i].protocol.writer().write_request(&ir);
                 }
                 Err(_) => {
@@ -1231,7 +1243,10 @@ async fn forward_once(
                 .into_response());
         };
         match ingress_proto.reader().read_request(&v) {
-            Ok(ir) => v = app.lanes[i].protocol.writer().write_request(&ir),
+            Ok(mut ir) => {
+                apply_required_max_tokens(&mut ir, &app.lanes[i]);
+                v = app.lanes[i].protocol.writer().write_request(&ir);
+            }
             Err(_) => {
                 return Ok((
                     StatusCode::BAD_REQUEST,
@@ -1528,6 +1543,7 @@ mod auth_style_tests {
 
     fn lane_with_auth(auth: Option<&str>) -> Lane {
         Lane {
+            default_max_tokens: None,
             model: "gpt-4o".to_string(),
             provider: "azure".to_string(),
             base_url: "https://res.openai.azure.com".to_string(),

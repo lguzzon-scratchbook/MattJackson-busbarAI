@@ -380,6 +380,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -479,6 +480,7 @@ mod tests {
         };
         // Lane speaks the OpenAI protocol; ingress below is Anthropic → cross-protocol translation.
         let lane = Lane {
+            default_max_tokens: None,
             model: "glm-4.5".to_string(),
             provider: "zai".to_string(),
             base_url: server.base_url(),
@@ -595,6 +597,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "glm-4.5".to_string(),
             provider: "zai".to_string(),
             base_url: server.base_url(),
@@ -707,6 +710,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "glm-4.6".to_string(),
             provider: "z".to_string(),
             base_url: server.base_url(),
@@ -836,6 +840,7 @@ mod tests {
             client_fault: 0,
         };
         let mk_lane = |model: &str, base_url: String| Lane {
+            default_max_tokens: None,
             model: model.to_string(),
             provider: "p".to_string(),
             base_url,
@@ -1360,6 +1365,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1454,6 +1460,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1574,6 +1581,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1588,6 +1596,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1714,6 +1723,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1728,6 +1738,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1856,6 +1867,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -1950,6 +1962,7 @@ mod tests {
         };
 
         let lane_token = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2050,6 +2063,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2173,6 +2187,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2187,6 +2202,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2329,6 +2345,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2343,6 +2360,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2357,6 +2375,7 @@ mod tests {
         };
 
         let lane2 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2486,6 +2505,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2500,6 +2520,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2683,6 +2704,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -2894,6 +2916,7 @@ mod tests {
             error_map.insert("1302".to_string(), "rate_limit".to_string());
 
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
@@ -2992,6 +3015,7 @@ mod tests {
             error_map.insert("1302".to_string(), "rate_limit".to_string());
 
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
@@ -3092,6 +3116,7 @@ mod tests {
             error_map.insert("1302".to_string(), "rate_limit".to_string());
 
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
@@ -3187,6 +3212,7 @@ mod tests {
             error_map.insert("1302".to_string(), "rate_limit".to_string());
 
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
@@ -3283,6 +3309,7 @@ mod tests {
             error_map.insert("1302".to_string(), "rate_limit".to_string());
 
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
@@ -3379,6 +3406,7 @@ mod tests {
             error_map.insert("1302".to_string(), "rate_limit".to_string());
 
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
@@ -3493,6 +3521,7 @@ mod tests {
             error_map_1.insert("1113".to_string(), "billing".to_string());
 
             let lane_1 = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server1.base_url(),
@@ -3526,6 +3555,7 @@ mod tests {
             let error_map_2 = HashMap::new(); // Empty - no overrides
 
             let lane_2 = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "z.ai".to_string(),
                 base_url: server2.base_url(),
@@ -3614,6 +3644,7 @@ mod tests {
                 max_requests: -1,
                 provider: "p".into(),
                 max_concurrent: 10,
+                default_max_tokens: None,
             };
             let pool = crate::config::PoolCfg {
                 members: vec![crate::config::PoolMember {
@@ -3734,6 +3765,7 @@ mod tests {
 
             let error_map = HashMap::new();
             let lane = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "anthropic".to_string(),
                 base_url: server.base_url(),
@@ -3843,6 +3875,7 @@ mod tests {
             };
 
             let lane_0 = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "anthropic".to_string(),
                 base_url: server0.base_url(),
@@ -3874,6 +3907,7 @@ mod tests {
             };
 
             let lane_1 = Lane {
+                default_max_tokens: None,
                 model: "test-model".to_string(),
                 provider: "anthropic".to_string(),
                 base_url: server1.base_url(),
@@ -3994,6 +4028,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -4008,6 +4043,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -4141,6 +4177,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
@@ -4155,6 +4192,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
@@ -4274,6 +4312,7 @@ mod tests {
         };
 
         let mk_lane = |key: &str| Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -4420,6 +4459,7 @@ mod tests {
         };
 
         let mk_lane = |key: &str| Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -4586,6 +4626,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
@@ -4600,6 +4641,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
@@ -4614,6 +4656,7 @@ mod tests {
         };
 
         let lane2 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server2.base_url(),
@@ -4798,6 +4841,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
@@ -4812,6 +4856,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
@@ -4918,6 +4963,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "p".to_string(),
             base_url: server0.base_url(),
@@ -4999,6 +5045,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "p".to_string(),
             base_url: server0.base_url(),
@@ -5102,6 +5149,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
@@ -5116,6 +5164,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
@@ -5294,6 +5343,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "openai-mock".to_string(),
             base_url: server.base_url(),
@@ -5428,6 +5478,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "test-model".to_string(),
             provider: "openai".to_string(),
             base_url: "https://configured.example.com".to_string(),
@@ -5573,6 +5624,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "m".to_string(),
             provider: "anthropic".to_string(),
             base_url: server.base_url(),
@@ -5702,6 +5754,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "glm-4.5".to_string(),
             provider: "z.ai".to_string(),
             base_url: server.base_url(),
@@ -5755,6 +5808,142 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Drive an OpenAI-ingress request (single-model, no-pool route) at an Anthropic backend and
+    /// return the body the upstream actually received, so `max_tokens`-injection regressions can be
+    /// asserted on the wire. `lane_default` is the lane's configured `default_max_tokens`.
+    async fn forwarded_openai_to_anthropic(
+        lane_default: Option<u32>,
+        request_body: serde_json::Value,
+    ) -> serde_json::Value {
+        use crate::route;
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data = LaneData {
+            model: "glm-4.5".to_string(),
+            provider: "z.ai".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            default_max_tokens: lane_default,
+            model: "glm-4.5".to_string(),
+            provider: "z.ai".to_string(),
+            base_url: server.base_url(),
+            api_key: "k".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+            health: None,
+        };
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store: Arc::new(InMemoryStore::new(vec![lane_data])),
+            by_model: HashMap::from([("glm-4.5".to_string(), 0)]),
+            pools: HashMap::new(),
+            client: Client::builder().build().unwrap(),
+            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: None,
+        });
+
+        let resp = route::openai_ingress(
+            State(app),
+            axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
+            axum::http::HeaderMap::new(),
+            Bytes::from(request_body.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200, "translation route must succeed");
+
+        let received = state
+            .get_last_request_body()
+            .expect("mock should have recorded the upstream request body");
+        let got: serde_json::Value =
+            serde_json::from_slice(&received).expect("upstream body is JSON");
+        server.shutdown().await;
+        got
+    }
+
+    /// Regression (max_tokens translation contract): an OpenAI request that legally OMITS
+    /// `max_tokens`, routed to an Anthropic backend, must reach the upstream WITH a `max_tokens`
+    /// (Anthropic 400s without it). With no per-lane default, the conservative fallback is injected.
+    #[tokio::test]
+    async fn test_openai_omits_max_tokens_injects_fallback_for_anthropic() {
+        let got = forwarded_openai_to_anthropic(
+            None,
+            json!({"model": "glm-4.5", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(
+            got.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(crate::proto::DEFAULT_MAX_TOKENS as u64),
+            "absent max_tokens must be backfilled with the fallback on →anthropic translation; got: {got}"
+        );
+    }
+
+    /// The per-lane configured `default_max_tokens` overrides the constant fallback when the source
+    /// omits `max_tokens`.
+    #[tokio::test]
+    async fn test_openai_omits_max_tokens_uses_configured_lane_default() {
+        let got = forwarded_openai_to_anthropic(
+            Some(1234),
+            json!({"model": "glm-4.5", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(
+            got.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(1234),
+            "configured lane default_max_tokens must be injected; got: {got}"
+        );
+    }
+
+    /// An explicit `max_tokens` from the client is preserved verbatim — injection only fills a gap,
+    /// it never overrides a caller-supplied value (even when a lane default is configured).
+    #[tokio::test]
+    async fn test_openai_explicit_max_tokens_preserved_over_lane_default() {
+        let got = forwarded_openai_to_anthropic(
+            Some(1234),
+            json!({"model": "glm-4.5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 7}),
+        )
+        .await;
+        assert_eq!(
+            got.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(7),
+            "caller-supplied max_tokens must survive translation untouched; got: {got}"
+        );
+    }
+
     /// Same-protocol request passthrough test.
     /// anthropic ingress → anthropic lane (ingress_protocol="anthropic") → mock receives body with model rewritten, NO translation applied.
     #[tokio::test]
@@ -5788,6 +5977,7 @@ mod tests {
         };
 
         let lane = Lane {
+            default_max_tokens: None,
             model: "m".to_string(),
             provider: "anthropic".to_string(),
             base_url: server.base_url(),
@@ -5884,6 +6074,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "m".to_string(),
             provider: "openai-provider".to_string(),
             base_url: server.base_url(),
@@ -5997,6 +6188,7 @@ mod tests {
             client_fault: 0,
         };
         let lane = Lane {
+            default_max_tokens: None,
             model: "m".to_string(),
             provider: "openai-provider".to_string(),
             base_url: server.base_url(),
@@ -6118,6 +6310,7 @@ mod tests {
             client_fault: 0,
         };
         let mk_lane = |key: &str| Lane {
+            default_max_tokens: None,
             model: "m".to_string(),
             provider: "anthropic".to_string(),
             base_url: server.base_url(),
@@ -6242,6 +6435,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "small-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -6256,6 +6450,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "large-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -6378,6 +6573,7 @@ mod tests {
         };
 
         let lane0 = Lane {
+            default_max_tokens: None,
             model: "model-8k".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
@@ -6392,6 +6588,7 @@ mod tests {
         };
 
         let lane1 = Lane {
+            default_max_tokens: None,
             model: "model-8k".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),

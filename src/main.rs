@@ -183,7 +183,12 @@ async fn main() {
 
     let mut lanes_data = Vec::new();
     let mut by_model = HashMap::new();
+    // Per-model configured default_max_tokens (injected at the translation seam for protocols that
+    // require max_tokens). Captured here because `cfg.models` is consumed by this loop.
+    let mut model_default_max_tokens: std::collections::HashMap<String, Option<u32>> =
+        std::collections::HashMap::new();
     for (model, mc) in cfg.models {
+        model_default_max_tokens.insert(model.clone(), mc.default_max_tokens);
         let provider_cfg = cfg.providers.get(&mc.provider).unwrap_or_else(|| {
             die(format!(
                 "model '{model}' references unknown provider '{}'",
@@ -260,6 +265,10 @@ async fn main() {
             path: provider_cfg.path.clone(),
             auth: provider_cfg.auth.clone(),
             health: provider_cfg.health.clone(),
+            default_max_tokens: model_default_max_tokens
+                .get(&ld.model)
+                .copied()
+                .flatten(),
         });
     }
 

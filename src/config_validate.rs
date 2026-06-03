@@ -24,6 +24,15 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 model_name, model_cfg.provider
             ));
         }
+        // A configured default_max_tokens of 0 would be injected verbatim into a translated request
+        // and rejected upstream — fail loud at startup rather than per-request.
+        if model_cfg.default_max_tokens == Some(0) {
+            errors.push(format!(
+                "model '{}' has default_max_tokens: 0; must be > 0 (or omit it to use the {} fallback)",
+                model_name,
+                crate::proto::DEFAULT_MAX_TOKENS
+            ));
+        }
     }
 
     // Rule 1: Reject pool name == any provider name (disambiguation)
@@ -154,6 +163,7 @@ mod tests {
             max_requests: -1,
             provider: provider.into(),
             max_concurrent,
+            default_max_tokens: None,
         }
     }
 
@@ -195,6 +205,35 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.contains("invalid auth 'api-key'")),
             "'api-key' is a valid auth style and must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_default_max_tokens() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        let mut m = make_model("myprovider", 10);
+        m.default_max_tokens = Some(0);
+        models.insert("mymodel".to_string(), m);
+        // A positive value (and the unset None default) must NOT error.
+        let mut ok = make_model("myprovider", 10);
+        ok.default_max_tokens = Some(4096);
+        models.insert("okmodel".to_string(), ok);
+
+        let cfg = make_root_cfg(providers, models, HashMap::new());
+        let errs = validate(&cfg).expect_err("default_max_tokens: 0 must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("mymodel") && e.contains("default_max_tokens: 0")),
+            "expected a default_max_tokens:0 error for 'mymodel'; got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("okmodel")),
+            "a positive default_max_tokens must not error; got: {errs:?}"
         );
     }
 
