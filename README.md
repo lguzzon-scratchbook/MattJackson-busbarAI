@@ -1,54 +1,67 @@
 # Busbar
 
-> A fast, native-protocol LLM gateway: weighted pool composition, lossless
-> cross-protocol translation, and correct billing-vs-client failure handling — in
-> one static Rust binary.
+> **One endpoint for every LLM. Swap models and vendors without touching client code.**
 
-Busbar sits in front of your LLM providers and routes each request to a model or a
-**pool** of models, tracking per-member health with a circuit breaker. Its thesis
-is **protocols, not providers**: it implements a small set of *wire protocols*
-losslessly and translates between any two of them through a superset intermediate
-representation (IR). A provider is just a catalog entry — a name, a `base_url`, and
-the name of the env var holding its key. No per-vendor integration code.
+Point your app at Busbar, speak whatever protocol your SDK already speaks, and reach
+any backend — Anthropic, OpenAI, Gemini, Bedrock, and 38 more — behind a single URL.
+Busbar translates between wire protocols *losslessly*, spreads load across weighted
+**pools**, and fails over in-flight when a vendor degrades, so one provider's bad day
+isn't your outage.
 
-When a client speaks the same protocol as the chosen backend, the request passes
-through untouched — preserving `cache_control`, thinking blocks, citations, and
-native usage accounting. When they differ, busbar translates request *and*
-response, streaming *and* non-streaming, in either direction (e.g. an OpenAI-format
-client driving a Gemini backend, or vice versa).
+No per-vendor SDKs in your app. No Python sidecar. No pile of per-provider
+`try/except` failover. Just one static binary and two YAML files.
 
-The name comes from electrical distribution: a busbar takes one feed and fans it
-out across many breakered circuits — one entry point, weighted distribution,
-per-circuit protection.
+`Feature-complete` · `267 tests` · `clippy -D warnings` clean · `security-hardened` ·
+`single static binary` · `AGPL-3.0`
 
-> **Project status: 0.17.4 (pre-1.0), in active development.** APIs and config may
-> change before 1.0. See [`docs/roadmap.md`](docs/roadmap.md) for the
-> protocols-not-providers thesis and the auth-adapter design.
+### Why it exists
 
-## Why Busbar
+If you build with LLMs, you've felt this: every vendor ships its own SDK and wire
+format, "failover" is a `try/except` around two clients, rate-limit and billing errors
+surface differently everywhere, and switching models means a code change and a deploy.
+Busbar makes the model a **config value**, not a dependency.
 
-- **Protocols, not providers.** Six wire protocols implemented losslessly; 42
-  vetted providers ship as catalog entries in `providers.yaml`, and you can add any
-  OpenAI-compatible endpoint (including your own) with three lines of YAML.
-- **Lossless cross-protocol translation.** A superset IR plus a `ProtocolReader` /
-  `ProtocolWriter` seam means a client speaking one protocol can reach a backend
-  speaking another — request and response, streamed or buffered, both directions.
-- **Not bearer-only.** Auth is a per-protocol/provider seam, not one hard-coded
-  scheme: bearer, Gemini's `x-goog-api-key`, Azure's `api-key` header, and AWS
-  **SigV4** for Bedrock all ride the same signing hook.
+Its thesis is **protocols, not providers**: implement a handful of *wire protocols*
+losslessly, and every provider that speaks one is just a catalog entry — a name, a
+`base_url`, and the env var holding its key. Adding a vendor (or your own
+OpenAI-compatible endpoint) is three lines of YAML, not an integration.
+
+The name comes from electrical distribution: a busbar takes one feed and fans it out
+across many breakered circuits — one entry point, weighted distribution, per-circuit
+protection.
+
+> **Project status: 0.17.4 — feature-complete, in pre-1.0 hardening.** The surface is
+> stable in practice; config and APIs may still change before 1.0. See
+> [`docs/roadmap.md`](docs/roadmap.md) for the protocols-not-providers thesis and the
+> auth-adapter design.
+
+## What you get
+
+- **One API for every model.** Your client speaks the protocol it already knows
+  (Anthropic, OpenAI, Gemini, Bedrock, Responses, or Cohere); Busbar reaches a backend
+  speaking *any* of them. Change models or vendors in `config.yaml` — the client never
+  changes.
+- **Lossless cross-protocol translation.** A superset IR with a `ProtocolReader` /
+  `ProtocolWriter` seam translates request *and* response, streamed *and* buffered, in
+  both directions — and reconciles the awkward asymmetries between dialects (a field one
+  protocol requires and another makes optional) so the call just works.
+- **Protocols, not providers.** Six wire protocols implemented losslessly; 42 vetted
+  providers ship as catalog entries in `providers.yaml`, and any OpenAI-compatible
+  endpoint — including your own — is three lines of YAML, not vendor integration code.
+- **In-flight failover, not a 3am page.** Weighted smooth round-robin across a pool,
+  per-pool failover with deadlines and exclusions, and a two-stage circuit breaker with
+  exponential cooldown and single-flight recovery. One vendor's 429 reroutes mid-request;
+  it doesn't cascade into your outage.
 - **Correct failure semantics.** A backend is ejected for *upstream* faults (5xx,
-  overload, rate-limit, billing/quota, auth) but never for *client-supplied* 4xx (a
-  malformed or oversized request). A healthy backend is never penalized because a
-  caller sent garbage.
-- **Resilience built in.** Weighted smooth round-robin across lanes, per-pool
-  failover with deadlines and exclusions, a two-stage circuit breaker with
-  exponential cooldown backoff, session affinity, context-length failover, and
-  optional active health probing.
-- **Optional governance.** Busbar-issued virtual keys with allowed-pools ACLs,
-  token-accurate budgets, and RPM/TPM rate limits, administered over an
-  admin-guarded management API and persisted in embedded SQLite.
-- **Single static binary.** Deploy-and-done. No runtime, no GC pauses. Builds for
-  Linux, macOS, and Windows (Intel + ARM).
+  overload, rate-limit, billing/quota, auth) but **never** for a *client* 4xx — a healthy
+  backend is never penalized because a caller sent a malformed or oversized request.
+- **Not bearer-only.** Auth is a per-provider seam: bearer, Gemini's `x-goog-api-key`,
+  Azure's `api-key` header, and AWS **SigV4** for Bedrock all ride one signing hook.
+- **Governance when you need it.** Busbar-issued virtual keys with allowed-pools ACLs,
+  token-accurate budgets, and RPM/TPM limits — over an admin-guarded API, persisted in
+  embedded SQLite. Off by default; one config block to turn on.
+- **Deploy-and-done.** A single static Rust binary — no runtime, no GC pauses, no
+  dependency tree. Builds for Linux, macOS, and Windows (Intel + ARM).
 
 ## Protocol support
 
@@ -69,6 +82,16 @@ Streaming is first-class for every protocol: Gemini uses `:streamGenerateContent
 Bedrock uses ConverseStream (busbar decodes the binary
 `application/vnd.amazon.eventstream` frames and re-frames them as the caller's
 protocol), and the others use SSE.
+
+### Translation, done right
+
+"Lossless" is a contract, not a slogan. **Same-protocol** calls pass through
+untouched — `cache_control`, thinking blocks, citations, and native usage accounting
+are all preserved. **Cross-protocol** calls go through the superset IR, which also
+reconciles the asymmetries between dialects: when a client legally omits a field the
+target backend requires — e.g. an OpenAI request with no `max_tokens` routed to an
+Anthropic model, which mandates one — Busbar supplies a configured default instead of
+letting the backend reject the call. A caller-supplied value is always preserved.
 
 ## Quick start
 
@@ -200,7 +223,7 @@ through its IR.
 | Pools & weighting | Smooth weighted round-robin (SWRR) across lanes; concurrency caps stack into one aggregate | [configuration.md](docs/configuration.md) |
 | Failover | Per-pool deadline + hop cap + member exclusions | [configuration.md](docs/configuration.md) |
 | Exhaustion policy | `reject` / `status_503` / `least_bad` / `fallback_pool:<name>` | [configuration.md](docs/configuration.md) |
-| Circuit breaker | Two-stage classify → disposition; `error_rate` or `consecutive` trips; exponential cooldown; Retry-After honored | [operations.md](docs/operations.md) |
+| Circuit breaker | Two-stage classify → disposition; `error_rate` or `consecutive` trips; exponential cooldown; single-flight half-open recovery; Retry-After honored | [operations.md](docs/operations.md) |
 | Session affinity | Sticky-by-header routing while a member stays healthy | [configuration.md](docs/configuration.md) |
 | Context-length failover | Oversized request fails over to a larger-context member without penalizing the smaller lane | [architecture.md](docs/architecture.md) |
 | Active health probing | `none` / `dead` / `active` background probes per provider | [operations.md](docs/operations.md) |
@@ -231,6 +254,25 @@ per-request fee plus a per-1000-token charge derived from response usage.
 Enforcement state is durable in embedded SQLite. Keys are minted and revoked over
 the admin-token-guarded `/admin/keys` management API. See
 [docs/operations.md](docs/operations.md).
+
+## Security
+
+Busbar lives in your request path, so it's built to be boring there:
+
+- **No caller-controlled upstreams (SSRF-safe).** The destination URL is built from
+  your vetted `providers.yaml` — never from request data. A caller can't steer Busbar
+  at an arbitrary host.
+- **Constant-time secret comparison.** Client tokens and the admin token are compared
+  in constant time; virtual keys are stored as SHA-256 hashes, never in plaintext.
+- **Bounded request bodies.** Requests are capped (32 MiB) so an oversized body can't
+  exhaust memory — enforced even in open-relay (`auth.mode=none`) deployments.
+- **Parameterized persistence.** All governance SQL is fully parameterized; no
+  string-built queries.
+- **Secrets stay out of logs.** Provider keys, client tokens, and request bodies are
+  never written to logs.
+
+These properties are exercised by the test suite and were the focus of a dedicated
+hardening pass. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Configuration summary
 
