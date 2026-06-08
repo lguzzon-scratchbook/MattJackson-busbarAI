@@ -995,31 +995,28 @@ impl ProtocolWriter for AnthropicWriter {
                     _ => return None,
                 };
                 let mut msg_obj = serde_json::Map::new();
-                // The native `message_start.message` is a skeleton Message an SDK reads
-                // `id`/`type`/`role`/`model`/`content`/`usage` from (plus `stop_reason`/
-                // `stop_sequence`, null at stream start). We emit that full skeleton whenever we
-                // have identity to anchor it — i.e. the egress stream carried a native `id`/`model`
-                // (same-protocol passthrough) or the cross-protocol decode populated either field.
-                // When neither is present (a minimal `{role,usage}` event with no identity, which
-                // is what a bare same-protocol fixture round-trips), we emit only `role`+`usage` so
-                // the passthrough stays byte-faithful and does not fabricate a skeleton the source
-                // never sent. Synthesize `id` only on the identity-bearing path where it's missing
-                // (cross-protocol gave `model` but no Anthropic id), never on the bare path.
-                let has_identity = id.is_some() || model.is_some();
-                if has_identity {
-                    let msg_id = id.clone().unwrap_or_else(synth_message_id);
-                    msg_obj.insert("id".to_string(), serde_json::json!(msg_id));
-                    msg_obj.insert("type".to_string(), serde_json::json!("message"));
-                }
+                // The native `message_start.message` is a skeleton Message EVERY native Anthropic
+                // stream carries and an SDK reads `id`/`type`/`role`/`model`/`content`/`usage` from
+                // (plus `stop_reason`/`stop_sequence`, null at stream start). Emit that full skeleton
+                // UNCONDITIONALLY — synthesizing a `msg_`-prefixed id when the source carried none —
+                // exactly as every other ingress writer does (openai/cohere/responses/gemini all
+                // `unwrap_or_else` an id). `write_response_event` runs ONLY on the cross-protocol
+                // `StreamTranslate` path (same-protocol streams pass raw bytes through and never
+                // reconstruct events), where `StreamTranslate` strips the foreign `id` to `None`;
+                // gating the skeleton on `has_identity` therefore emitted a DEGENERATE
+                // `{role,usage}` message_start on every cross-protocol Anthropic-ingress stream —
+                // missing the mandatory `id`/`type`/`content`/`stop_reason`/`stop_sequence` an SDK
+                // requires to construct its streaming Message (a decode failure and a proxy tell).
+                let msg_id = id.clone().unwrap_or_else(synth_message_id);
+                msg_obj.insert("id".to_string(), serde_json::json!(msg_id));
+                msg_obj.insert("type".to_string(), serde_json::json!("message"));
                 msg_obj.insert("role".to_string(), serde_json::json!(role_str));
                 if let Some(model_str) = model {
                     msg_obj.insert("model".to_string(), serde_json::json!(model_str));
                 }
-                if has_identity {
-                    msg_obj.insert("content".to_string(), serde_json::Value::Array(Vec::new()));
-                    msg_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
-                    msg_obj.insert("stop_sequence".to_string(), serde_json::Value::Null);
-                }
+                msg_obj.insert("content".to_string(), serde_json::Value::Array(Vec::new()));
+                msg_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
+                msg_obj.insert("stop_sequence".to_string(), serde_json::Value::Null);
                 if let Some(usage_val) = usage {
                     let mut usage_map = serde_json::Map::new();
                     usage_map.insert(

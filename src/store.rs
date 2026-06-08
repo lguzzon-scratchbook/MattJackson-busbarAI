@@ -551,7 +551,15 @@ impl InMemoryStore {
             // Signed jitter in [-jitter_range, +jitter_range]; apply its sign so cooldowns are
             // spread both shorter AND longer (desyncing lanes). Using the absolute value here was a
             // bug — it only ever lengthened the cooldown.
-            let jitter = (jitter_seed as i64 % (2 * jitter_range as i64 + 1)) - jitter_range as i64;
+            // Reduce the u128 FNV seed into an UNSIGNED bounded value BEFORE centering. Casting the
+            // seed `as i64` first (the old bug) reinterprets the low 64 bits as signed — frequently
+            // negative — and Rust's truncated `%` then yields a value in (-2r, +2r), so subtracting
+            // `r` skewed the final jitter to roughly (-3r, +r) instead of the documented symmetric
+            // [-r, +r]. Taking `% span` on the unsigned u128 keeps the remainder in [0, 2r], so the
+            // centered result is exactly [-r, +r].
+            let span = 2 * jitter_range as u128 + 1;
+            let unbiased = (jitter_seed % span) as i64;
+            let jitter = unbiased - jitter_range as i64;
             let jittered = if jitter >= 0 {
                 duration.saturating_add(jitter as u64)
             } else {
@@ -1373,6 +1381,46 @@ mod tests {
         assert!(
             !store.usable(0, 1000),
             "a tripped (Open) lane must not be usable during its cooldown"
+        );
+    }
+
+    /// Round-4 MEDIUM/correctness: cooldown jitter must be SYMMETRIC in [-r, +r] (r = duration/10),
+    /// not the old (-3r, +r) skew. The old code cast the u128 FNV seed `as i64` (frequently negative)
+    /// before `% (2r+1)`, so the centered jitter biased SHORTER. Trip a fresh lane across many
+    /// distinct time-seeds and assert every resulting cooldown stays within [0.9·duration,
+    /// 1.1·duration] — a value below 0.9·duration is only reachable under the old skewed formula
+    /// (the duration/2 lower clamp does not engage at these magnitudes).
+    #[test]
+    fn test_cooldown_jitter_is_symmetric() {
+        let cfg = BreakerCfg::default(); // base 15, max 120
+                                         // 5 consecutive errors → streak 5 → 15<<5 saturates to max 120; r = 12.
+        let expected_base = cfg.max_cooldown_secs; // 120
+        let r = expected_base / 10; // 12
+        let lo = expected_base - r; // 108
+        let hi = expected_base + r; // 132
+        let mut saw_below_base = false;
+        for seed in 0..400u64 {
+            // Distinct time-seed per iteration drives a distinct jitter; fresh store so streak resets.
+            set_now_for_test(1_000_000 + seed * 7);
+            let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+            for _ in 0..5 {
+                store.record_transient(0, "5xx", &cfg, None);
+            }
+            let now = crate::store::now_for_test();
+            let remaining = store.cooldown_remaining(0, now);
+            assert!(
+                remaining >= lo && remaining <= hi,
+                "cooldown {remaining}s must stay within symmetric [{lo}, {hi}] (seed {seed})"
+            );
+            if remaining < expected_base {
+                saw_below_base = true;
+            }
+        }
+        // The jitter must actually exercise the SHORTER side too (not just lengthen) — otherwise the
+        // sign handling is broken in the other direction.
+        assert!(
+            saw_below_base,
+            "jitter must sometimes shorten the cooldown below the base (symmetric distribution)"
         );
     }
 

@@ -298,29 +298,31 @@ impl ProtocolReader for GeminiReader {
         // the explicit pre-insert below (preventing the silent duplicate insert the loop used to
         // perform, which would be discarded the moment the two writes ever diverged).
         //
-        // `stream` is NOT in `modeled_keys` and therefore, when the SOURCE body carries it, it IS
-        // preserved through `extra` and echoed back by the writer — exactly mirroring how `model`
-        // (also captured into a typed field) is round-tripped, so a read→write of a body that
-        // carried `stream` stays byte-identical. `IrRequest.stream` (captured above) is read ONLY by
-        // path-selection (`upstream_path_for_stream`) and is the source of truth for the URL choice;
-        // the `extra` copy exists purely for round-trip fidelity. Two distinct cases reach the wire:
-        //   * Same-protocol Gemini→Gemini: `forward::strip_router_shim_keys` removes `model`/`stream`
-        //     from the egress body before the upstream call, so the router-injected shim never lands
-        //     on a real Gemini request regardless of the `extra` copy.
-        //   * Cross-protocol egress: a downstream writer may write `stream` from both its typed field
-        //     AND this `extra` copy; because both derive from the same intent they coincide, and a
-        //     `serde_json::Map::insert` overwrite means one wire key (not a duplicate). This is a
-        //     duplicated WRITE, not a duplicate KEY — fragile only if a future writer's two values
-        //     ever diverge, which is a property of that writer, not of this reader.
-        // (The earlier comment that claimed `stream` is excluded from `extra` was false; this is the
-        // accurate description. The native Gemini GenerateContentRequest has no `stream` field —
-        // streaming is URL-selected — so on a NATIVE request `extra` carries no `stream` at all.)
+        // `stream` is NOT in `modeled_keys`: when the SOURCE body carries it, it is preserved through
+        // `extra` and echoed back by the writer — mirroring how `model` (also captured into a typed
+        // field) round-trips, so a read→write of a body that carried `stream` stays byte-identical
+        // (the `test_gemini_roundtrip_identity` invariant). `IrRequest.stream` (captured above) is the
+        // source of truth for path selection (`upstream_path_for_stream`); the `extra` copy is purely
+        // for round-trip fidelity. The router-injected `stream`/shim NEVER reach a real backend
+        // because `forward::strip_router_shim_keys` now runs UNCONDITIONALLY (same- AND cross-protocol)
+        // before the upstream call.
+        //
+        // The router-internal `__busbar_gemini_json_array` shim IS in `modeled_keys`, so it never
+        // enters `extra` and can never be re-emitted onto a cross-protocol upstream body by a
+        // downstream writer. Unlike `stream` it is not a caller field with any round-trip meaning (a
+        // native Gemini request never carries it), so excluding it costs no fidelity. Previously it
+        // was absent from the set, so the CROSS-protocol path (which rebuilds the body via
+        // read/write_request, bypassing the same-protocol-only strip that existed before this fix)
+        // swept it into `extra` and every egress writer re-emitted this router fingerprint onto a
+        // foreign OpenAI/Anthropic/Cohere/Bedrock backend. Both the unconditional forward-layer strip
+        // and this exclusion now guard that leak (defense in depth).
         let modeled_keys: std::collections::HashSet<&str> = [
             "contents",
             "tools",
             "systemInstruction",
             "generationConfig",
             "model",
+            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
         ]
         .iter()
         .cloned()
@@ -1024,12 +1026,13 @@ impl ProtocolWriter for GeminiWriter {
                     (Some(id), _) => {
                         frame.insert("responseId".to_string(), serde_json::json!(id));
                     }
-                    // Cross-protocol stream: `StreamTranslate` strips the foreign id/model to `None`
-                    // before this writer runs. A native google-genai SDK reads `chunk.response_id`
-                    // off the FIRST chunk (for observability/tracing), so emitting no identity frame
-                    // at all is a detectable fidelity gap from a native Gemini stream (which always
-                    // carries `responseId` in the first chunk). Synthesize one — matching the
-                    // non-stream `write_response` behavior — rather than dropping the frame.
+                    // Cross-protocol stream: `StreamTranslate` strips the foreign `id` to `None`
+                    // before this writer runs (it does NOT strip `model` — that is the lane's model
+                    // name, emitted as `modelVersion` below). A native google-genai SDK reads
+                    // `chunk.response_id` off the FIRST chunk (for observability/tracing), so emitting
+                    // no identity frame at all is a detectable fidelity gap from a native Gemini stream
+                    // (which always carries `responseId` in the first chunk). Synthesize one —
+                    // matching the non-stream `write_response` behavior — rather than dropping it.
                     (None, _) => {
                         frame.insert(
                             "responseId".to_string(),
@@ -1037,6 +1040,11 @@ impl ProtocolWriter for GeminiWriter {
                         );
                     }
                 }
+                // A native Gemini SSE stream ALWAYS carries `modelVersion` in the first chunk (the
+                // official google-genai SDK reads `chunk.model_version`). `StreamTranslate` now
+                // preserves the lane's `model` across the cross-protocol boundary, so this is
+                // populated on cross-protocol streams (not just same-protocol passthrough) and the
+                // SDK no longer sees an empty model on every cross-protocol response.
                 if let Some(model) = model {
                     frame.insert("modelVersion".to_string(), serde_json::json!(model));
                 }

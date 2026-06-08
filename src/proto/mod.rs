@@ -369,18 +369,19 @@ impl StreamTranslate {
         {
             // Cross-protocol stream identity strip: a `StreamTranslate` only exists when
             // ingress != egress (`new` returns None otherwise), so every event here crosses a
-            // protocol boundary. Clear the foreign-format `MessageStart` `id`/`created` (and `model`)
-            // so the INGRESS writer synthesizes NATIVE-format stream identity rather than leaking the
-            // backend's `chatcmpl-…`/`msg_…` id to a different-protocol client — mirrors the
-            // non-stream strip in forward.rs (`ir.id = None`). Same-protocol byte-exact round-trips
-            // never reach here, so they are untouched.
-            if let crate::ir::IrStreamEvent::MessageStart {
-                id, created, model, ..
-            } = &mut ev
-            {
+            // protocol boundary. Clear the foreign-format `MessageStart` `id`/`created` so the INGRESS
+            // writer synthesizes NATIVE-format stream identity rather than leaking the backend's
+            // `chatcmpl-…`/`msg_…` id to a different-protocol client — mirrors the non-stream strip in
+            // forward.rs (`ir.id = None`). `model` is DELIBERATELY LEFT INTACT: it is the lane's model
+            // name (format-neutral, like `created`), and ingress writers use a populated `model` as
+            // the anchor for synthesizing the full native stream-start skeleton — clearing it
+            // suppressed that synthesis (the Anthropic writer emitted a degenerate `message_start`
+            // missing `id`/`type`/`content`/`stop_reason`/`stop_sequence`; the Gemini writer omitted
+            // `modelVersion`). The non-stream path in forward.rs also does NOT clear `model`. Same-
+            // protocol byte-exact round-trips never reach here, so they are untouched.
+            if let crate::ir::IrStreamEvent::MessageStart { id, created, .. } = &mut ev {
                 *id = None;
                 *created = None;
-                *model = None;
             }
             // Bedrock-INGRESS error path: a native AWS SDK dispatches mid-stream errors off the
             // `:message-type: exception` / `:exception-type` headers, which ONLY
@@ -583,6 +584,15 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
 /// payloads as one streaming JSON array. The output is ALWAYS a syntactically valid JSON array
 /// (`finish` emits `]`, or `[]` when no chunk was seen) so a client that buffers and `JSON.parse`s
 /// the whole body still succeeds.
+/// Router-internal shim key the gemini ingress route injects into the request body when the client
+/// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
+/// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims. Single
+/// source of truth shared by the route injection (`route.rs`), the forward-layer strip
+/// (`forward::strip_router_shim_keys`), and the Gemini reader's `modeled_keys` exclusion so it never
+/// reaches a backend on any path. A leading `__busbar` makes a collision with a real provider field
+/// impossible.
+pub(crate) const GEMINI_JSON_ARRAY_SHIM_KEY: &str = "__busbar_gemini_json_array";
+
 pub(crate) struct GeminiJsonArrayFramer {
     buf: Vec<u8>,
     /// How far into `buf` the SSE terminator scan has already advanced (keeps `feed` linear; mirrors
@@ -661,10 +671,21 @@ impl GeminiJsonArrayFramer {
     }
 
     /// Call once at end-of-stream. Emits the closing `]` (and the opening `[` too, as `[]`, when the
-    /// stream carried no chunk) so the body is always a complete, parseable JSON array.
+    /// stream carried no chunk) so the body is always a complete, parseable JSON array. When the
+    /// framer ABORTED (the reassembly buffer overran `MAX_BUF` without a frame terminator), the
+    /// stream was silently truncated — so instead of a bare `]` that would make the partial array
+    /// look complete, append a Gemini-shaped `google.rpc.Status` error element so a parsing client
+    /// can see the stream ended abnormally (then close the array).
     pub(crate) fn finish(&mut self) -> Vec<u8> {
         if self.finished {
             return Vec::new();
+        }
+        if self.aborted {
+            return self.finish_with_error(
+                500,
+                "INTERNAL",
+                "busbar: upstream stream exceeded the reassembly buffer and was truncated",
+            );
         }
         self.finished = true;
         if self.started {
@@ -672,6 +693,33 @@ impl GeminiJsonArrayFramer {
         } else {
             b"[]".to_vec()
         }
+    }
+
+    /// Terminate the array with a trailing Gemini-shaped error element, then the closing `]`. Used on
+    /// a mid-stream upstream transport failure (and on internal abort): a native Gemini JSON-array
+    /// body is `application/json`, so the in-band error MUST itself be a valid array element — a
+    /// `{"error":{"code","message","status"}}` object matching Gemini's `google.rpc.Status` envelope
+    /// (the same shape `GeminiWriter::write_error` emits). Emitting raw SSE `event:`/`data:` text here
+    /// (the bug this replaces) spliced non-JSON into the array, yielding an unparseable body and a
+    /// protocol tell (a native Gemini JSON-array stream never contains SSE framing). Idempotent.
+    pub(crate) fn finish_with_error(&mut self, code: u16, status: &str, message: &str) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let err = serde_json::json!({
+            "error": { "code": code, "message": message, "status": status }
+        });
+        let mut out: Vec<u8> = Vec::new();
+        if self.started {
+            out.push(b',');
+        } else {
+            out.push(b'[');
+            self.started = true;
+        }
+        out.extend_from_slice(err.to_string().as_bytes());
+        out.push(b']');
+        out
     }
 }
 
@@ -1198,7 +1246,12 @@ mod tests {
         let reader = AnthropicReader;
         let writer = AnthropicWriter;
 
-        // message_start with usage
+        // message_start with usage. `write_response_event` runs ONLY on the cross-protocol
+        // StreamTranslate path (same-protocol streams pass raw bytes through), so the writer ALWAYS
+        // emits the full native skeleton — `id` (synthesized when absent), `type`, `content[]`,
+        // `stop_reason`, `stop_sequence` — that every native Anthropic message_start carries. Assert
+        // those structural fields (the synthesized `id` is non-deterministic) plus the round-tripped
+        // usage, rather than byte-identity to the bare input.
         let data = serde_json::json!({
             "message": {
                 "role": "assistant",
@@ -1213,9 +1266,29 @@ mod tests {
         let ev = reader.read_response_event("message_start", &data);
         assert!(ev.is_some());
         if let Some(e) = ev {
+            let (et, out) = writer
+                .write_response_event(&e)
+                .expect("writes message_start");
+            assert_eq!(et, "message_start");
+            let msg = out.get("message").expect("message object");
+            assert!(
+                msg.get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .starts_with("msg_"),
+                "synthesized id must be msg_-prefixed: {out}"
+            );
+            assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("message"));
+            assert_eq!(msg.get("role").and_then(|v| v.as_str()), Some("assistant"));
+            assert!(msg.get("content").and_then(|c| c.as_array()).is_some());
+            assert!(msg.get("stop_reason").map(|v| v.is_null()).unwrap_or(false));
+            assert!(msg
+                .get("stop_sequence")
+                .map(|v| v.is_null())
+                .unwrap_or(false));
             assert_eq!(
-                writer.write_response_event(&e),
-                Some(("message_start".to_string(), data))
+                msg.get("usage").and_then(|u| u.get("input_tokens")),
+                Some(&serde_json::json!(10))
             );
         }
 
@@ -2255,7 +2328,9 @@ mod tests {
             let reader = AnthropicReader;
             let writer = AnthropicWriter;
 
-            // 1. message_start w/ usage incl. cache tokens
+            // 1. message_start w/ usage incl. cache tokens. The writer (cross-protocol-only path)
+            // always emits the full native skeleton with a synthesized `id`, so assert the structural
+            // fields + round-tripped usage rather than byte-identity to the bare input.
             let data = serde_json::json!({
                 "message": {
                     "role": "assistant",
@@ -2270,9 +2345,30 @@ mod tests {
             let ev = reader.read_response_event("message_start", &data);
             assert!(ev.is_some());
             if let Some(e) = ev {
+                let (et, out) = writer
+                    .write_response_event(&e)
+                    .expect("writes message_start");
+                assert_eq!(et, "message_start");
+                let msg = out.get("message").expect("message object");
+                assert!(
+                    msg.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .starts_with("msg_"),
+                    "synthesized id must be msg_-prefixed: {out}"
+                );
+                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("message"));
+                assert_eq!(msg.get("role").and_then(|v| v.as_str()), Some("assistant"));
+                assert!(msg.get("content").and_then(|c| c.as_array()).is_some());
+                assert!(msg.get("stop_reason").map(|v| v.is_null()).unwrap_or(false));
+                assert!(msg
+                    .get("stop_sequence")
+                    .map(|v| v.is_null())
+                    .unwrap_or(false));
                 assert_eq!(
-                    writer.write_response_event(&e),
-                    Some(("message_start".to_string(), data))
+                    msg.get("usage")
+                        .and_then(|u| u.get("cache_read_input_tokens")),
+                    Some(&serde_json::json!(15))
                 );
             }
 
@@ -2917,6 +3013,47 @@ mod stream_translate_tests {
         let mut out = mid;
         out.extend_from_slice(&end);
         assert_eq!(out, b"[]", "empty stream → empty JSON array");
+    }
+
+    /// Round-4: `finish_with_error` after real chunks appends a gemini-shaped error element + `]`, so
+    /// the body stays a valid JSON array (used on a mid-stream transport failure).
+    #[test]
+    fn test_gemini_json_array_framer_finish_with_error_closes_array() {
+        let mut f = GeminiJsonArrayFramer::new();
+        let mut out = f.feed(b"data: {\"candidates\":[{\"index\":0}]}\n\n");
+        out.extend_from_slice(&f.finish_with_error(500, "INTERNAL", "boom"));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out).expect("error-terminated body must parse as JSON array");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 2, "one chunk + one trailing error element");
+        assert_eq!(arr[1]["error"]["code"], 500);
+        assert_eq!(arr[1]["error"]["status"], "INTERNAL");
+        // A finish_with_error on an EMPTY stream still yields a valid single-element array.
+        let mut g = GeminiJsonArrayFramer::new();
+        let only = g.finish_with_error(503, "UNAVAILABLE", "x");
+        let pv: serde_json::Value = serde_json::from_slice(&only).expect("parses");
+        assert_eq!(pv.as_array().expect("array").len(), 1);
+    }
+
+    /// Round-4: when the framer ABORTS (reassembly buffer overran `MAX_BUF` without a terminator),
+    /// `finish` must emit a gemini error element instead of a bare `]` that would make the silently
+    /// truncated stream look complete.
+    #[test]
+    fn test_gemini_json_array_framer_finish_signals_abort() {
+        let mut f = GeminiJsonArrayFramer::new();
+        // Feed a frame with no terminator that overruns MAX_BUF → aborts.
+        let huge = vec![b'x'; GeminiJsonArrayFramer::MAX_BUF + 16];
+        let mut pre = Vec::from(&b"data: {\"k\":\""[..]);
+        pre.extend_from_slice(&huge);
+        let _ = f.feed(&pre);
+        let out = f.finish();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out).expect("aborted finish must still parse as JSON array");
+        let arr = parsed.as_array().expect("array");
+        assert!(
+            arr.iter().any(|el| el.get("error").is_some()),
+            "aborted stream must surface an error element, not a silent bare close; got {parsed}"
+        );
     }
 
     /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for tests.

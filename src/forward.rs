@@ -81,10 +81,9 @@ fn strip_router_shim_keys(v: &mut Value, ingress_protocol: &str) {
 
 /// Router-internal shim key the gemini ingress route injects into the request body when the client
 /// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
-/// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims and is
-/// stripped by [`strip_router_shim_keys`] before the upstream call. A leading `__busbar` makes an
-/// accidental collision with a real provider field impossible.
-const GEMINI_JSON_ARRAY_SHIM_KEY: &str = "__busbar_gemini_json_array";
+/// JSON-array streaming format, not SSE). Defined once in `proto` and re-exported here so the route
+/// injection, this strip, and the Gemini reader's `modeled_keys` exclusion all share one literal.
+use crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY;
 
 /// True when the body carries the gemini JSON-array shim key set to `true` (see
 /// [`GEMINI_JSON_ARRAY_SHIM_KEY`]).
@@ -420,6 +419,7 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
 ///
 /// Where to charge a request's token usage when its response stream completes (the resolved virtual
 /// key + its budget period + the governance store). `None` when governance is off or no key resolved.
+#[derive(Clone)]
 pub(crate) struct UsageSink {
     pub gov: Arc<crate::governance::GovState>,
     pub key_id: String,
@@ -589,6 +589,19 @@ where
                         // failure double-counted against the breaker.
                         drop(this.permit.take());
                         this.ended = true;
+                        // Gemini JSON-array ingress (non-`alt=sse`): the client has been receiving a
+                        // streaming JSON ARRAY (`[obj,obj`), so the in-band error MUST be a valid
+                        // trailing array element followed by the closing `]` — NOT the SSE text frame
+                        // `mid_stream_error_bytes` produces. Emitting `event: error\ndata:{...}` into a
+                        // JSON-array body splices non-JSON into the array (unparseable) and is a
+                        // protocol tell (a native Gemini JSON-array stream never contains SSE framing).
+                        // Route the error through the framer instead: a Gemini `google.rpc.Status`
+                        // element + `]`.
+                        if let Some(framer) = this.json_array.as_mut() {
+                            let err_bytes =
+                                framer.finish_with_error(500, "INTERNAL", &e.to_string());
+                            return Poll::Ready(Some(Ok(Bytes::from(err_bytes))));
+                        }
                         // Emit the error in the INGRESS protocol's framing, NOT a hard-coded SSE
                         // text frame. For a bedrock-ingress client (binary eventstream) this is a
                         // valid AWS exception frame; for SSE clients it is shaped to the ingress
@@ -1072,6 +1085,7 @@ pub(crate) async fn forward_with_pool(
                     caller_token,
                     &mut request_ctx,
                     ingress_protocol,
+                    usage_sink.clone(),
                 )
                 .await;
             }
@@ -1130,15 +1144,17 @@ pub(crate) async fn forward_with_pool(
             .protocol
             .writer()
             .rewrite_model(&mut hop_v, &app.lanes[i].model);
-        // Same-protocol passthrough for a PATH-MODEL ingress (gemini/bedrock): the route layer
-        // injected `model`/`stream` shim keys into the body so the shared resolve/forward plumbing
-        // (which reads both from the body) works. Cross-protocol rebuilds `hop_v` via
-        // read/write_request so the shims are already gone there, but the same-protocol branch would
-        // forward them to the backend — a router-internal leak (and, for Bedrock, an invalid Converse
-        // request). Strip them.
-        if ingress_protocol == egress_name {
-            strip_router_shim_keys(&mut hop_v, ingress_protocol);
-        }
+        // PATH-MODEL ingress (gemini/bedrock): the route layer injected `model`/`stream`/
+        // `__busbar_gemini_json_array` shim keys into the body so the shared resolve/forward plumbing
+        // (which reads them from the body) works. Strip them UNCONDITIONALLY — on BOTH the
+        // same-protocol and cross-protocol branches — before the body reaches any backend. The strip
+        // previously ran only on the same-protocol branch on the assumption the cross-protocol
+        // read/write_request rebuild had already dropped them; that was false for Gemini (the
+        // `__busbar_gemini_json_array` shim was swept into IR `extra` and re-emitted by the egress
+        // writer), leaking a router fingerprint to a foreign backend. (The Gemini reader now also
+        // excludes both keys from `extra`, so this is defense in depth.) No-op for body-model
+        // ingress (openai etc.), whose `model`/`stream` are genuine caller fields.
+        strip_router_shim_keys(&mut hop_v, ingress_protocol);
         let payload = match serde_json::to_vec(&hop_v) {
             Ok(p) => p,
             // Re-serializing a Value that was parsed from valid JSON and only rewritten with
@@ -1239,12 +1255,32 @@ pub(crate) async fn forward_with_pool(
                     let bytes = read_capped_body(r).await;
 
                     if is_passthrough_40x {
+                        // Verbatim relay of the upstream 401/403 body+CT is correct ONLY on the
+                        // same-protocol path, where the upstream error is already in the client's
+                        // native shape. On a CROSS-protocol boundary (e.g. an Anthropic-ingress client
+                        // routed to an OpenAI backend that 401s) relaying the egress provider's native
+                        // error envelope and Content-Type to a different-protocol SDK is a
+                        // foreign-format leak (§8.2) — the SDK fails to decode it into its typed
+                        // exception, an immediate proxy tell. Reshape into the ingress protocol's
+                        // native envelope instead, deriving the kind from the status (the sibling
+                        // ClientFault branch does the same). The passthrough breaker invariant is
+                        // unchanged either way: no breaker penalty for a caller-key auth failure.
+                        if ingress_protocol != egress_name {
+                            let kind = if status == StatusCode::UNAUTHORIZED {
+                                "authentication_error"
+                            } else {
+                                "permission_error"
+                            };
+                            let msg = extract_error_message(&bytes)
+                                .unwrap_or_else(|| "upstream rejected the request".to_string());
+                            return ingress_error(ingress_protocol, status, kind, &msg);
+                        }
                         use axum::body::Body;
                         let mut rb = Response::builder().status(status);
                         if let Some(ct) = ct {
                             rb = rb.header(CONTENT_TYPE, ct);
                         }
-                        // Re-create response from bytes for passthrough relay
+                        // Re-create response from bytes for same-protocol passthrough relay
                         return rb
                             .body(Body::from(bytes))
                             .unwrap_or_else(|_| status.into_response());
@@ -1601,6 +1637,7 @@ pub(crate) async fn forward_with_pool(
         caller_token,
         &mut request_ctx,
         ingress_protocol,
+        usage_sink,
     )
     .await
 }
@@ -1637,6 +1674,7 @@ async fn handle_exhaustion_for_pool(
     caller_token: Option<&str>,
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
+    usage_sink: Option<UsageSink>,
 ) -> Response {
     // Look up pool-specific on_exhausted config, default to Status503 for unknown pools.
     let mode = app
@@ -1655,6 +1693,7 @@ async fn handle_exhaustion_for_pool(
                 fallback_pool,
                 request_ctx,
                 ingress_protocol,
+                usage_sink,
             )
             .await
         }
@@ -1668,6 +1707,7 @@ async fn handle_exhaustion_for_pool(
                 request_ctx,
                 pool_name,
                 ingress_protocol,
+                usage_sink,
             )
             .await
         }
@@ -1716,6 +1756,7 @@ fn handle_status_503(
 /// and the 2xx response is translated back to the ingress protocol (buffered for non-stream, framed
 /// via `StreamTranslate` for SSE). Non-2xx responses are reshaped to the ingress error envelope on a
 /// crossed boundary. Same-protocol targets pass through verbatim.
+#[allow(clippy::too_many_arguments)] // plumbing: each arg is an independent request input
 #[tracing::instrument(name = "forward_once", skip_all, fields(lane = i))]
 async fn forward_once(
     app: &Arc<App>,
@@ -1725,6 +1766,7 @@ async fn forward_once(
     caller_token: Option<&str>,
     timeout_secs: u64,
     ingress_protocol: &str,
+    usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
     let mut v: Value = match serde_json::from_slice(body) {
@@ -1776,10 +1818,9 @@ async fn forward_once(
         .protocol
         .writer()
         .rewrite_model(&mut v, &app.lanes[i].model);
-    // Strip router-internal shim keys on the same-protocol passthrough path (see forward_with_pool).
-    if ingress_protocol == egress_name {
-        strip_router_shim_keys(&mut v, ingress_protocol);
-    }
+    // Strip router-internal shim keys UNCONDITIONALLY (same- AND cross-protocol) before the body
+    // reaches any backend — see forward_with_pool for why the cross-protocol branch must strip too.
+    strip_router_shim_keys(&mut v, ingress_protocol);
     let payload = match serde_json::to_vec(&v) {
         Ok(p) => p,
         // Effectively infallible (Value parsed from valid JSON); return a shaped 500 rather than
@@ -1861,6 +1902,15 @@ async fn forward_once(
                     .unwrap_or_else(|_| status.into_response()));
             }
 
+            // SUCCESS: the degraded path served a 2xx. Mirror the main forward loop
+            // (forward_with_pool) — record the lane success (feeds the breaker success window so a
+            // HalfOpen lane served via fallback/least-bad recovers to Closed) and consume one unit of
+            // its lifetime request budget. No pool context here, so use the bare-lane forms. Without
+            // these, a HalfOpen lane that ONLY ever serves traffic through the exhaustion paths never
+            // self-recovers and its `max_requests` budget never depletes.
+            app.store.record_success(i);
+            app.store.spend_budget(i);
+
             // SUCCESS: stream the response body incrementally (permit held for stream life).
             let is_sse = ct
                 .as_ref()
@@ -1873,6 +1923,9 @@ async fn forward_once(
             if cross_protocol && !is_sse {
                 let bytes = read_capped_body(r).await;
                 drop(permit); // a buffered (non-streamed) response holds no permit
+                              // Token accounting: no FirstByteBody on this buffered path, so tap the
+                              // usage here and charge it to the key's budget (mirrors the main path).
+                record_nonstream_usage(&bytes, &usage_sink);
                 if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                     if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
@@ -1927,7 +1980,7 @@ async fn forward_once(
                 "", // degraded path: lane-default breaker cell
                 translate,
                 json_array,
-                None,
+                usage_sink,
             );
             let mut rb = Response::builder().status(status);
             // Cross-protocol streaming: the body is reframed to the client's format, so the CT must
@@ -1971,6 +2024,7 @@ async fn forward_once(
 /// it consults THAT pool's own `on_exhausted` config and re-enters. The `visited_pools` set
 /// in `RequestCtx` is the loop guard — a chain that cycles back to an already-visited pool
 /// (A→B→A) terminates with 503 instead of recursing forever.
+#[allow(clippy::too_many_arguments)] // plumbing: each arg is an independent request input
 async fn handle_fallback_pool(
     app: Arc<App>,
     body: Bytes,
@@ -1978,6 +2032,7 @@ async fn handle_fallback_pool(
     pool_name: &str,
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
+    usage_sink: Option<UsageSink>,
 ) -> Response {
     // Deadline propagated across hops.
     if request_ctx.expired(now()) {
@@ -2027,6 +2082,7 @@ async fn handle_fallback_pool(
                 caller_token,
                 request_ctx,
                 ingress_protocol,
+                usage_sink,
             ))
             .await;
         };
@@ -2041,6 +2097,9 @@ async fn handle_fallback_pool(
             caller_token,
             request_ctx.remaining(now()),
             ingress_protocol,
+            // Clone per attempt: a transient transport failure retries the next member, so the sink
+            // must survive into the next loop iteration; only a successful stream consumes it.
+            usage_sink.clone(),
         )
         .await
         {
@@ -2065,6 +2124,7 @@ async fn handle_least_bad(
     request_ctx: &RequestCtx,
     pool: &str,
     ingress_protocol: &str,
+    usage_sink: Option<UsageSink>,
 ) -> Response {
     let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
         // No candidates at all - fall back to Status503.
@@ -2091,6 +2151,7 @@ async fn handle_least_bad(
         caller_token,
         request_ctx.remaining(now),
         ingress_protocol,
+        usage_sink,
     )
     .await
     {

@@ -3100,6 +3100,69 @@ mod tests {
         server1.shutdown().await;
     }
 
+    /// Round-4 MEDIUM/correctness: `forward_once` (the LeastBad/FallbackPool helper) must record
+    /// lane success AND spend budget on a 2xx, mirroring the main forward loop. Without it a HalfOpen
+    /// lane served only via the degraded path never recovers and its `max_requests` budget never
+    /// depletes. Route a budget-limited lane via LeastBad and assert `ok` incremented and `budget`
+    /// decremented after one served request.
+    #[tokio::test]
+    async fn test_forward_once_records_success_and_spends_budget() {
+        use crate::store::now as store_now;
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": [] }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "lane0",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .cooldown_until(t0 + 600) // Open → normal selection finds nothing → LeastBad path
+                .streak(3)
+                .err(5)
+                .budget(2), // limited lane: 2 lifetime requests remaining
+            )
+            .pool("leastbad", &[(0, 1)])
+            .on_exhausted("leastbad", crate::config::OnExhausted::LeastBad)
+            .build();
+
+        let before = app.store.snapshot(0, store_now());
+        assert_eq!(before.ok, 0, "precondition: no successes yet");
+        assert_eq!(before.budget, 2, "precondition: budget 2");
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "leastbad",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200, "LeastBad serves 2xx");
+        // Drain the body so any streaming completion settles (non-stream here, but keep it uniform).
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        let after = app.store.snapshot(0, store_now());
+        assert_eq!(
+            after.ok, 1,
+            "forward_once must record_success on 2xx (was the bug: HalfOpen never recovers via fallback)"
+        );
+        assert_eq!(
+            after.budget, 1,
+            "forward_once must spend_budget on 2xx (was the bug: unlimited requests via fallback)"
+        );
+        server.shutdown().await;
+    }
+
     /// FallbackPool loop guard — an A→B→A config (pool_a→pool_b→pool_a), every member
     /// tripped, must TERMINATE via the visited-set and return 503 rather than recursing forever.
     /// This is the safety-critical test for multi-level fallback chains.

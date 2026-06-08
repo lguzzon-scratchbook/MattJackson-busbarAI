@@ -238,37 +238,9 @@ fn attach_bedrock_error_headers(resp: &mut Response, kind: &str) {
             headers.insert(axum::http::HeaderName::from_static("x-amzn-requestid"), hv);
         }
     }
-    let errortype = bedrock_errortype_for(kind);
+    let errortype = crate::proto::error_kind_to_bedrock_type(kind);
     if let Ok(hv) = axum::http::HeaderValue::from_str(errortype) {
         headers.insert(axum::http::HeaderName::from_static("x-amzn-errortype"), hv);
-    }
-}
-
-/// Map a router error `kind` to the AWS Bedrock exception name used for the `x-amzn-errortype`
-/// header. Must stay in lock-step with the bedrock writer's body `__type`
-/// (`error_kind_to_bedrock_type` in `proto::bedrock`) so the header and the JSON body agree — the
-/// bedrock module is private to `proto`, so the mapping is mirrored here for the only `kind` values
-/// this router actually emits (`permission_error`/`insufficient_quota`/`rate_limit_error`/
-/// `not_found_error`/`invalid_request_error`), with the same generic `ValidationException` fallback.
-fn bedrock_errortype_for(kind: &str) -> &'static str {
-    match kind {
-        "invalid_request_error" | "invalid_request" | "validation" | "bad_request" => {
-            "ValidationException"
-        }
-        "rate_limit_error" | "rate_limit" | "too_many_requests" | "throttling" => {
-            "ThrottlingException"
-        }
-        "authentication_error" | "permission_error" | "auth" | "forbidden" | "unauthorized" => {
-            "AccessDeniedException"
-        }
-        "not_found" | "not_found_error" | "model_not_found" => "ResourceNotFoundException",
-        "timeout" | "model_timeout" => "ModelTimeoutException",
-        "overloaded_error" | "service_unavailable" | "unavailable" => "ServiceUnavailableException",
-        "quota_exceeded" | "service_quota_exceeded" | "insufficient_quota" => {
-            "ServiceQuotaExceededException"
-        }
-        "api_error" | "internal_error" | "server_error" => "InternalServerException",
-        _ => "ValidationException",
     }
 }
 
@@ -395,7 +367,10 @@ async fn ingress_path_model(
             // JSON array rather than SSE. The shim is stripped before the upstream call
             // (`forward::strip_router_shim_keys`); cross-protocol egress drops it via the IR.
             if gemini_json_array {
-                obj.insert("__busbar_gemini_json_array".to_string(), Value::Bool(true));
+                obj.insert(
+                    crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY.to_string(),
+                    Value::Bool(true),
+                );
             }
         }
         None => {
@@ -759,11 +734,21 @@ pub(crate) async fn named(
         return finish(&app, &gov, "anthropic", &name, started, resp);
     }
 
-    ingress_error(
+    // Model/pool miss: wrap the 404 in `finish` so it is still counted in REQUESTS_TOTAL /
+    // REQUEST_DURATION_SECONDS and fires the request-log webhook — the same observability invariant
+    // already enforced for governance rejections (a raw early-return made the miss invisible).
+    finish(
+        &app,
+        &gov,
         "anthropic",
-        StatusCode::NOT_FOUND,
-        "not_found_error",
-        &format!("router: '{name}' is not a known model or pool"),
+        &name,
+        started,
+        ingress_error(
+            "anthropic",
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("router: '{name}' is not a known model or pool"),
+        ),
     )
 }
 
@@ -797,20 +782,37 @@ pub(crate) async fn adhoc(
             .await;
             finish(&app, &gov, "anthropic", &model, started, resp)
         }
-        Some(&i) => ingress_error(
+        // Provider mismatch / model miss: wrap the 4xx in `finish` so the client error is counted
+        // in REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fires the request-log webhook, matching
+        // the success arm and the governance-rejection path (a raw early-return made it invisible).
+        Some(&i) => finish(
+            &app,
+            &gov,
             "anthropic",
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &format!(
-                "router: model '{}' is on provider '{}', not '{}'",
-                model, app.lanes[i].provider, provider
+            &model,
+            started,
+            ingress_error(
+                "anthropic",
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!(
+                    "router: model '{}' is on provider '{}', not '{}'",
+                    model, app.lanes[i].provider, provider
+                ),
             ),
         ),
-        None => ingress_error(
+        None => finish(
+            &app,
+            &gov,
             "anthropic",
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            &format!("router: unknown model '{model}'"),
+            &model,
+            started,
+            ingress_error(
+                "anthropic",
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                &format!("router: unknown model '{model}'"),
+            ),
         ),
     }
 }
@@ -1831,6 +1833,255 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Round-4 HIGH/correctness: a MID-STREAM transport failure on a gemini `:streamGenerateContent`
+    /// request WITHOUT `?alt=sse` (the JSON-array framer is engaged) must terminate the body as a
+    /// VALID JSON array — a trailing gemini-shaped error element + closing `]` — NOT raw SSE
+    /// `event:`/`data:` text spliced into the array (the bug: `mid_stream_error_bytes` bypassed the
+    /// framer, yielding an unparseable body and a protocol tell). Routes gemini→openai with
+    /// `SseTransportError` so the upstream drops the connection after the first frame, driving
+    /// `FirstByteBody`'s `Poll::Ready(Some(Err))` arm while `json_array` is active.
+    #[tokio::test]
+    async fn test_gemini_json_array_mid_stream_error_closes_array_no_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::SseTransportError {
+            ok_events: vec![r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string()],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/foo:streamGenerateContent"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({ "contents": [{"role": "user", "parts": [{"text": "hello"}]}] }).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "stream starts 2xx");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "JSON-array framed; got {ct}"
+        );
+        let body = resp.text().await.unwrap();
+        // The whole body must still be a VALID JSON array (closing `]` present).
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!("mid-stream-error JSON-array body must still parse as JSON; got {body:?} ({e})")
+        });
+        let arr = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("body must be a JSON array; got {body:?}"));
+        // No SSE framing anywhere — a native gemini JSON-array stream never contains `event:`/`data:`.
+        assert!(
+            !body.contains("event:") && !body.contains("data:"),
+            "JSON-array error body must NOT contain SSE text; got {body:?}"
+        );
+        // The trailing element is the gemini-shaped `google.rpc.Status` error.
+        assert!(
+            arr.iter()
+                .any(|el| el.get("error").and_then(|e| e.get("status")).is_some()),
+            "array must carry a trailing gemini error element; got {body:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Round-4 HIGH/conformance: the router-internal `__busbar_gemini_json_array` shim (and `stream`)
+    /// must NEVER reach a CROSS-protocol backend. Routes gemini `:streamGenerateContent` (no
+    /// `?alt=sse`) → an OpenAI backend and asserts the upstream-received body carries neither key (the
+    /// bug: the gemini reader swept both into IR `extra` and the egress writer re-emitted the
+    /// router fingerprint onto the foreign backend).
+    #[tokio::test]
+    async fn test_gemini_json_array_shim_not_leaked_cross_protocol() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/foo:streamGenerateContent"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({ "contents": [{"role": "user", "parts": [{"text": "hello"}]}] }).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        // Drain the body so the upstream request fully completes and its body is recorded.
+        let _ = resp.bytes().await.unwrap();
+
+        let upstream = state
+            .get_last_request_body()
+            .expect("upstream received a body");
+        let upstream_v: serde_json::Value =
+            serde_json::from_slice(&upstream).expect("upstream body is JSON");
+        assert!(
+            upstream_v.get("__busbar_gemini_json_array").is_none(),
+            "router shim key must not leak to a foreign backend; got {upstream_v}"
+        );
+        assert!(
+            upstream_v.get("stream").is_none(),
+            "router-injected `stream` must not leak to a foreign backend; got {upstream_v}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Round-4 HIGH/conformance: a CROSS-protocol stream to an Anthropic-SDK client must emit a FULL
+    /// `message_start` skeleton — `id` (msg_-prefixed), `type:"message"`, `content:[]`,
+    /// `stop_reason`/`stop_sequence` (null) — not the degenerate `{role,usage}` the
+    /// `has_identity`-gated writer produced once `StreamTranslate` stripped the foreign id/model.
+    /// Routes openai→anthropic and inspects the first `message_start` SSE frame.
+    #[tokio::test]
+    async fn test_anthropic_cross_protocol_message_start_full_skeleton() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        // Anthropic ingress → OpenAI backend (cross-protocol): StreamTranslate reframes the upstream
+        // OpenAI SSE into Anthropic SSE via the writer's `write_response_event`.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/foo/v1/messages"))
+            .bearer_auth("t")
+            .body(
+                json!({ "model": "foo", "stream": true, "messages": [], "max_tokens": 16 })
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.text().await.unwrap();
+        // Extract the `message_start` event's `data:` JSON.
+        let ms_data = body
+            .split("\n\n")
+            .find(|f| f.contains("event: message_start"))
+            .and_then(|f| f.lines().find(|l| l.starts_with("data: ")))
+            .map(|l| l.trim_start_matches("data: ").to_string())
+            .unwrap_or_else(|| panic!("no message_start event in stream; got {body:?}"));
+        let ev: serde_json::Value =
+            serde_json::from_str(&ms_data).expect("message_start data parses");
+        let msg = ev.get("message").expect("message object");
+        assert!(
+            msg.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .starts_with("msg_"),
+            "message_start.message.id must be a synthesized msg_ id; got {msg}"
+        );
+        assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("message"));
+        assert!(
+            msg.get("content").and_then(|c| c.as_array()).is_some(),
+            "content[] must be present; got {msg}"
+        );
+        assert!(
+            msg.get("stop_reason").map(|v| v.is_null()).unwrap_or(false),
+            "stop_reason must be present (null); got {msg}"
+        );
+        assert!(
+            msg.get("stop_sequence")
+                .map(|v| v.is_null())
+                .unwrap_or(false),
+            "stop_sequence must be present (null); got {msg}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Round-4 HIGH/conformance: a CROSS-protocol passthrough 401 must be RESHAPED into the ingress
+    /// protocol's native error envelope, not relayed verbatim from the egress provider. Anthropic
+    /// ingress → OpenAI backend that 401s in Passthrough mode: the client must see the Anthropic error
+    /// shape (`{"type":"error","error":{"type":...}}`), not the OpenAI `{"error":{...}}` shape.
+    #[tokio::test]
+    async fn test_passthrough_401_cross_protocol_reshaped_to_ingress() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Auth {
+            status: StatusCode::UNAUTHORIZED,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .auth_mode(crate::auth::AuthMode::Passthrough)
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/foo/v1/messages"))
+            .bearer_auth("caller-token")
+            .body(json!({ "model": "foo", "messages": [], "max_tokens": 16 }).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "passthrough 401 status relayed"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Anthropic native error envelope: top-level `type:"error"` and `error.type`.
+        assert_eq!(
+            body.get("type").and_then(|v| v.as_str()),
+            Some("error"),
+            "cross-protocol 401 must be reshaped to the Anthropic error envelope; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("authentication_error"),
+            "401 maps to authentication_error in the ingress envelope; got {body}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// MEDIUM/test-coverage: a Gemini path with NO colon (`/v1beta/models/gemini-flash`) hits the
     /// malformed-path branch and must return a Gemini-shaped 404 (not a 200, not a panic).
     #[tokio::test]
@@ -2164,7 +2415,7 @@ mod tests {
                 .unwrap_or("");
             assert_eq!(hdr, expected, "x-amzn-errortype for kind {kind}");
             assert_eq!(
-                bedrock_errortype_for(kind),
+                crate::proto::error_kind_to_bedrock_type(kind),
                 expected,
                 "header mapping for {kind}"
             );
