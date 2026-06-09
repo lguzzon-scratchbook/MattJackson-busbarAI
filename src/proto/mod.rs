@@ -4022,6 +4022,73 @@ mod stream_translate_tests {
         );
     }
 
+    /// Round-10 HIGH/conformance regression: a CROSS-PROTOCOL tool call streamed to a Gemini client
+    /// must surface as a SINGLE native `functionCall` part `{name, args}` — not a `{name, args:{}}`
+    /// opening frame followed by a separate nameless `{args}` part. An OpenAI backend emits the tool
+    /// NAME on the first tool-call chunk and the arguments as later `arguments` fragments; the IR
+    /// preserves that split (BlockStart{ToolUse{name}} then InputJsonDelta). Before the GeminiWriter
+    /// per-stream buffer, the writer emitted two parts: an empty-args part carrying the name and an
+    /// args part carrying NO name — a shape a native google-genai client never produces (and where a
+    /// strict client reading `function_call.name` off the args part sees an empty string). The
+    /// per-stream buffer re-attaches the name to the args part so exactly one `{name, args}` part is
+    /// written.
+    #[test]
+    fn test_translate_to_gemini_tool_call_single_functioncall_part() {
+        let mut t = StreamTranslate::new("gemini", "openai").expect("gemini ingress translator");
+        let mut out = String::new();
+        for frame in [
+            // role chunk
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            // first tool-call chunk: id + name, no args yet
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\"}}]}}]}\n\n",
+            // argument fragments
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n",
+            // finish
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        out.push_str(&String::from_utf8(t.finish()).unwrap());
+
+        // Collect every `functionCall` part across all emitted Gemini chunks.
+        let payloads = data_payloads(&out);
+        let func_parts: Vec<&serde_json::Value> = payloads
+            .iter()
+            .filter_map(|p| {
+                p.pointer("/candidates/0/content/parts")
+                    .and_then(|parts| parts.as_array())
+            })
+            .flatten()
+            .filter_map(|part| part.get("functionCall"))
+            .collect();
+
+        assert_eq!(
+            func_parts.len(),
+            1,
+            "exactly one native functionCall part expected (no empty-args-then-args split); got:\n{out}"
+        );
+        let func = func_parts[0];
+        assert_eq!(
+            func.pointer("/name").and_then(|n| n.as_str()),
+            Some("get_weather"),
+            "the single functionCall part must carry the name; got:\n{out}"
+        );
+        assert_eq!(
+            func.pointer("/args/city").and_then(|c| c.as_str()),
+            Some("SF"),
+            "the single functionCall part must carry the args; got:\n{out}"
+        );
+        // No nameless functionCall part anywhere (the old split's second part).
+        assert!(
+            !func_parts.iter().any(|f| f
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .is_empty()),
+            "no nameless functionCall part may be emitted; got:\n{out}"
+        );
+    }
+
     /// A CRLF-delimited SSE upstream (`\r\n\r\n` frame terminators — spec-legal, emitted by some
     /// gateways/CDNs) must reassemble and translate correctly. An LF-only scanner would never detect
     /// a terminator and buffer the whole stream until MAX_BUF, then abort — stalling the client.
@@ -5647,8 +5714,9 @@ mod gemini_integration_tests {
     // Gemini's URL embeds the model; non-Gemini protocols keep their fixed path.
     #[test]
     fn test_gemini_upstream_path_for_embeds_model() {
+        let gemini_writer = GeminiWriter;
         assert_eq!(
-            GeminiWriter.upstream_path_for("gemini-1.5-pro"),
+            gemini_writer.upstream_path_for("gemini-1.5-pro"),
             "/v1beta/models/gemini-1.5-pro:generateContent"
         );
         // Default (non-Gemini) ignores the model.

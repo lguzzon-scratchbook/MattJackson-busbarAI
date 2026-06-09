@@ -826,8 +826,68 @@ fn gemini_stream_error_code_status(class: StatusClass) -> (u16, &'static str) {
 }
 
 /// Gemini writer implementation.
-#[derive(Clone)]
-pub(crate) struct GeminiWriter;
+///
+/// Carries one piece of per-stream state: the currently open streaming tool call. A native Gemini
+/// SSE stream emits a tool call as a SINGLE `functionCall` part `{name, args}` per chunk. The IR,
+/// however, carries the tool NAME only on the `BlockStart` (`IrBlockMeta::ToolUse{name}`) and the
+/// arguments only on the following `InputJsonDelta(String)` — so a stateless writer that emits one
+/// IR event at a time produced TWO parts on the wire: a `{name, args:{}}` BlockStart frame followed
+/// by a nameless `{args}` delta frame. A native google-genai client never sees that split (and a
+/// strict client reading `part.function_call.name` off the args-only part sees an empty name). To
+/// emit the native single `{name, args}` shape we buffer the name from the BlockStart here and
+/// re-attach it on the subsequent args delta, emitting nothing on the BlockStart itself.
+///
+/// `StreamTranslate::new` builds a FRESH `Protocol::gemini()` (hence a fresh `GeminiWriter` with an
+/// empty buffer) for each stream, so this state is stream-scoped by construction — exactly the
+/// precedent `ResponsesWriter`'s per-stream `sequence`/`response_id` fields established.
+pub(crate) struct GeminiWriter {
+    /// The currently open streaming tool call, as `(index, name, args_emitted)`:
+    /// - `index` is the IR block index from the opening `BlockStart`, used to match the subsequent
+    ///   `BlockDelta`/`BlockStop` to THIS tool block.
+    /// - `name` is the function name buffered off the `BlockStart` so it can be re-attached to the
+    ///   args delta (producing one native `{name, args}` part).
+    /// - `args_emitted` records whether an args-bearing `functionCall` frame has already been
+    ///   written for this block, so the `BlockStop` arm can flush a `{name, args:{}}` frame for a
+    ///   zero-argument tool call (whose source emitted NO `InputJsonDelta`) without double-emitting
+    ///   the name when args did arrive.
+    ///
+    /// `Mutex` (not `Cell`) so the writer stays `Sync` as the `ProtocolWriter` trait requires; a
+    /// stream is single-threaded at any instant so contention is nil, and a poisoned lock degrades
+    /// to the stateless behavior rather than panicking on the request path.
+    open_tool: std::sync::Mutex<Option<(usize, String, bool)>>,
+}
+
+/// Value-namespace constructor for [`GeminiWriter`]. A `const` and a struct may share a name (they
+/// live in the value and type namespaces respectively), so every existing site that writes the bare
+/// `GeminiWriter` literal — `Protocol::gemini()` and the tests — keeps compiling unchanged while the
+/// type now carries per-stream state. Each USE of the const inlines a FRESH `GeminiWriter` with an
+/// empty `open_tool` buffer, so every `Protocol::gemini()` call mints an independent buffer — the
+/// per-stream scoping the single-frame functionCall fix needs. `Mutex::new`/`None` are const, so
+/// this is valid in const context.
+///
+/// `clippy::declare_interior_mutable_const` warns that a `const` with interior mutability is inlined
+/// per use rather than shared. That per-use fresh instance is PRECISELY the semantics we need: a
+/// `static` would share ONE buffer across every stream in the process, bleeding one stream's open
+/// tool name into another. So the lint's suggestion is wrong for this site and is suppressed
+/// deliberately — mirroring `ResponsesWriter`.
+#[allow(non_upper_case_globals)]
+#[allow(clippy::declare_interior_mutable_const)]
+pub(crate) const GeminiWriter: GeminiWriter = GeminiWriter {
+    open_tool: std::sync::Mutex::new(None),
+};
+
+impl Clone for GeminiWriter {
+    fn clone(&self) -> Self {
+        // Preserve the in-flight open tool call across a mid-stream `Protocol::clone` so the
+        // functionCall name/args correlation survives; a poisoned lock degrades to an empty buffer
+        // (stateless behavior) rather than panicking on the request path.
+        GeminiWriter {
+            open_tool: std::sync::Mutex::new(
+                self.open_tool.lock().map(|t| t.clone()).unwrap_or(None),
+            ),
+        }
+    }
+}
 
 impl ProtocolWriter for GeminiWriter {
     fn upstream_path(&self) -> &str {
@@ -1144,31 +1204,30 @@ impl ProtocolWriter for GeminiWriter {
                 Some(("".to_string(), serde_json::Value::Object(frame)))
             }
 
-            // BlockStart → for a tool block, emit a `functionCall` frame carrying the tool NAME.
-            // The IR carries the tool name only on BlockStart (IrBlockMeta::ToolUse{name}); the
-            // arguments arrive on the following InputJsonDelta(s). Mirroring the OpenAI writer,
-            // we split the Gemini frame the same way: name here, args on the delta. Dropping this
-            // frame (as before) silently lost the function name, producing an unusable tool call.
-            // Text blocks have no Gemini block-start frame (inline parts), so → None.
-            IrStreamEvent::BlockStart { block, .. } => match block {
-                crate::ir::IrBlockMeta::ToolUse { name, .. } => Some((
-                    "".to_string(),
-                    serde_json::json!({
-                        "candidates": [{
-                            "content": {
-                                "role": "model",
-                                "parts": [{"functionCall": {"name": name, "args": {}}}]
-                            }
-                        }]
-                    }),
-                )),
+            // BlockStart → for a tool block, BUFFER the tool name and emit NO frame. A native Gemini
+            // SSE stream carries a tool call as a SINGLE `functionCall` part `{name, args}`; the IR
+            // carries the name here and the arguments on the following InputJsonDelta. Emitting a
+            // `{name, args:{}}` frame here (as before) plus a nameless `{args}` delta frame produced
+            // TWO parts on the wire — a split a native google-genai client never sees, and one where
+            // a strict client reading `part.function_call.name` off the args-only part sees an empty
+            // name. Instead we stash `(index, name)` and re-attach the name on the args delta so a
+            // single native `{name, args}` part is written. The BlockStop arm flushes a
+            // `{name, args:{}}` frame if NO delta ever arrives (a zero-argument tool call), so the
+            // call is never lost. Text blocks have no Gemini block-start frame (inline parts) → None.
+            IrStreamEvent::BlockStart { index, block } => match block {
+                crate::ir::IrBlockMeta::ToolUse { name, .. } => {
+                    if let Ok(mut guard) = self.open_tool.lock() {
+                        *guard = Some((*index, name.clone(), false));
+                    }
+                    None
+                }
                 crate::ir::IrBlockMeta::Text
                 | crate::ir::IrBlockMeta::Thinking
                 | crate::ir::IrBlockMeta::Image => None,
             },
 
             // TextDelta → chunk with text part
-            IrStreamEvent::BlockDelta { index: _, delta } => match delta {
+            IrStreamEvent::BlockDelta { index, delta } => match delta {
                 crate::ir::IrDelta::TextDelta(text) => Some((
                     "".to_string(),
                     serde_json::json!({
@@ -1181,19 +1240,37 @@ impl ProtocolWriter for GeminiWriter {
                     }),
                 )),
 
-                // InputJsonDelta → functionCall with args (best-effort, parse JSON string). The
-                // function NAME is emitted on the preceding BlockStart frame (above); the Gemini
-                // client merges the parts within `candidates[].content.parts`.
+                // InputJsonDelta → a SINGLE native `functionCall` part `{name, args}`. The name was
+                // buffered by the preceding tool BlockStart (above); re-attaching it here is what
+                // makes the wire frame match a native Gemini chunk, instead of the nameless
+                // `{args}` part this arm emitted before (which a strict google-genai client reads as
+                // an empty `function_call.name`). `args` is the best-effort JSON parse of the IR
+                // arg-string fragment. We mark the buffer `args_emitted` so the BlockStop arm does
+                // not also flush an empty-args frame for this same call.
                 crate::ir::IrDelta::InputJsonDelta(json_str) => {
                     let args: serde_json::Value =
                         serde_json::from_str(json_str).unwrap_or(serde_json::json!({}));
+                    // Recover the buffered name for THIS block. If the buffer is absent/poisoned or
+                    // tracks a different index (no matching tool BlockStart was seen), fall back to
+                    // an empty name — the same degraded value the stateless arm produced — rather
+                    // than panicking on the request path.
+                    let name = match self.open_tool.lock() {
+                        Ok(mut guard) => match guard.as_mut() {
+                            Some((idx, name, args_emitted)) if idx == index => {
+                                *args_emitted = true;
+                                name.clone()
+                            }
+                            _ => String::new(),
+                        },
+                        Err(_) => String::new(),
+                    };
                     Some((
                         "".to_string(),
                         serde_json::json!({
                             "candidates": [{
                                 "content": {
                                     "role": "model",
-                                    "parts": [{"functionCall": {"args": args}}]
+                                    "parts": [{"functionCall": {"name": name, "args": args}}]
                                 }
                             }]
                         }),
@@ -1206,8 +1283,38 @@ impl ProtocolWriter for GeminiWriter {
                 }
             },
 
-            // BlockStop → None (no frame; stateless)
-            IrStreamEvent::BlockStop { .. } => None,
+            // BlockStop → for a tool block that closed WITHOUT any args delta (a zero-argument tool
+            // call: the source emitted BlockStart then BlockStop with no InputJsonDelta), flush the
+            // single native `{name, args:{}}` part now so the call is not lost. When args DID arrive
+            // the delta arm already emitted the `{name, args}` part and set `args_emitted`, so this
+            // arm emits nothing. Either way the buffer is cleared for the next tool block. A
+            // poisoned lock degrades to no frame rather than panicking on the request path.
+            IrStreamEvent::BlockStop { index } => {
+                let flush_name = match self.open_tool.lock() {
+                    Ok(mut guard) => match guard.as_ref() {
+                        Some((idx, name, args_emitted)) if idx == index => {
+                            let name = (!*args_emitted).then(|| name.clone());
+                            *guard = None;
+                            name
+                        }
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
+                flush_name.map(|name| {
+                    (
+                        "".to_string(),
+                        serde_json::json!({
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"functionCall": {"name": name, "args": {}}}]
+                                }
+                            }]
+                        }),
+                    )
+                })
+            }
 
             // MessageDelta → chunk with finishReason + usageMetadata
             IrStreamEvent::MessageDelta {
@@ -1607,11 +1714,11 @@ mod tests {
         }
     }
 
-    /// Regression: the Gemini writer must NOT drop the tool name. The name is carried on the
-    /// BlockStart frame (mirroring the OpenAI writer); previously BlockStart returned None and the
-    /// InputJsonDelta frame emitted `"name": ""`, losing the function name entirely.
+    /// Regression: the tool BlockStart now BUFFERS the name and emits NO frame; a native Gemini
+    /// stream carries a tool call as a single `functionCall` part, so the name must NOT appear in a
+    /// separate opening frame (that produced a two-part split a native client never sees).
     #[test]
-    fn test_writer_tool_blockstart_carries_name() {
+    fn test_writer_tool_blockstart_emits_no_frame() {
         let writer = GeminiWriter;
         let ev = IrStreamEvent::BlockStart {
             index: 1,
@@ -1620,14 +1727,10 @@ mod tests {
                 name: "get_weather".to_string(),
             },
         };
-        let (_, chunk) = writer
-            .write_response_event(&ev)
-            .expect("tool BlockStart must emit a functionCall frame carrying the name");
-
-        let name = chunk
-            .pointer("/candidates/0/content/parts/0/functionCall/name")
-            .and_then(|n| n.as_str());
-        assert_eq!(name, Some("get_weather"), "frame: {chunk}");
+        assert!(
+            writer.write_response_event(&ev).is_none(),
+            "tool BlockStart must buffer the name and emit no separate frame"
+        );
     }
 
     /// The text BlockStart still produces no frame (Gemini inlines text parts).
@@ -1641,25 +1744,101 @@ mod tests {
         assert!(writer.write_response_event(&ev).is_none());
     }
 
-    /// The InputJsonDelta frame carries args (and no longer asserts an empty name).
+    /// Regression: a tool BlockStart followed by an InputJsonDelta emits ONE native `functionCall`
+    /// part carrying BOTH the buffered name and the args — not a nameless `{args}` part. Before the
+    /// per-stream buffer the delta arm emitted `{args}` with no name, which a strict google-genai
+    /// client reads as an empty `function_call.name`.
     #[test]
-    fn test_writer_input_json_delta_carries_args() {
+    fn test_writer_tool_call_emits_single_name_and_args_part() {
         let writer = GeminiWriter;
-        let ev = IrStreamEvent::BlockDelta {
+        // Open the tool block: buffers the name, emits nothing.
+        assert!(writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::ToolUse {
+                    id: String::new(),
+                    name: "get_weather".to_string(),
+                },
+            })
+            .is_none());
+        // Args delta: emits the single `{name, args}` part.
+        let (_, chunk) = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: IrDelta::InputJsonDelta("{\"city\":\"SF\"}".to_string()),
+            })
+            .expect("args frame");
+        let func = chunk
+            .pointer("/candidates/0/content/parts/0/functionCall")
+            .expect("functionCall part");
+        assert_eq!(
+            func.pointer("/name").and_then(|n| n.as_str()),
+            Some("get_weather"),
+            "args frame must carry the buffered name: {chunk}"
+        );
+        assert_eq!(
+            func.pointer("/args/city").and_then(|c| c.as_str()),
+            Some("SF"),
+            "args frame must carry the args: {chunk}"
+        );
+        // No second (nameless) part — exactly one part on the wire.
+        assert!(
+            chunk.pointer("/candidates/0/content/parts/1").is_none(),
+            "tool call must emit exactly one part: {chunk}"
+        );
+    }
+
+    /// Regression: a zero-argument tool call (BlockStart then BlockStop with NO InputJsonDelta) must
+    /// still emit one `{name, args:{}}` part on the BlockStop flush — the call is never lost.
+    #[test]
+    fn test_writer_tool_call_empty_args_flushed_on_stop() {
+        let writer = GeminiWriter;
+        assert!(writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::ToolUse {
+                    id: String::new(),
+                    name: "ping".to_string(),
+                },
+            })
+            .is_none());
+        let (_, chunk) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
+            .expect("zero-arg tool call must flush a functionCall frame on BlockStop");
+        let func = chunk
+            .pointer("/candidates/0/content/parts/0/functionCall")
+            .expect("functionCall part");
+        assert_eq!(
+            func.pointer("/name").and_then(|n| n.as_str()),
+            Some("ping"),
+            "flushed frame must carry the name: {chunk}"
+        );
+        assert!(
+            func.get("args").map(|a| a.is_object()).unwrap_or(false),
+            "flushed frame must carry an (empty) args object: {chunk}"
+        );
+    }
+
+    /// Regression: when args DID arrive, the BlockStop must NOT emit a second (duplicate) frame.
+    #[test]
+    fn test_writer_tool_call_no_double_emit_on_stop() {
+        let writer = GeminiWriter;
+        writer.write_response_event(&IrStreamEvent::BlockStart {
+            index: 1,
+            block: IrBlockMeta::ToolUse {
+                id: String::new(),
+                name: "get_weather".to_string(),
+            },
+        });
+        writer.write_response_event(&IrStreamEvent::BlockDelta {
             index: 1,
             delta: IrDelta::InputJsonDelta("{\"city\":\"SF\"}".to_string()),
-        };
-        let (_, chunk) = writer.write_response_event(&ev).expect("args frame");
-        let city = chunk
-            .pointer("/candidates/0/content/parts/0/functionCall/args/city")
-            .and_then(|c| c.as_str());
-        assert_eq!(city, Some("SF"), "frame: {chunk}");
-        // The args frame must NOT carry an empty/placeholder name.
+        });
         assert!(
-            chunk
-                .pointer("/candidates/0/content/parts/0/functionCall/name")
+            writer
+                .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
                 .is_none(),
-            "args frame must not carry a name field: {chunk}"
+            "BlockStop must not re-emit a frame once args were emitted"
         );
     }
 
@@ -1999,7 +2178,8 @@ mod tests {
             "a native request carries no stream in extra: {:?}",
             ir.extra
         );
-        let wire = GeminiWriter.write_request(&ir);
+        let writer = GeminiWriter;
+        let wire = writer.write_request(&ir);
         assert!(
             wire.get("stream").is_none(),
             "stream intent must not be serialised into the body: {wire}"
@@ -2460,7 +2640,8 @@ mod tests {
             "a source `stream` is preserved in extra for round-trip identity (like model): {:?}",
             ir.extra
         );
-        let wire = GeminiWriter.write_request(&ir);
+        let writer = GeminiWriter;
+        let wire = writer.write_request(&ir);
         assert_eq!(
             wire.get("stream"),
             Some(&serde_json::json!(true)),
@@ -2484,7 +2665,8 @@ mod tests {
             "native request carries no stream in extra: {:?}",
             ir.extra
         );
-        let wire = GeminiWriter.write_request(&ir);
+        let writer = GeminiWriter;
+        let wire = writer.write_request(&ir);
         assert!(
             wire.get("stream").is_none(),
             "stream intent must not be synthesized onto a native body: {wire}"
@@ -2544,7 +2726,8 @@ mod tests {
             "native toolConfig must round-trip through extra: {:?}",
             ir.extra
         );
-        let wire = GeminiWriter.write_request(&ir);
+        let writer = GeminiWriter;
+        let wire = writer.write_request(&ir);
         assert_eq!(
             wire.get("toolConfig"),
             Some(&tool_config),
