@@ -183,7 +183,10 @@ impl ProtocolReader for GeminiReader {
                     .and_then(|r| r.as_str())
                     .unwrap_or("");
                 let role = match role_str {
-                    "user" => crate::ir::IrRole::User,
+                    // Gemini's Content.role is optional; an absent/empty role is an
+                    // implicit user turn per the GenerateContentRequest schema and the
+                    // official SDK. Match the streaming reader's leniency (line ~467).
+                    "user" | "" => crate::ir::IrRole::User,
                     "model" => crate::ir::IrRole::Assistant,
                     _ => {
                         return Err(IrError {
@@ -2000,6 +2003,61 @@ mod tests {
         assert!(
             wire.get("stream").is_none(),
             "stream intent must not be serialised into the body: {wire}"
+        );
+    }
+
+    /// Regression: Gemini's `Content.role` is OPTIONAL. A single-turn request that omits `role`
+    /// (a common native shape, accepted by the real API and the official SDK as an implicit user
+    /// turn) must NOT be hard-rejected. Previously `read_request` mapped any non-`user`/`model`
+    /// role (including absent/empty) to a `ClientError`, 400ing a request the real API serves —
+    /// and diverging from the streaming reader, which already treats an empty role as a model turn.
+    #[test]
+    fn test_read_request_absent_role_defaults_to_user() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"parts": [{"text": "hi"}]}]
+        });
+        let ir = reader
+            .read_request(&body)
+            .expect("a role-less content must be accepted as a user turn, not rejected");
+        assert_eq!(ir.messages.len(), 1, "one message expected: {ir:?}");
+        assert_eq!(
+            ir.messages[0].role,
+            crate::ir::IrRole::User,
+            "an absent role must default to user: {ir:?}"
+        );
+    }
+
+    /// An explicitly EMPTY role string (`"role": ""`) is likewise treated as a user turn, matching
+    /// the absent-role case and the streaming reader's `role_val.is_empty()` leniency.
+    #[test]
+    fn test_read_request_empty_role_defaults_to_user() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"role": "", "parts": [{"text": "hi"}]}]
+        });
+        let ir = reader
+            .read_request(&body)
+            .expect("an empty role must be accepted as a user turn, not rejected");
+        assert_eq!(
+            ir.messages[0].role,
+            crate::ir::IrRole::User,
+            "an empty role must default to user: {ir:?}"
+        );
+    }
+
+    /// A genuinely unexpected NON-EMPTY role string is still a hard client error — the leniency is
+    /// scoped to the absent/empty case (the real API's optional-role default), not to arbitrary
+    /// role values.
+    #[test]
+    fn test_read_request_unknown_nonempty_role_still_rejected() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"role": "function", "parts": [{"text": "hi"}]}]
+        });
+        assert!(
+            reader.read_request(&body).is_err(),
+            "an unexpected non-empty role must still be rejected"
         );
     }
 

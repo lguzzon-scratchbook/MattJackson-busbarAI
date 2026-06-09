@@ -6,6 +6,19 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Largest wire `output_index` we accept in a streaming Responses event before clamping. The
+/// Responses API, like Chat Completions, documents at most 128 parallel output items, so any larger
+/// index is malformed; clamp it to this value (the highest valid 0-based index, 127) before the
+/// `usize` cast so a crafted `u64::MAX` index can never participate in unbounded set growth or
+/// index arithmetic. Mirrors `openai.rs::MAX_TOOL_INDEX`.
+const MAX_OUTPUT_INDEX: usize = 127;
+
+/// Hard cap on the number of DISTINCT output indices tracked per stream in `StreamDecodeState`
+/// (`open_tools`) and in the writer's open-item sets. Bounds per-request memory against a
+/// pathological backend that emits a unique `output_index` per event (a per-connection amplification
+/// DoS). Matches `openai.rs::MAX_OPEN_TOOLS` (OpenAI's documented parallel-tool-call limit, 128).
+const MAX_OPEN_TOOLS: usize = 128;
+
 /// Monotonic per-process counter mixed into synthesized response ids so two responses minted in
 /// the same wall-clock second still get distinct `resp_` ids. Paired with the unix timestamp this
 /// gives a collision-free id without pulling in a UUID/random crate (no new dependency).
@@ -554,18 +567,30 @@ impl ProtocolReader for ResponsesReader {
                         if let Some(output_index) =
                             data.get("output_index").and_then(|i| i.as_u64())
                         {
-                            let idx = output_index as usize;
+                            // Clamp the wire index before the cast: a crafted `u64::MAX` would
+                            // otherwise feed the per-stream set and downstream index arithmetic
+                            // unbounded. Saturate at MAX_OUTPUT_INDEX (mirrors openai.rs).
+                            let idx = (output_index as usize).min(MAX_OUTPUT_INDEX);
                             // Record the open tool index so the terminal `output_item.done` for
                             // this index closes the block EXACTLY once. Native Responses emits a
                             // single `output_item.done` per function-call item, so unlike text
                             // (which also gets a `content_part.done`) a tool index is closed by one
                             // event — tracking it here keeps the open/close pair balanced and lets
                             // the done arm distinguish a real open block from a duplicate close.
-                            state.open_tools.insert(idx);
-                            out.push(IrStreamEvent::BlockStart {
-                                index: idx,
-                                block: crate::ir::IrBlockMeta::ToolUse { id: call_id, name },
-                            });
+                            //
+                            // Cap the distinct-index cardinality: a backend emitting a unique
+                            // `output_index` per event must not grow `open_tools` without bound
+                            // (a per-connection amplification DoS). Only open a new block when the
+                            // index is already tracked or there is room under the cap; beyond it the
+                            // event is silently skipped (no BlockStart), matching openai.rs.
+                            let already_open = state.open_tools.contains(&idx);
+                            if already_open || state.open_tools.len() < MAX_OPEN_TOOLS {
+                                state.open_tools.insert(idx);
+                                out.push(IrStreamEvent::BlockStart {
+                                    index: idx,
+                                    block: crate::ir::IrBlockMeta::ToolUse { id: call_id, name },
+                                });
+                            }
                         }
                     } else if item_obj.get("type").and_then(|t| t.as_str()) == Some("message") {
                     }
@@ -587,7 +612,7 @@ impl ProtocolReader for ResponsesReader {
                     let idx = data
                         .get("output_index")
                         .and_then(|i| i.as_u64())
-                        .map_or(0, |v| v as usize);
+                        .map_or(0, |v| (v as usize).min(MAX_OUTPUT_INDEX));
                     if !state.text_block_open {
                         state.text_block_open = true;
                         out.push(IrStreamEvent::BlockStart {
@@ -611,7 +636,7 @@ impl ProtocolReader for ResponsesReader {
                 if !delta.is_empty() {
                     if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
                         out.push(IrStreamEvent::BlockDelta {
-                            index: output_index as usize,
+                            index: (output_index as usize).min(MAX_OUTPUT_INDEX),
                             delta: crate::ir::IrDelta::InputJsonDelta(delta),
                         });
                     }
@@ -620,7 +645,7 @@ impl ProtocolReader for ResponsesReader {
 
             "response.output_item.done" | "response.content_part.done" => {
                 if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
-                    let idx = output_index as usize;
+                    let idx = (output_index as usize).min(MAX_OUTPUT_INDEX);
                     // Native Responses closes a single text item with TWO terminal frames at the
                     // SAME `output_index`: `content_part.done` (the text content part) immediately
                     // followed by `output_item.done` (the enclosing message item). Emitting a
@@ -980,6 +1005,17 @@ pub(crate) struct ResponsesWriter {
     /// `AtomicU64` (not `Cell`) so the writer stays `Sync` as the `ProtocolWriter` trait requires;
     /// the stream is single-threaded at any instant, so `Relaxed` ordering is sufficient.
     sequence: AtomicU64,
+    /// Per-stream `response.id`. Captured on the opening `MessageStart` (the synthesized-or-
+    /// forwarded id written into `response.created`) and replayed verbatim onto EVERY subsequent
+    /// lifecycle event (`response.completed`/`response.incomplete`/`response.failed`). A native
+    /// OpenAI Responses stream carries the SAME `id` on every event; the official SDK reads
+    /// `event.response.id` on the terminal event to finalize and correlate the `Response`. Before
+    /// this cell existed, `MessageDelta`/`Error` each minted a FRESH `resp_` id, so on any
+    /// cross-protocol stream (where the IR strips identity) the terminal event's id differed from
+    /// `response.created` — an SDK-breaking correctness failure and a hard distinguishability tell.
+    /// Per-stream INSTANCE state for the same reason as `sequence` (see the type doc); a poisoned
+    /// lock degrades to the synthesize-fresh fallback rather than panicking on the request path.
+    response_id: std::sync::Mutex<Option<String>>,
     /// Output indices for which this writer emitted a function-call `output_item.added`. The IR
     /// `BlockStop` carries only the integer index (no block kind), but a native Responses stream
     /// emits `output_item.done` ONLY for items it previously `added` — and the Text `BlockStart`
@@ -991,6 +1027,17 @@ pub(crate) struct ResponsesWriter {
     /// the same reason as `sequence` (see the type doc); `Relaxed`-equivalent `Mutex` access is
     /// fine since a stream is single-threaded at any instant and the writer must stay `Sync`.
     open_tool_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    /// Output indices for which this writer opened a TEXT message item (emitted
+    /// `output_item.added` type "message" + `content_part.added`). A native /v1/responses stream
+    /// ALWAYS brackets a text part with the full lifecycle
+    /// `output_item.added(message) → content_part.added → output_text.delta* → output_text.done →
+    /// content_part.done → output_item.done`; the official SDK builds `response.output[]` from the
+    /// added/done pair, so a stream of orphan `output_text.delta` frames leaves the assembled
+    /// Response with an empty output array. The IR `BlockStop` carries only the index, so track the
+    /// open text indices here (the same way `open_tool_indices` tracks tool items) so the matching
+    /// BlockStop emits the text terminal frames for THIS index only. Per-stream INSTANCE state for
+    /// the same reason as the other fields; a poisoned lock degrades safely.
+    open_text_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
 }
 
 /// Value-namespace constructor for [`ResponsesWriter`]. A `const` and a struct may share a name
@@ -1010,7 +1057,9 @@ pub(crate) struct ResponsesWriter {
 #[allow(clippy::declare_interior_mutable_const)]
 pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     sequence: AtomicU64::new(0),
+    response_id: std::sync::Mutex::new(None),
     open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+    open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
 };
 
 impl Clone for ResponsesWriter {
@@ -1022,8 +1071,17 @@ impl Clone for ResponsesWriter {
         // panicking on the request path.
         ResponsesWriter {
             sequence: AtomicU64::new(self.sequence.load(Ordering::Relaxed)),
+            response_id: std::sync::Mutex::new(
+                self.response_id.lock().map(|id| id.clone()).unwrap_or(None),
+            ),
             open_tool_indices: std::sync::Mutex::new(
                 self.open_tool_indices
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
+            ),
+            open_text_indices: std::sync::Mutex::new(
+                self.open_text_indices
                     .lock()
                     .map(|set| set.clone())
                     .unwrap_or_default(),
@@ -1043,6 +1101,31 @@ impl ResponsesWriter {
         if let Ok(mut set) = self.open_tool_indices.lock() {
             set.clear();
         }
+        if let Ok(mut set) = self.open_text_indices.lock() {
+            set.clear();
+        }
+        // Clear the carried `response.id` alongside the sequence counter: a reused/cloned writer
+        // must not leak a previous stream's id onto a new stream's terminal events. The new id is
+        // stored when this stream's `MessageStart` is written.
+        if let Ok(mut id) = self.response_id.lock() {
+            *id = None;
+        }
+    }
+
+    /// Store the per-stream `response.id` captured on `MessageStart` so terminal events replay it
+    /// verbatim. Lock poisoning degrades to a no-op (the terminal arm then synthesizes a fresh id)
+    /// rather than panicking on the request path.
+    fn set_response_id(&self, id: &str) {
+        if let Ok(mut slot) = self.response_id.lock() {
+            *slot = Some(id.to_string());
+        }
+    }
+
+    /// Return the per-stream `response.id` captured on `MessageStart`, or `None` if it was never
+    /// set (a malformed stream whose terminal event preceded `MessageStart`, or a poisoned lock).
+    /// The caller falls back to synthesizing a fresh id in that case.
+    fn carried_response_id(&self) -> Option<String> {
+        self.response_id.lock().ok().and_then(|id| id.clone())
     }
 
     /// Return the next `sequence_number` for this stream and advance the counter. The first call
@@ -1067,6 +1150,38 @@ impl ResponsesWriter {
     /// panicking on the request path.
     fn take_tool_open(&self, index: usize) -> bool {
         self.open_tool_indices
+            .lock()
+            .map(|mut set| set.remove(&index))
+            .unwrap_or(false)
+    }
+
+    /// Mark a TEXT message item open at `index` IF it is not already open and there is room under
+    /// the cardinality cap, returning true when this call performed the open (so the caller emits
+    /// the opening `output_item.added`/`content_part.added` frames exactly once). Returns false if
+    /// the index was already open (a subsequent text delta — no re-open) or the cap is reached
+    /// (skip the frames; bounds per-stream memory against a pathological backend). Lock poisoning
+    /// degrades to false. Mirrors the cardinality discipline of the reader's `open_tools` cap.
+    fn open_text_item(&self, index: usize) -> bool {
+        self.open_text_indices
+            .lock()
+            .map(|mut set| {
+                if set.contains(&index) {
+                    return false;
+                }
+                if set.len() >= MAX_OPEN_TOOLS {
+                    return false;
+                }
+                set.insert(index);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Return true and forget `index` if a TEXT message item was open at it (so the matching
+    /// `BlockStop` emits the text terminal frames for THIS index only). Returns false for a
+    /// non-text index. Lock poisoning degrades to false.
+    fn take_text_open(&self, index: usize) -> bool {
+        self.open_text_indices
             .lock()
             .map(|mut set| set.remove(&index))
             .unwrap_or(false)
@@ -1301,6 +1416,9 @@ impl ProtocolWriter for ResponsesWriter {
                 // `translate_event` strips these to None) so the event stays SDK-valid.
                 let mut resp_obj = serde_json::Map::new();
                 let id = id.clone().unwrap_or_else(synthesize_response_id);
+                // Carry this stream's id forward so the terminal events (and any failure) replay
+                // the SAME `response.id` — a native stream never changes its id mid-flight.
+                self.set_response_id(&id);
                 let created_at = created.unwrap_or_else(now_unix_secs);
                 resp_obj.insert("id".to_string(), serde_json::json!(id));
                 resp_obj.insert("object".to_string(), serde_json::json!("response"));
@@ -1325,7 +1443,41 @@ impl ProtocolWriter for ResponsesWriter {
             }
 
             IrStreamEvent::BlockStart { index, block } => match block {
-                crate::ir::IrBlockMeta::Text => None,
+                crate::ir::IrBlockMeta::Text => {
+                    // A native /v1/responses stream brackets a text part inside a `message` output
+                    // item: `output_item.added(message)` opens it, the `output_text.delta`s carry
+                    // the body, and `output_item.done(message)` closes it. The official SDK builds
+                    // `response.output[]` from the added/done pair, so without an enclosing item the
+                    // assembled Response has an empty output array even though deltas streamed.
+                    // Previously the Text BlockStart returned None, leaving the deltas orphaned.
+                    //
+                    // The `ProtocolWriter` trait emits at most ONE wire frame per IR event, so the
+                    // intermediate `content_part.added` sub-frame (which would need a second frame
+                    // for this single BlockStart) cannot be produced here; the message item's
+                    // `output_item.added`/`.done` pair is the load-bearing lifecycle the SDK reads
+                    // to materialize the assistant message, and the deltas already carry
+                    // `content_index: 0`. Track the open text index (capped) so the matching
+                    // BlockStop emits `output_item.done` for THIS index only.
+                    if !self.open_text_item(*index) {
+                        return None;
+                    }
+                    let item_id = synthesize_item_id("msg", *index);
+                    Some((
+                        "response.output_item.added".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_item.added",
+                            "output_index": index,
+                            "item_id": item_id,
+                            "item": {
+                                "type": "message",
+                                "id": item_id,
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": []
+                            }
+                        }),
+                    ))
+                }
                 crate::ir::IrBlockMeta::ToolUse { id, name } => {
                     // `item_id` (a stable per-output-item id, `fc_…` for a function-call item) is
                     // carried on the native `output_item.added`/`.done` pair so a client correlates the
@@ -1401,30 +1553,58 @@ impl ProtocolWriter for ResponsesWriter {
                 // function call, both of which break a typed Responses SDK and are deterministic
                 // distinguishability tells.
                 //
-                // So consult the per-stream open-tool set: emit `output_item.done` for a
-                // function-call index only (consuming the marker), and emit NOTHING for a text (or
-                // any non-tool) index.
-                if !self.take_tool_open(*index) {
-                    return None;
+                // So consult the per-stream open sets: a function-call index closes with an
+                // `output_item.done` typed "function_call"; a text index (opened by the Text
+                // BlockStart with `output_item.added` typed "message") closes with an
+                // `output_item.done` typed "message"; any other (never-opened) index emits NOTHING.
+                //
+                // NOTE: this arm must YIELD its `Option` as the match value (never `return` it), so
+                // the closing `emitted.map(...)` tail injects the top-level `sequence_number` every
+                // native Responses event carries — an early `return Some(..)` would skip it.
+                if self.take_tool_open(*index) {
+                    // Native `response.output_item.done` carries the SAME stable `item_id` as the
+                    // matching `output_item.added` (so a client correlates the `added → done`
+                    // lifecycle) plus the finalized `item` object (a typed SDK reads `event.item`).
+                    // The function-call `output_item.added` used `synthesize_item_id("fc", index)`,
+                    // so the same deterministic id reconstructs the matching pair here.
+                    let item_id = synthesize_item_id("fc", *index);
+                    Some((
+                        "response.output_item.done".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "output_index": index,
+                            "item_id": item_id,
+                            "item": {
+                                "type": "function_call",
+                                "id": item_id,
+                            },
+                        }),
+                    ))
+                } else if self.take_text_open(*index) {
+                    // Close the message item opened by the Text BlockStart. The same deterministic
+                    // `msg_…` id (also carried on every `output_text.delta`) reconstructs the
+                    // matching `added → done` pair the SDK uses to finalize `response.output[]`.
+                    let item_id = synthesize_item_id("msg", *index);
+                    Some((
+                        "response.output_item.done".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "output_index": index,
+                            "item_id": item_id,
+                            "item": {
+                                "type": "message",
+                                "id": item_id,
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": []
+                            }
+                        }),
+                    ))
+                } else {
+                    // Nothing open at this index (e.g. a repeated BlockStop, or an index whose
+                    // BlockStart was suppressed by the cardinality cap): emit no frame.
+                    None
                 }
-                // Native `response.output_item.done` carries the SAME stable `item_id` as the
-                // matching `output_item.added` (so a client correlates the `added → done`
-                // lifecycle) plus the finalized `item` object (a typed SDK reads `event.item`). The
-                // function-call `output_item.added` used `synthesize_item_id("fc", index)`, so the
-                // same deterministic id reconstructs the matching pair here.
-                let item_id = synthesize_item_id("fc", *index);
-                Some((
-                    "response.output_item.done".to_string(),
-                    serde_json::json!({
-                        "type": "response.output_item.done",
-                        "output_index": index,
-                        "item_id": item_id,
-                        "item": {
-                            "type": "function_call",
-                            "id": item_id,
-                        },
-                    }),
-                ))
             }
 
             IrStreamEvent::MessageDelta {
@@ -1451,14 +1631,18 @@ impl ProtocolWriter for ResponsesWriter {
                 // terminal event to finalize the `Response`, and strict typed decoders raise on a
                 // missing `id`/`created_at`. A real OpenAI stream never sends a terminal event
                 // without an `id`, so omitting it is also a distinguishability tell. The IR
-                // `MessageDelta` carries no identity, so synthesize a protocol-correct `resp_` id
-                // and the current unix time — consistent with the `Error` arm below (which already
-                // synthesizes a `resp_` id for `response.failed`) and the non-stream
-                // `write_response`.
-                resp_obj.insert(
-                    "id".to_string(),
-                    serde_json::json!(synthesize_response_id()),
-                );
+                // `MessageDelta` carries no identity, so REPLAY the id captured on this stream's
+                // opening `MessageStart` (stored in `response_id`) so `response.completed`/
+                // `response.incomplete` carries the SAME `id` as `response.created` — a native
+                // stream never changes its id mid-flight, and the SDK reads `event.response.id` on
+                // the terminal event to finalize the `Response`. Only if the cell is unexpectedly
+                // empty (a malformed stream whose terminal event preceded `MessageStart`, or a
+                // poisoned lock) do we fall back to synthesizing a fresh id so the event stays
+                // structurally valid.
+                let response_id = self
+                    .carried_response_id()
+                    .unwrap_or_else(synthesize_response_id);
+                resp_obj.insert("id".to_string(), serde_json::json!(response_id));
                 resp_obj.insert("object".to_string(), serde_json::json!("response"));
                 resp_obj.insert("created_at".to_string(), serde_json::json!(now_unix_secs()));
                 resp_obj.insert("status".to_string(), serde_json::json!(status));
@@ -1526,12 +1710,19 @@ impl ProtocolWriter for ResponsesWriter {
                     .provider_signal
                     .clone()
                     .unwrap_or_else(|| "server_error".to_string());
+                // Replay the stream's captured `response.id` so `response.failed` correlates with
+                // the opening `response.created` (the SDK reads `event.response.id` on the failure
+                // event); fall back to a fresh id only if the cell is empty (failure before any
+                // `MessageStart`, or a poisoned lock).
+                let response_id = self
+                    .carried_response_id()
+                    .unwrap_or_else(synthesize_response_id);
                 Some((
                     "response.failed".to_string(),
                     serde_json::json!({
                         "type": "response.failed",
                         "response": {
-                            "id": synthesize_response_id(),
+                            "id": response_id,
                             "object": "response",
                             "status": "failed",
                             "error": {
@@ -3780,10 +3971,15 @@ mod tests {
     /// `output_item.done` (with `type:"function_call"`, as a prior revision did) would be an
     /// unmatched lifecycle event AND mis-type a text response as a function call — both break a
     /// typed Responses SDK and are distinguishability tells.
+    /// Regression (HIGH/conformance, Round 10): a TEXT part must be bracketed inside a `message`
+    /// output item. The Text BlockStart emits `response.output_item.added` (type "message") and the
+    /// Text BlockStop emits the matching `response.output_item.done` (type "message") carrying the
+    /// SAME `msg_…` `item_id`. Previously the text BlockStart returned None and the BlockStop
+    /// returned None, leaving the `output_text.delta`s orphaned with no parent item — so a typed SDK
+    /// never materialized the assistant message in `response.output[]`.
     #[test]
-    fn test_text_block_stop_emits_no_output_item_done() {
+    fn test_text_block_emits_message_item_lifecycle() {
         let writer = ResponsesWriter;
-        // Open a stream and a text part (text BlockStart emits no body, then a text delta).
         let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
             role: crate::ir::IrRole::Assistant,
             usage: None,
@@ -3791,34 +3987,54 @@ mod tests {
             created: None,
             model: None,
         });
-        assert!(
-            writer
-                .write_response_event(&IrStreamEvent::BlockStart {
-                    index: 0,
-                    block: crate::ir::IrBlockMeta::Text,
-                })
-                .is_none(),
-            "text BlockStart emits no body"
-        );
+        // Text BlockStart now opens a message item.
+        let (added_et, added) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text,
+            })
+            .expect("text BlockStart opens a message item");
+        assert_eq!(added_et, "response.output_item.added");
+        assert_eq!(added["item"]["type"], "message");
+        assert_eq!(added["item"]["role"], "assistant");
+        let added_item_id = added["item_id"]
+            .as_str()
+            .expect("item_id present")
+            .to_string();
+        assert!(added_item_id.starts_with("msg_"), "text item id is msg_…");
+
         let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
             index: 0,
             delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
         });
-        // The text BlockStop must emit nothing — no phantom output_item.done.
+
+        // Text BlockStop now closes the message item with a matching done.
+        let (done_et, done) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("text BlockStop closes the message item");
+        assert_eq!(done_et, "response.output_item.done");
+        assert_eq!(done["item"]["type"], "message");
+        assert_eq!(
+            done["item_id"].as_str(),
+            Some(added_item_id.as_str()),
+            "done item_id matches the added item_id (added→done correlation)"
+        );
+
+        // A SECOND BlockStop at the (already-closed) text index must NOT re-emit a done.
         assert!(
             writer
                 .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
                 .is_none(),
-            "a text block's BlockStop must not emit output_item.done"
+            "a repeated BlockStop for a closed text index must not re-emit output_item.done"
         );
     }
 
-    /// Regression (HIGH): an interleaved tool+text stream must close ONLY the tool index with an
-    /// `output_item.done`. The tool BlockStop emits a `function_call` done; the text BlockStop emits
-    /// nothing. Exercises the per-stream open-tool-index tracking so a text index is never mistaken
-    /// for a function-call item.
+    /// Regression (HIGH): an interleaved tool+text stream closes the tool index with a
+    /// `function_call` done and the text index with a `message` done — each with its own typed
+    /// item, never cross-typed. Exercises the per-stream open-index tracking so a text index is
+    /// never mistaken for a function-call item and vice-versa.
     #[test]
-    fn test_tool_block_stop_emits_done_text_does_not() {
+    fn test_tool_and_text_block_stop_emit_correctly_typed_done() {
         let writer = ResponsesWriter;
         let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
             role: crate::ir::IrRole::Assistant,
@@ -3837,22 +4053,28 @@ mod tests {
                 },
             })
             .expect("tool added emits");
+        let _ = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 1,
+                block: crate::ir::IrBlockMeta::Text,
+            })
+            .expect("text added emits");
         let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
             index: 1,
             delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
         });
-        // Tool index closes with a done.
-        let (etype, _) = writer
+        // Tool index closes with a function_call done.
+        let (etype, tool_done) = writer
             .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
             .expect("tool BlockStop emits output_item.done");
         assert_eq!(etype, "response.output_item.done");
-        // Text index closes with nothing.
-        assert!(
-            writer
-                .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
-                .is_none(),
-            "text BlockStop must not emit output_item.done"
-        );
+        assert_eq!(tool_done["item"]["type"], "function_call");
+        // Text index closes with a message done.
+        let (text_et, text_done) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
+            .expect("text BlockStop emits output_item.done (message)");
+        assert_eq!(text_et, "response.output_item.done");
+        assert_eq!(text_done["item"]["type"], "message");
         // A SECOND BlockStop at the (already-closed) tool index 0 must not emit a duplicate done.
         assert!(
             writer
@@ -4008,6 +4230,227 @@ mod tests {
         assert!(
             second.is_empty(),
             "a closed tool index must not re-emit BlockStop, got {second:?}"
+        );
+    }
+
+    /// Regression (CRITICAL/conformance + HIGH/correctness, Round 10): every lifecycle event in ONE
+    /// stream must carry the SAME `response.id`. On a cross-protocol stream the IR strips identity
+    /// (id == None), so `response.created` synthesizes a `resp_` id which MUST be replayed verbatim
+    /// on `response.completed`. Before the per-stream `response_id` cell, `MessageDelta` minted a
+    /// fresh id, so the terminal event's id differed from `response.created` — SDK-breaking.
+    #[test]
+    fn test_terminal_id_matches_created_id_cross_protocol() {
+        let writer = ResponsesWriter;
+        // Cross-protocol: id is None, so response.created synthesizes one.
+        let (_, created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            })
+            .expect("MessageStart emits response.created");
+        let created_id = created["response"]["id"]
+            .as_str()
+            .expect("created carries id")
+            .to_string();
+        assert!(created_id.starts_with("resp_"));
+
+        let (etype, completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("MessageDelta emits terminal");
+        assert_eq!(etype, "response.completed");
+        assert_eq!(
+            completed["response"]["id"].as_str(),
+            Some(created_id.as_str()),
+            "response.completed.id must equal response.created.id (same stream, same id)"
+        );
+    }
+
+    /// Regression (HIGH/correctness, Round 10): a `response.failed` (from an IR Error) must carry
+    /// the SAME `response.id` as the opening `response.created`, so an SDK correlates the failure
+    /// with the in-flight Response. Before the carried-id cell, the Error arm synthesized a fresh
+    /// id distinct from `response.created`.
+    #[test]
+    fn test_failed_id_matches_created_id_cross_protocol() {
+        let writer = ResponsesWriter;
+        let (_, created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            })
+            .expect("MessageStart emits response.created");
+        let created_id = created["response"]["id"].as_str().unwrap().to_string();
+
+        let (etype, failed) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            }))
+            .expect("Error emits response.failed");
+        assert_eq!(etype, "response.failed");
+        assert_eq!(
+            failed["response"]["id"].as_str(),
+            Some(created_id.as_str()),
+            "response.failed.id must equal response.created.id"
+        );
+    }
+
+    /// Regression (HIGH/correctness, Round 10): a same-protocol passthrough forwards the upstream
+    /// `id` on `response.created`, and that SAME id must be replayed on the terminal event.
+    #[test]
+    fn test_terminal_id_matches_forwarded_created_id() {
+        let writer = ResponsesWriter;
+        let (_, created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: Some("resp_upstream123".to_string()),
+                created: Some(42),
+                model: None,
+            })
+            .expect("emit");
+        assert_eq!(created["response"]["id"].as_str(), Some("resp_upstream123"));
+        let (_, completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("emit");
+        assert_eq!(
+            completed["response"]["id"].as_str(),
+            Some("resp_upstream123"),
+            "terminal event must replay the forwarded upstream id"
+        );
+    }
+
+    /// Regression (HIGH/correctness, Round 10): a fresh stream's `response.created` REPLACES the
+    /// carried id, so a reused/cloned writer never leaks the previous stream's id onto a new
+    /// stream's terminal event. (`reset_sequence_number` clears the cell; `MessageStart` sets it.)
+    #[test]
+    fn test_carried_id_resets_per_stream() {
+        let writer = ResponsesWriter;
+        // Stream A.
+        let (_, a_created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: Some("resp_A".to_string()),
+                created: None,
+                model: None,
+            })
+            .expect("emit");
+        assert_eq!(a_created["response"]["id"].as_str(), Some("resp_A"));
+        // Stream B begins on the same writer instance.
+        let (_, b_created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: Some("resp_B".to_string()),
+                created: None,
+                model: None,
+            })
+            .expect("emit");
+        assert_eq!(b_created["response"]["id"].as_str(), Some("resp_B"));
+        let (_, b_completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("emit");
+        assert_eq!(
+            b_completed["response"]["id"].as_str(),
+            Some("resp_B"),
+            "stream B's terminal id must be B's, not A's leaked id"
+        );
+    }
+
+    /// Regression (HIGH/security, Round 10): a backend that emits a `response.output_item.added`
+    /// for each of many unique `output_index` values must NOT grow `state.open_tools` without
+    /// bound. After feeding more than MAX_OPEN_TOOLS distinct indices, the tracked set is capped.
+    #[test]
+    fn test_reader_open_tools_is_capped() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        for i in 0..(MAX_OPEN_TOOLS as u64 + 200) {
+            let _ = reader_read_response_events(
+                "response.output_item.added",
+                &serde_json::json!({
+                    "output_index": i,
+                    "item": {"type":"function_call","call_id":"fc","name":"f"}
+                }),
+                &mut state,
+            );
+        }
+        assert!(
+            state.open_tools.len() <= MAX_OPEN_TOOLS,
+            "open_tools must be capped at MAX_OPEN_TOOLS, got {}",
+            state.open_tools.len()
+        );
+    }
+
+    /// Regression (HIGH/security, Round 10): a crafted huge `output_index` must be clamped to
+    /// MAX_OUTPUT_INDEX before the usize cast/insert, so the tracked index never exceeds the cap and
+    /// downstream index arithmetic stays bounded.
+    #[test]
+    fn test_reader_output_index_clamped() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let out = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": u64::MAX,
+                "item": {"type":"function_call","call_id":"fc","name":"f"}
+            }),
+            &mut state,
+        );
+        match out.first() {
+            Some(crate::ir::IrStreamEvent::BlockStart { index, .. }) => {
+                assert_eq!(*index, MAX_OUTPUT_INDEX, "u64::MAX index must clamp to cap");
+            }
+            other => panic!("expected a clamped BlockStart, got {other:?}"),
+        }
+        assert!(state.open_tools.contains(&MAX_OUTPUT_INDEX));
+        assert!(!state.open_tools.iter().any(|&i| i > MAX_OUTPUT_INDEX));
+    }
+
+    /// Regression (HIGH/security, Round 10): the writer's open-text-index set is also capped so a
+    /// pathological stream of unique text BlockStarts cannot grow per-stream writer memory without
+    /// bound.
+    #[test]
+    fn test_writer_open_text_indices_capped() {
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let mut opened = 0usize;
+        for i in 0..(MAX_OPEN_TOOLS + 200) {
+            if writer
+                .write_response_event(&IrStreamEvent::BlockStart {
+                    index: i,
+                    block: crate::ir::IrBlockMeta::Text,
+                })
+                .is_some()
+            {
+                opened += 1;
+            }
+        }
+        assert!(
+            opened <= MAX_OPEN_TOOLS,
+            "writer must open at most MAX_OPEN_TOOLS text items, opened {opened}"
         );
     }
 }

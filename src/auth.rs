@@ -1723,6 +1723,95 @@ mod tests {
         handle.abort();
     }
 
+    /// Regression for the admin-surface carrier-separation invariant (HIGH/authz-boundary) promised
+    /// by the comment at the top of the `is_admin` branch: the `/admin` operator surface is guarded
+    /// ONLY by `Authorization: Bearer` and `x-admin-token` — NOT by the vendor-SDK client-token
+    /// carriers (`x-api-key` / `x-goog-api-key`) that `extract_client_token` also reads. A future
+    /// DRY refactor unifying admin extraction onto `extract_client_token` would let the operator
+    /// admin token be presented via the carriers every native vendor SDK populates, turning any
+    /// leaked/observed client header into operator-surface (key create/delete) access. This pins the
+    /// boundary: the CORRECT admin secret presented via `x-api-key` or `x-goog-api-key` MUST 401,
+    /// while the two sanctioned admin carriers MUST authorize.
+    #[tokio::test]
+    async fn test_admin_token_not_acceptable_via_vendor_carriers() {
+        use crate::governance::{GovState, SqliteStore};
+        use crate::test_support::TestApp;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/keys");
+
+        // The admin secret presented via the vendor-SDK carriers MUST be rejected: these carriers are
+        // the client-token surface, NOT the operator surface. Exercise BOTH carriers, on BOTH the
+        // GET (list) and POST (create) admin verbs, since the admin auth branch is verb-agnostic.
+        for carrier in ["x-api-key", "x-goog-api-key"] {
+            let r_get = client
+                .get(&url)
+                .header(carrier, "admintok")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r_get.status().as_u16(),
+                401,
+                "admin secret via {carrier} (GET) must NOT reach the admin surface, got {}",
+                r_get.status()
+            );
+
+            let r_post = client
+                .post(&url)
+                .header(carrier, "admintok")
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r_post.status().as_u16(),
+                401,
+                "admin secret via {carrier} (POST) must NOT reach the admin surface, got {}",
+                r_post.status()
+            );
+        }
+
+        // The two sanctioned admin carriers MUST authorize (proving the 401s above are carrier
+        // separation, not a blanket reject).
+        let r_bearer = client
+            .get(&url)
+            .bearer_auth("admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_bearer.status().as_u16(),
+            401,
+            "Authorization: Bearer admintok must authorize the admin surface, got {}",
+            r_bearer.status()
+        );
+        let r_hdr = client
+            .get(&url)
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_hdr.status().as_u16(),
+            401,
+            "x-admin-token: admintok must authorize the admin surface, got {}",
+            r_hdr.status()
+        );
+
+        handle.abort();
+    }
+
     /// End-to-end through the real router + `auth_middleware` in GOVERNANCE mode, exercising the
     /// non-`Authorization` carriers (`x-goog-api-key`, `x-api-key`) into the virtual-key lookup.
     /// The existing governance test only uses `Authorization: Bearer`, and the multi-carrier test

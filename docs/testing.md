@@ -28,11 +28,22 @@ of time by pushing onto a shared `MockServerState`:
   `pop` per request), plus the **last seen** auth header and request body for
   assertions (`get_last_auth_header`, `get_last_request_body`).
 - **`MockResponse`** variants model upstream behaviors: `Ok { status, body }`,
-  `RateLimit { status, provider_signal }`, `Billing { status, code, message }`,
-  `Auth { status }`, `ServerError { status, body }`, and
+  `RateLimit { status, provider_signal, retry_after }` (`retry_after:
+  Option<u64>` emits a `Retry-After: <n>` header in whole seconds when set),
+  `Billing { status, code, message }`, `Auth { status }`,
+  `ServerError { status, body }`,
   `Sse { events, abort_at_index }` (the `abort_at_index` simulates a mid-stream
   upstream abort — it sends N events then an SSE `error` frame with no `[DONE]`,
-  exercising the after-first-byte path).
+  exercising the after-first-byte path),
+  `SseTransportError { ok_events }` (emits the `ok_events` real SSE frames then
+  makes the body stream yield an `Err`, a true mid-stream **transport** failure
+  that exercises `FirstByteBody`'s `Err` arm rather than a clean SSE `error`
+  text frame), and
+  `EventStream { frames, amzn_request_id }` (a native AWS binary
+  `application/vnd.amazon.eventstream` body as a real Bedrock ConverseStream
+  backend emits — `frames` is the ordered `(event_type, json_payload)` sequence
+  encoded via `eventstream::encode_frame`, and `amzn_request_id` is served as
+  the `x-amzn-RequestId` header for testing same-protocol Bedrock passthrough).
 
 ```rust
 let state = Arc::new(MockServerState::new());
@@ -155,6 +166,16 @@ Patterns this enables:
 - **Streaming + after-first-byte** — push `MockResponse::Sse { abort_at_index:
   Some(n) }`; assert the client gets the first n events then an SSE `error` frame
   (no failover) and the breaker records the fault.
+- **Mid-stream transport error** — push `MockResponse::SseTransportError {
+  ok_events }`; the body yields the real frames then an `Err`, exercising the
+  after-first-byte mid-stream error path (`FirstByteBody`'s `Err` arm), which
+  appends the ingress protocol's native mid-stream error frame after the
+  already-sent frames.
+- **Bedrock ConverseStream passthrough** — push `MockResponse::EventStream {
+  frames, amzn_request_id }` with a Bedrock-protocol lane and a Bedrock ingress;
+  assert the same-protocol path relays the binary event-stream verbatim,
+  preserves the `application/vnd.amazon.eventstream` content type, and forwards
+  the upstream `x-amzn-RequestId` rather than synthesizing a fresh one.
 - **on_exhausted** — populate `on_exhausted_cfgs` with `LeastBad` /
   `FallbackPool(..)` and pre-trip all members; assert the configured behavior
   (and loop-guarding for fallback chains).

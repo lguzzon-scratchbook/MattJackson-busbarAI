@@ -900,6 +900,42 @@ fn write_tool(tool: &crate::ir::IrTool) -> serde_json::Value {
 #[derive(Clone)]
 pub(crate) struct AnthropicWriter;
 
+/// Which native credential scheme a credential maps to. Anthropic accepts exactly one scheme per
+/// request, and a native client presents exactly one: an API-key client sends `x-api-key` and no
+/// `authorization`; an OAuth client sends `authorization: Bearer` and no `x-api-key`. Emitting
+/// both (the same secret duplicated across two schemes) is a request shape no native client
+/// produces — a structural upstream-distinguishability tell — so we classify and emit one.
+#[derive(Debug, PartialEq, Eq)]
+enum AnthropicCredScheme {
+    /// Canonical Anthropic API key (`sk-ant-api...`): `x-api-key` only.
+    ApiKey,
+    /// OAuth access token (`sk-ant-oat...`): `authorization: Bearer` only.
+    OAuth,
+    /// Shape not recognizable as either Anthropic credential family. busbar cannot tell from the
+    /// credential alone whether this is a static API key or a passthrough Bearer token (the mode
+    /// is known to forward.rs but not plumbed into this trait method), so it conservatively emits
+    /// BOTH headers — preserving the passthrough Bearer round-trip for an opaque caller token
+    /// while still presenting `x-api-key` for a non-canonical static key. Real Anthropic
+    /// credentials always match `ApiKey`/`OAuth`, so the dual-header fallback never fires for
+    /// genuine API-key or OAuth traffic — the path the distinguishability finding is about.
+    Ambiguous,
+}
+
+impl AnthropicWriter {
+    /// Classify `key` into its native credential scheme by prefix. Matches on the trimmed key so
+    /// surrounding whitespace (a likely config artifact) doesn't misclassify a credential.
+    fn classify_credential(key: &str) -> AnthropicCredScheme {
+        let k = key.trim_start();
+        if k.starts_with("sk-ant-api") {
+            AnthropicCredScheme::ApiKey
+        } else if k.starts_with("sk-ant-oat") {
+            AnthropicCredScheme::OAuth
+        } else {
+            AnthropicCredScheme::Ambiguous
+        }
+    }
+}
+
 impl ProtocolWriter for AnthropicWriter {
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
@@ -910,14 +946,24 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Anthropic authenticates via `x-api-key` (API keys) AND accepts `authorization: Bearer`
-        // (OAuth/short-lived tokens). Both are emitted because this one function serves two modes:
-        //   * static lane key  -> the configured API key,
-        //   * passthrough       -> the *caller's* credential (forward.rs feeds the caller token in
-        //                          as `key`), which callers present as `Authorization: Bearer`.
-        // The passthrough path REQUIRES the `authorization` header to round-trip a caller's Bearer
-        // token to the upstream (see test_support passthrough coverage), so it cannot be dropped
-        // without breaking a stable public path. Both headers carry the same single credential.
+        // Anthropic accepts exactly ONE credential scheme per request, and a native client presents
+        // exactly one: an API-key client sends `x-api-key` and NO `authorization`; an OAuth client
+        // sends `authorization: Bearer <token>` and NO `x-api-key`. Emitting both (the same secret
+        // duplicated across two schemes) is a request shape no native client produces — a structural
+        // upstream-distinguishability tell — and, if upstream ever cross-validates the two headers,
+        // a latent 401 source. So we classify the credential and emit a single scheme.
+        //
+        // This one function serves two modes; the credential family disambiguates the real ones:
+        //   * static lane key -> the configured Anthropic API key (`sk-ant-api...`) -> `x-api-key`,
+        //   * passthrough      -> the *caller's* OAuth access token (`sk-ant-oat...`) ->
+        //                         `authorization: Bearer` (round-trips the caller's token upstream).
+        // `classify_credential` keys on those prefixes. A credential matching neither family is
+        // `Ambiguous`: busbar cannot tell from the credential alone whether it's a static key or a
+        // passthrough Bearer token (the mode lives in forward.rs, not in this trait signature), so
+        // it falls back to BOTH headers to keep the passthrough Bearer path working without
+        // silently dropping a non-canonical static key. Real Anthropic credentials always match
+        // ApiKey/OAuth, so the dual-header fallback never fires for genuine traffic — the path the
+        // distinguishability finding is about. The `anthropic-version` header is common to all.
         //
         // A key with bytes that aren't valid in an HTTP header value (e.g. a stray newline in the
         // env var) yields an empty header rather than panicking the worker — the upstream then
@@ -936,20 +982,32 @@ impl ProtocolWriter for AnthropicWriter {
                 HeaderValue::from_static("")
             })
         };
-        vec![
+        let x_api_key = || {
             (
                 HeaderName::from_static("x-api-key"),
                 safe("x-api-key", key.to_string()),
-            ),
+            )
+        };
+        let authorization = || {
             (
                 HeaderName::from_static("authorization"),
                 safe("authorization", format!("Bearer {key}")),
-            ),
-            (
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static(ANTHROPIC_API_VERSION),
-            ),
-        ]
+            )
+        };
+        let version = (
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static(ANTHROPIC_API_VERSION),
+        );
+        match Self::classify_credential(key) {
+            // Configured Anthropic API key: native API-key client shape — `x-api-key` only.
+            AnthropicCredScheme::ApiKey => vec![x_api_key(), version],
+            // OAuth access token / passthrough Bearer token: native OAuth client shape —
+            // `authorization: Bearer` only.
+            AnthropicCredScheme::OAuth => vec![authorization(), version],
+            // Unrecognized shape: emit both so neither the static-key nor the passthrough path
+            // breaks (see the comment above on why this can't be disambiguated here).
+            AnthropicCredScheme::Ambiguous => vec![x_api_key(), authorization(), version],
+        }
     }
 
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
@@ -1359,48 +1417,148 @@ impl ProtocolWriter for AnthropicWriter {
 mod anthropic_hardening_tests {
     use super::*;
 
-    /// auth_headers carries the canonical x-api-key plus the passthrough-required authorization
-    /// header and the anthropic-version header, each with the configured credential verbatim.
+    fn header_value(headers: &[(HeaderName, HeaderValue)], name: &str) -> Option<String> {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+    }
+
+    /// A configured API key authenticates the native way: `x-api-key` ONLY, with no
+    /// `authorization` header — sending both is the upstream-distinguishability tell we fixed.
+    /// `anthropic-version` is always present.
     #[test]
-    fn auth_headers_emits_x_api_key_authorization_and_version() {
-        let headers = AnthropicWriter.auth_headers("secret-key");
-        let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
+    fn auth_headers_api_key_emits_only_x_api_key() {
+        let headers = AnthropicWriter.auth_headers("sk-ant-api03-secret-key");
 
-        assert!(names.contains(&"x-api-key"), "x-api-key must be present");
-        assert!(
-            names.contains(&"authorization"),
-            "authorization (passthrough Bearer) must be present"
+        assert_eq!(
+            header_value(&headers, "x-api-key").as_deref(),
+            Some("sk-ant-api03-secret-key")
         );
         assert!(
-            names.contains(&"anthropic-version"),
-            "anthropic-version must be present"
+            header_value(&headers, "authorization").is_none(),
+            "an API key must NOT emit an authorization header (native API-key clients never do)"
         );
+        assert_eq!(
+            header_value(&headers, "anthropic-version").as_deref(),
+            Some("2023-06-01")
+        );
+    }
 
-        let value = |name: &str| {
-            headers
-                .iter()
-                .find(|(n, _)| n.as_str() == name)
-                .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
-        };
-        assert_eq!(value("x-api-key").as_deref(), Some("secret-key"));
-        assert_eq!(value("authorization").as_deref(), Some("Bearer secret-key"));
+    /// A credential matching neither Anthropic family (no `sk-ant-api` / `sk-ant-oat` prefix) is
+    /// Ambiguous: busbar can't tell a static key from a passthrough Bearer token here, so it emits
+    /// BOTH headers — preserving both paths. This is the ONLY case where both are sent; real
+    /// Anthropic credentials never land here.
+    #[test]
+    fn auth_headers_unrecognized_credential_emits_both_headers() {
+        let headers = AnthropicWriter.auth_headers("caller-specific-token-abc123");
+
+        assert_eq!(
+            header_value(&headers, "x-api-key").as_deref(),
+            Some("caller-specific-token-abc123")
+        );
+        assert_eq!(
+            header_value(&headers, "authorization").as_deref(),
+            Some("Bearer caller-specific-token-abc123")
+        );
+        assert_eq!(
+            header_value(&headers, "anthropic-version").as_deref(),
+            Some("2023-06-01")
+        );
+    }
+
+    /// classify_credential maps each credential family deterministically; leading whitespace is
+    /// trimmed before matching.
+    #[test]
+    fn classify_credential_covers_each_family() {
+        assert_eq!(
+            AnthropicWriter::classify_credential("sk-ant-api03-key"),
+            AnthropicCredScheme::ApiKey
+        );
+        assert_eq!(
+            AnthropicWriter::classify_credential("sk-ant-oat01-token"),
+            AnthropicCredScheme::OAuth
+        );
+        assert_eq!(
+            AnthropicWriter::classify_credential("opaque-bearer"),
+            AnthropicCredScheme::Ambiguous
+        );
+        // Whitespace must not flip an API key into the Ambiguous (dual-header) bucket.
+        assert_eq!(
+            AnthropicWriter::classify_credential("  sk-ant-api03-key"),
+            AnthropicCredScheme::ApiKey
+        );
+    }
+
+    /// An OAuth/passthrough Bearer token (the `sk-ant-oat` family) authenticates the native way:
+    /// `authorization: Bearer` ONLY, with no `x-api-key`. This preserves the passthrough path that
+    /// round-trips a caller's Bearer token to upstream.
+    #[test]
+    fn auth_headers_oauth_token_emits_only_authorization_bearer() {
+        let headers = AnthropicWriter.auth_headers("sk-ant-oat01-caller-token");
+
+        assert_eq!(
+            header_value(&headers, "authorization").as_deref(),
+            Some("Bearer sk-ant-oat01-caller-token")
+        );
+        assert!(
+            header_value(&headers, "x-api-key").is_none(),
+            "an OAuth token must NOT emit an x-api-key header (native OAuth clients never do)"
+        );
+        assert_eq!(
+            header_value(&headers, "anthropic-version").as_deref(),
+            Some("2023-06-01")
+        );
+    }
+
+    /// Leading whitespace (a likely config artifact) must not cause an OAuth token to be
+    /// misclassified as an API key.
+    #[test]
+    fn auth_headers_oauth_token_classification_trims_leading_whitespace() {
+        let headers = AnthropicWriter.auth_headers("  sk-ant-oat01-caller-token");
+        // The header value itself is the verbatim (untrimmed) credential — only the
+        // classification trims. Round-tripping the caller's exact token is the contract.
+        assert_eq!(
+            header_value(&headers, "authorization").as_deref(),
+            Some("Bearer   sk-ant-oat01-caller-token")
+        );
+        assert!(header_value(&headers, "x-api-key").is_none());
     }
 
     /// A key with bytes invalid for an HTTP header value (e.g. a trailing newline) must not panic
-    /// the worker; both credential headers fall back to empty so the upstream returns a clean 401.
+    /// the worker; the (single) credential header falls back to empty so the upstream returns a
+    /// clean 401. An invalid API key emits only the empty `x-api-key` (no `authorization`).
     #[test]
-    fn auth_headers_invalid_key_falls_back_to_empty_no_panic() {
-        let headers = AnthropicWriter.auth_headers("bad\nkey");
-        let value = |name: &str| {
-            headers
-                .iter()
-                .find(|(n, _)| n.as_str() == name)
-                .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
-        };
-        assert_eq!(value("x-api-key").as_deref(), Some(""));
-        assert_eq!(value("authorization").as_deref(), Some(""));
+    fn auth_headers_invalid_api_key_falls_back_to_empty_no_panic() {
+        // A recognizable API key (so the single-header API-key path is exercised) whose bytes are
+        // invalid for an HTTP header value.
+        let headers = AnthropicWriter.auth_headers("sk-ant-api03-bad\nkey");
+        assert_eq!(header_value(&headers, "x-api-key").as_deref(), Some(""));
+        assert!(
+            header_value(&headers, "authorization").is_none(),
+            "an invalid API key still must not emit an authorization header"
+        );
         // anthropic-version is static and unaffected by the bad key.
-        assert_eq!(value("anthropic-version").as_deref(), Some("2023-06-01"));
+        assert_eq!(
+            header_value(&headers, "anthropic-version").as_deref(),
+            Some("2023-06-01")
+        );
+    }
+
+    /// The same empty-value-no-panic guarantee on the OAuth path: an invalid OAuth token emits
+    /// only the empty `authorization` header (no `x-api-key`).
+    #[test]
+    fn auth_headers_invalid_oauth_token_falls_back_to_empty_no_panic() {
+        let headers = AnthropicWriter.auth_headers("sk-ant-oat01-bad\ntoken");
+        assert_eq!(header_value(&headers, "authorization").as_deref(), Some(""));
+        assert!(
+            header_value(&headers, "x-api-key").is_none(),
+            "an invalid OAuth token still must not emit an x-api-key header"
+        );
+        assert_eq!(
+            header_value(&headers, "anthropic-version").as_deref(),
+            Some("2023-06-01")
+        );
     }
 
     /// extract_error parses the body once and surfaces both provider_code and structured_type.

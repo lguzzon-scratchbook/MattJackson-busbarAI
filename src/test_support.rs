@@ -71,6 +71,21 @@ pub(crate) enum MockResponse {
         frames: Vec<(&'static str, Vec<u8>)>,
         amzn_request_id: &'static str,
     },
+    /// The BINARY-stream twin of `SseTransportError`: a TRUE mid-stream transport failure on a native
+    /// AWS `application/vnd.amazon.eventstream` body. Emits `ok_frames` real CRC-valid binary frames
+    /// (each encoded via `crate::eventstream::encode_frame`), then PAUSES so the proxy reliably reads
+    /// and forwards the first byte to the client (crossing the after-first-byte failover boundary),
+    /// THEN makes the body stream yield an `Err`, aborting the connection mid-binary-body. reqwest
+    /// surfaces this as a transport error to the proxy's `FirstByteBody`, exercising the
+    /// `Poll::Ready(Some(Err))` arm on a SAME-PROTOCOL bedrock→bedrock passthrough (upstream CT is
+    /// `application/vnd.amazon.eventstream`, so `is_sse` is true and `ingress_eventstream` is true).
+    /// The proxy must therefore append a CRC-valid BINARY `:message-type: exception` frame — NOT SSE
+    /// `event:`/`data:` ASCII text spliced into the binary body. `amzn_request_id` is served as the
+    /// `x-amzn-RequestId` header, as a native ConverseStream backend always does.
+    EventStreamTransportError {
+        ok_frames: Vec<(&'static str, Vec<u8>)>,
+        amzn_request_id: &'static str,
+    },
 }
 
 impl Default for MockResponse {
@@ -322,6 +337,40 @@ async fn mock_handler(
                 .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
                 .header("x-amzn-requestid", amzn_request_id)
                 .body(Body::from(bytes))
+                .unwrap()
+        }
+        MockResponse::EventStreamTransportError {
+            ok_frames,
+            amzn_request_id,
+        } => {
+            // Encode each (event_type, payload) into a CRC-valid binary AWS event-stream frame, then
+            // PAUSE and yield a stream `Err` so the connection aborts mid-binary-body — the binary
+            // counterpart of `SseTransportError`. The pause lets the proxy forward the first byte
+            // (crossing the after-first-byte boundary) before the error races in; on fast localhost
+            // an immediate error can otherwise trip pre-first-byte failover (a 503) instead.
+            let frames: Vec<Bytes> = ok_frames
+                .into_iter()
+                .map(|(event_type, payload)| {
+                    Bytes::from(crate::eventstream::encode_frame(event_type, &payload))
+                })
+                .collect();
+            let s = stream::unfold((0usize, frames), |(i, frames)| async move {
+                if i < frames.len() {
+                    let item = Ok::<Bytes, std::io::Error>(frames[i].clone());
+                    Some((item, (i + 1, frames)))
+                } else if i == frames.len() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let item = Err(std::io::Error::other("mid-stream connection drop"));
+                    Some((item, (i + 1, frames)))
+                } else {
+                    None
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                .header("x-amzn-requestid", amzn_request_id)
+                .body(Body::from_stream(s))
                 .unwrap()
         }
     }

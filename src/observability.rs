@@ -196,16 +196,25 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
             match host.parse::<IpAddr>() {
                 Ok(IpAddr::V4(v4)) => is_internal_v4(&v4),
                 Ok(IpAddr::V6(v6)) => {
-                    // Canonicalize an IPv4-mapped address (`::ffff:a.b.c.d`) FIRST and apply the V4
-                    // predicates: otherwise `[::ffff:127.0.0.1]` / `[::ffff:169.254.169.254]` parse as
-                    // V6, match none of the V6 predicates below, and reach loopback / cloud-metadata —
-                    // defeating the guard. `to_ipv4_mapped` only matches true `::ffff:0:0/96` mapped
-                    // addresses (NOT `::1`), so the V6 predicates still cover genuine V6 literals.
-                    if let Some(v4) = v6.to_ipv4_mapped() {
+                    // Catch `::1` FIRST: under `to_ipv4()` (below) loopback `::1` canonicalizes to
+                    // `0.0.0.1`, which is NOT a V4 loopback, so the embedded-V4 arm would miss it —
+                    // `is_loopback()` covers it here.
+                    if v6.is_loopback() {
+                        return true;
+                    }
+                    // Canonicalize an embedded IPv4 address FIRST and apply the V4 predicates:
+                    // otherwise `[::ffff:127.0.0.1]` / `[::169.254.169.254]` parse as V6, match none
+                    // of the V6 predicates below, and reach loopback / cloud-metadata — defeating the
+                    // guard. Use `to_ipv4()` rather than `to_ipv4_mapped()`: it is a SUPERSET that
+                    // ALSO covers the IPv4-COMPATIBLE form (`[::a.b.c.d]`, e.g. `[::127.0.0.1]` /
+                    // `[::169.254.169.254]`), where the leading `segments()[0] == 0` makes the
+                    // ULA/link-local masks below miss and `to_ipv4_mapped()` returns None — yet a
+                    // connecting stack still routes it to the embedded v4 target. This keeps parity
+                    // with `config_validate::ssrf_blocked_host`, which deliberately uses `to_ipv4()`.
+                    if let Some(v4) = v6.to_ipv4() {
                         return is_internal_v4(&v4);
                     }
-                    v6.is_loopback()
-                        || v6.is_unspecified()
+                    v6.is_unspecified()
                         // unique-local (fc00::/7) and link-local (fe80::/10): no stable std
                         // predicate on this toolchain, so check the leading bits directly.
                         || (v6.segments()[0] & 0xfe00) == 0xfc00
@@ -522,6 +531,14 @@ mod tests {
             "https://[::ffff:10.0.0.5]/hook",        // mapped RFC1918
             "https://[::ffff:192.168.1.10]/hook",    // mapped RFC1918
             "https://[::ffff:0.0.0.0]/hook",         // mapped unspecified
+            // IPv4-COMPATIBLE form (`::a.b.c.d`): `to_ipv4_mapped()` returns None for these and the
+            // leading `segments()[0] == 0` makes the ULA/link-local masks miss, so under the old
+            // `to_ipv4_mapped()` canonicalization they fell through to `false` (allowed) — a real
+            // SSRF gap and a broken documented parity with `config_validate::ssrf_blocked_host`.
+            "https://[::127.0.0.1]/log",        // compatible loopback
+            "https://[::169.254.169.254]/meta", // compatible cloud metadata (link-local IMDS)
+            "https://[::10.0.0.5]/hook",        // compatible RFC1918
+            "https://[::1]/log",                // bare loopback must still be caught
         ] {
             let res = validate_webhook_url(Some(bad.to_string()));
             assert!(

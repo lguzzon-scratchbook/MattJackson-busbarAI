@@ -315,8 +315,18 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
 /// governance to manage virtual keys discovers this only at runtime. Mirror the `token` mode with no
 /// `client_tokens` fail-loud pattern and reject it at boot. A disabled governance block carries no
 /// requirement (the admin surface is inert anyway).
+///
+/// `auth` is the deployment's auth block (read separately, like governance, so neither lands on
+/// `RootCfg`). `governance.enabled` combined with `auth.mode=passthrough` is a self-contradictory
+/// deployment: governance requires every request to resolve to an enabled virtual key, which
+/// supersedes passthrough's "accept any caller credential and forward it upstream" intent — so a
+/// server an operator believes is in passthrough silently rejects every caller lacking a virtual
+/// key (a behaviour inversion that could cause a production outage). The auth runtime emits a
+/// one-time warning, but only `resolve`/this validator can see BOTH blocks at boot, so reject the
+/// combination here with a clear diagnostic rather than letting it pass to a runtime warning.
 pub(crate) fn validate_governance(
     governance: &crate::config::GovernanceCfg,
+    auth: Option<&crate::config::AuthCfg>,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     if governance.enabled
@@ -327,6 +337,16 @@ pub(crate) fn validate_governance(
     {
         errors.push(
             "governance.enabled is true but no governance.admin_token is configured; the /admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
+        );
+    }
+    if governance.enabled
+        && auth.is_some_and(|a| {
+            crate::auth::AuthMode::from_config_str(&a.mode)
+                == Some(crate::auth::AuthMode::Passthrough)
+        })
+    {
+        errors.push(
+            "governance.enabled is true together with auth.mode=passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; set auth.mode=token (or omit the auth block) alongside governance.".to_string(),
         );
     }
     if errors.is_empty() {
@@ -382,11 +402,23 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
         return None;
     }
 
-    // Known cloud metadata / internal hostnames (case-insensitive). `localhost` (and its
-    // trailing-dot FQDN form `localhost.`) does NOT parse as an `IpAddr` and is not an alternate
-    // IPv4 encoding, so without listing it here it would slip past every IP-range check below and
-    // a `base_url: https://localhost:11434/` would forward inbound API keys to a loopback service
-    // (e.g. a local Ollama or metadata sidecar) — an SSRF credential-relay. Block both spellings.
+    // Normalize a single trailing FQDN-root dot off the host BEFORE any check below. glibc
+    // getaddrinfo (reqwest's default resolver) treats a trailing dot as a rooted FQDN and still
+    // resolves the literal it precedes — so `https://127.0.0.1./`, `https://169.254.169.254./`,
+    // and `https://10.0.0.1./` connect to exactly the loopback / IMDS / RFC1918 targets the bare
+    // forms do. Without stripping it, an IP-literal+dot does NOT parse as `IpAddr` (so the
+    // loopback/link-local/private arms never fire), is not in `METADATA_HOSTS`, and fails
+    // `is_alternate_ipv4_encoding` (the trailing empty segment makes `all_numeric` false) — an SSRF
+    // credential-relay bypass. Stripping here covers IP literals, alternate encodings, and the
+    // `localhost.` FQDN spelling uniformly (the explicit `localhost.` METADATA_HOSTS entry below is
+    // now redundant but kept as belt-and-suspenders).
+    let host = host.strip_suffix('.').unwrap_or(host);
+
+    // Known cloud metadata / internal hostnames (case-insensitive). `localhost` does NOT parse as
+    // an `IpAddr` and is not an alternate IPv4 encoding, so without listing it here it would slip
+    // past every IP-range check below and a `base_url: https://localhost:11434/` would forward
+    // inbound API keys to a loopback service (e.g. a local Ollama or metadata sidecar) — an SSRF
+    // credential-relay. The trailing-dot `localhost.` spelling is normalized off above.
     const METADATA_HOSTS: &[&str] = &[
         "metadata.google.internal",
         "metadata.internal",
@@ -1261,7 +1293,7 @@ mod tests {
                 price_per_1k_tokens_cents: 0,
                 admin_token: missing.clone(),
             };
-            let errs = validate_governance(&gov)
+            let errs = validate_governance(&gov, None)
                 .expect_err("enabled governance without admin_token must fail");
             assert!(
                 errs.iter().any(|e| e.contains("governance.admin_token")
@@ -1281,7 +1313,7 @@ mod tests {
             admin_token: Some("an-operator-secret".to_string()),
         };
         assert!(
-            validate_governance(&gov).is_ok(),
+            validate_governance(&gov, None).is_ok(),
             "enabled governance WITH an admin_token must validate"
         );
     }
@@ -1297,8 +1329,78 @@ mod tests {
             admin_token: None,
         };
         assert!(
-            validate_governance(&gov).is_ok(),
+            validate_governance(&gov, None).is_ok(),
             "disabled governance carries no admin_token requirement"
+        );
+    }
+
+    #[allow(deprecated)] // constructing AuthCfg with the legacy `_legacy_token` field in test
+    fn auth_cfg(mode: &str) -> config::AuthCfg {
+        config::AuthCfg {
+            mode: mode.to_string(),
+            _legacy_token: None,
+            client_tokens: vec![],
+        }
+    }
+
+    #[test]
+    fn test_validate_governance_rejects_passthrough_combination() {
+        // Regression: governance.enabled + auth.mode=passthrough is a self-contradictory deployment.
+        // Governance supersedes passthrough (every request must resolve to an enabled virtual key),
+        // so an operator who believes they are in passthrough silently rejects every caller lacking
+        // a virtual key — a behaviour inversion that must fail loud at boot, not pass to a runtime
+        // warning. Case-insensitive / whitespace-tolerant, matching AuthMode::from_config_str.
+        for mode in ["passthrough", "  PassThrough "] {
+            let gov = config::GovernanceCfg {
+                enabled: true,
+                db_path: "busbar-governance.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: Some("an-operator-secret".to_string()),
+            };
+            let errs = validate_governance(&gov, Some(&auth_cfg(mode)))
+                .expect_err("governance + passthrough must be rejected at boot");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("auth.mode=passthrough") && e.contains("governance")),
+                "expected a governance+passthrough rejection for mode {mode:?}; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_governance_allows_token_and_none_modes() {
+        // governance + auth.mode=token (or none) is the supported pairing and must NOT be rejected
+        // on the passthrough ground.
+        for mode in ["token", "none"] {
+            let gov = config::GovernanceCfg {
+                enabled: true,
+                db_path: "busbar-governance.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: Some("an-operator-secret".to_string()),
+            };
+            assert!(
+                validate_governance(&gov, Some(&auth_cfg(mode))).is_ok(),
+                "governance + auth.mode={mode} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_governance_passthrough_ignored_when_disabled() {
+        // A DISABLED governance block carries no requirement, so even auth.mode=passthrough is fine
+        // (governance is inert — passthrough semantics apply unchanged).
+        let gov = config::GovernanceCfg {
+            enabled: false,
+            db_path: "busbar-governance.db".to_string(),
+            price_per_request_cents: 1,
+            price_per_1k_tokens_cents: 0,
+            admin_token: None,
+        };
+        assert!(
+            validate_governance(&gov, Some(&auth_cfg("passthrough"))).is_ok(),
+            "disabled governance + passthrough must validate (governance inert)"
         );
     }
 
@@ -1388,6 +1490,14 @@ mod tests {
             "https://10.0.1/",              // short dotted form = 10.0.0.1
             "https://2852039166/",          // decimal int = 169.254.169.254 (IMDS)
             "https://0x0a.0x00.0x00.0x01/", // per-octet hex
+            // Trailing-dot FQDN-root spellings of IP literals. glibc getaddrinfo treats the trailing
+            // dot as a rooted FQDN and still resolves the literal, but an IP+dot does NOT parse as
+            // `IpAddr` and is not in METADATA_HOSTS — without the normalize-trailing-dot step these
+            // slipped past every check (an SSRF credential-relay bypass).
+            "https://127.0.0.1./",        // loopback, trailing dot
+            "https://169.254.169.254./",  // IMDS, trailing dot
+            "https://10.0.0.1./v1",       // RFC1918, trailing dot
+            "https://192.168.1.1.:8443/", // RFC1918 with port, trailing dot
         ] {
             assert!(
                 ssrf_blocked_host(blocked).is_some(),

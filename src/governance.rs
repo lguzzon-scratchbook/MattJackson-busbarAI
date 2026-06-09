@@ -131,6 +131,32 @@ impl GovState {
         self.add_rate_tokens(key_id, now, tokens);
     }
 
+    /// Acquire the `rate` map for writing, recovering from a poisoned lock rather than panicking.
+    ///
+    /// A panic while any holder owns this lock marks it poisoned; a plain `.write().unwrap()` would
+    /// then panic on EVERY subsequent `check_rate`/`add_rate_tokens`, cascading a single transient
+    /// fault into a full governance outage (the project rule is no panic on the request path). The
+    /// `rate` map is best-effort, single-node TPM/RPM accounting — its invariants are re-established
+    /// per call (stale windows are reset in place), so continuing with the recovered guard is safe.
+    fn rate_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, RateState>> {
+        self.rate.write().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Acquire the `by_hash` key cache for reading, recovering from a poisoned lock instead of
+    /// panicking. Mirrors `rate_write`'s rationale for the auth hot path: `lookup` runs per request
+    /// and must never panic, so a poisoned cache (from a panic in some prior `refresh`) is recovered
+    /// rather than propagated. The cache content is a snapshot of the durable store, so the recovered
+    /// guard yields a consistent (if possibly slightly stale) view.
+    fn by_hash_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, VirtualKey>> {
+        self.by_hash.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Acquire the `by_hash` key cache for writing, recovering from a poisoned lock instead of
+    /// panicking (see `by_hash_read`). Used by `refresh` after a management-API mutation.
+    fn by_hash_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, VirtualKey>> {
+        self.by_hash.write().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// the configured admin token (None = admin API disabled).
     pub(crate) fn admin_token(&self) -> Option<&str> {
         self.admin_token.as_deref()
@@ -253,10 +279,10 @@ impl GovState {
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(RATE_SWEEP_INTERVAL)
         {
-            let mut sweep = self.rate.write().unwrap();
+            let mut sweep = self.rate_write();
             sweep.retain(|_, st| st.window_start == window);
         }
-        let mut map = self.rate.write().unwrap();
+        let mut map = self.rate_write();
         // Resolve this key's entry for the CURRENT window. Three cases:
         //  - present & current-window  -> mutate in place (fast path; no key clone).
         //  - present but STALE         -> reset it in place to the current window (counters back to
@@ -312,7 +338,7 @@ impl GovState {
             return;
         }
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
-        let mut map = self.rate.write().unwrap();
+        let mut map = self.rate_write();
         if let Some(st) = map.get_mut(key_id) {
             if st.window_start == window {
                 // Entry is for the window this response belongs to -> credit it.
@@ -426,7 +452,7 @@ impl GovState {
     /// Resolve a presented secret to its virtual key (cache lookup; secret hashed, never compared raw).
     pub(crate) fn lookup(&self, secret: &str) -> Option<VirtualKey> {
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
-        self.by_hash.read().unwrap().get(&hash).cloned()
+        self.by_hash_read().get(&hash).cloned()
     }
 
     /// Direct handle to the backing store, for tests that seed/inspect persistence.
@@ -438,7 +464,7 @@ impl GovState {
     /// Reload the cache from the store (after a management-API mutation,).
     pub(crate) fn refresh(&self) -> StoreResult<()> {
         let fresh = Self::load(self.store.as_ref())?;
-        *self.by_hash.write().unwrap() = fresh;
+        *self.by_hash_write() = fresh;
         Ok(())
     }
 }
@@ -1092,7 +1118,11 @@ mod tests {
             k.tpm_limit = None;
             assert!(gov.check_rate(&k, w0).is_ok());
         }
-        assert_eq!(gov.rate.read().unwrap().len(), 10, "10 W0 entries present");
+        assert_eq!(
+            gov.rate.read().unwrap_or_else(|p| p.into_inner()).len(),
+            10,
+            "10 W0 entries present"
+        );
 
         // Force the next call to run the eager sweep (ticker at a multiple of the interval).
         gov.rate_sweep_ticker.store(0, Ordering::Relaxed);
@@ -1102,7 +1132,7 @@ mod tests {
         let w_later = w0 + RATE_WINDOW_SECS * 2;
         assert!(gov.check_rate(&survivor, w_later).is_ok());
 
-        let map = gov.rate.read().unwrap();
+        let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
         assert_eq!(
             map.len(),
             1,
@@ -1229,6 +1259,60 @@ mod tests {
         // The incumbent row is untouched (never overwritten).
         let still = store.get_key("vk_freshid").unwrap().unwrap();
         assert_eq!(still.key_hash, "HASH_A", "incumbent must not be clobbered");
+    }
+
+    #[test]
+    fn test_poisoned_rate_lock_recovers_not_panics() {
+        // Regression: a panic while the `rate` lock is held poisons it. The hot-path accessors must
+        // RECOVER (via into_inner) rather than `.unwrap()`-panic on every subsequent call, which
+        // would cascade a single transient fault into a full governance outage. We deliberately
+        // poison the lock, then assert check_rate/add_rate_tokens still function.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(2);
+        k.tpm_limit = None;
+        let now = 1_700_000_040;
+
+        // Poison the rate lock: panic inside the write guard.
+        let g = gov.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = g.rate.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(gov.rate.is_poisoned(), "lock must be poisoned for the test");
+
+        // Despite the poison, the hot path keeps working (no panic, RPM still enforced).
+        assert!(gov.check_rate(&k, now).is_ok(), "1st admits after poison");
+        assert!(gov.check_rate(&k, now).is_ok(), "2nd admits after poison");
+        assert!(
+            gov.check_rate(&k, now).is_err(),
+            "RPM=2 still enforced on a recovered (poisoned) lock"
+        );
+    }
+
+    #[test]
+    fn test_poisoned_by_hash_lock_recovers_not_panics() {
+        // The auth-path key cache lock has the same hazard: a poisoned `by_hash` must not make every
+        // subsequent `lookup` panic. Poison it, then confirm lookup still resolves a cached key.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-abc";
+        let k = sample_key("k1", &crate::sigv4::sha256_hex(secret.as_bytes()));
+        store.put_key(&k).unwrap();
+        let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
+
+        let g = gov.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = g.by_hash.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(gov.by_hash.is_poisoned(), "cache lock must be poisoned");
+
+        // lookup still works (no panic) and refresh still succeeds on the recovered guard.
+        assert_eq!(gov.lookup(secret).unwrap().id, "k1");
+        gov.refresh()
+            .expect("refresh recovers the poisoned cache lock");
+        assert_eq!(gov.lookup(secret).unwrap().id, "k1");
     }
 
     #[test]

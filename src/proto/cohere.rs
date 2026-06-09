@@ -858,8 +858,77 @@ impl ProtocolReader for CohereReader {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct CohereWriter;
+pub(crate) struct CohereWriter {
+    /// IR block indices for which this writer emitted a `tool-call-start` frame. The IR
+    /// `BlockStop` carries only the integer index (no block kind), but a native Cohere v2 stream
+    /// closes a tool-call block with `tool-call-end` and a text-content block with `content-end`.
+    /// Emitting `content-end` for ALL `BlockStop` events — as a prior revision did — closed a
+    /// tool-call block with the text-content close event, so a native Cohere SDK that distinguishes
+    /// content events from tool-call events by type mis-decoded the stream (the HIGH finding). Track
+    /// the tool-call opens here so `BlockStop` emits `tool-call-end` for a tool index and
+    /// `content-end` for a text (or any non-tool) index. Per-stream INSTANCE state, mirroring the
+    /// Responses writer's `open_tool_indices`: a `Mutex` keeps the writer `Sync` as the
+    /// `ProtocolWriter` trait requires, and a stream is single-threaded at any instant so
+    /// `Relaxed`-equivalent access is fine. Lock poisoning degrades to a no-op / `false` rather than
+    /// panicking on the request path.
+    open_tool_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+}
+
+/// Value-namespace constructor for [`CohereWriter`]. A `const` and a struct may share a name (they
+/// live in the value and type namespaces respectively), so `Protocol::cohere()` can keep writing
+/// the bare `CohereWriter` literal while the type now carries per-stream state. Each USE of the
+/// const inlines a fresh `CohereWriter` with an empty open-tool set, so every `Protocol::cohere()`
+/// call mints independent per-stream state — exactly the per-stream scoping the open/close pairing
+/// needs. `Mutex::new`/`BTreeSet::new` are const fns, so this is valid in const context.
+///
+/// `clippy::declare_interior_mutable_const` warns that a `const` with interior mutability is
+/// inlined per use rather than shared. That per-use fresh instance is PRECISELY the semantics we
+/// need: a `static` would share ONE open-tool set across every stream in the process, letting one
+/// stream's tool index leak into another. So the lint's suggestion is wrong for this site and is
+/// suppressed deliberately (mirrors the Responses writer's identically-shaped const).
+#[allow(non_upper_case_globals)]
+#[allow(clippy::declare_interior_mutable_const)]
+pub(crate) const CohereWriter: CohereWriter = CohereWriter {
+    open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+};
+
+impl Clone for CohereWriter {
+    fn clone(&self) -> Self {
+        // Carry the open-tool-index set across a clone so a mid-stream `Protocol::clone` keeps the
+        // in-flight tool-call open/close correlation; a poisoned lock degrades to an empty set
+        // rather than panicking on the request path.
+        CohereWriter {
+            open_tool_indices: std::sync::Mutex::new(
+                self.open_tool_indices
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
+
+impl CohereWriter {
+    /// Record that a `tool-call-start` frame was emitted at IR block `index`, so the matching
+    /// `BlockStop` closes it with `tool-call-end` rather than `content-end`. Lock poisoning degrades
+    /// to a no-op rather than panicking on the request path.
+    fn mark_tool_open(&self, index: usize) {
+        if let Ok(mut set) = self.open_tool_indices.lock() {
+            set.insert(index);
+        }
+    }
+
+    /// Return true and forget `index` if it was a previously-opened tool-call block; false if no
+    /// tool-call block was opened at `index` (e.g. a text block, whose `BlockStop` must emit
+    /// `content-end`). Lock poisoning degrades to `false` (treat as a text close) rather than
+    /// panicking on the request path.
+    fn take_tool_open(&self, index: usize) -> bool {
+        self.open_tool_indices
+            .lock()
+            .map(|mut set| set.remove(&index))
+            .unwrap_or(false)
+    }
+}
 
 impl ProtocolWriter for CohereWriter {
     fn upstream_path(&self) -> &str {
@@ -1109,22 +1178,28 @@ impl ProtocolWriter for CohereWriter {
                 // Omitting it made streamed tool calls invisible to a Cohere client. The reader
                 // expects `function.arguments` to be a (possibly empty) string and accumulates
                 // tool-call-delta argument fragments onto it, so we open with an empty string.
-                crate::ir::IrBlockMeta::ToolUse { id, name } => Some((
-                    "".to_string(),
-                    serde_json::json!({
-                        "type": "tool-call-start",
-                        "index": index,
-                        "delta": {
-                            "message": {
-                                "tool_calls": {
-                                    "id": id,
-                                    "type": "function",
-                                    "function": { "name": name, "arguments": "" }
+                crate::ir::IrBlockMeta::ToolUse { id, name } => {
+                    // Record the open tool index so the matching `BlockStop` closes it with
+                    // `tool-call-end` (the native Cohere v2 close event for a tool block) rather
+                    // than `content-end` (the text-block close event) — see `open_tool_indices`.
+                    self.mark_tool_open(*index);
+                    Some((
+                        "".to_string(),
+                        serde_json::json!({
+                            "type": "tool-call-start",
+                            "index": index,
+                            "delta": {
+                                "message": {
+                                    "tool_calls": {
+                                        "id": id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": "" }
+                                    }
                                 }
                             }
-                        }
-                    }),
-                )),
+                        }),
+                    ))
+                }
                 // Cohere v2 has no streamed thinking/image block shape. Emitting a fabricated frame
                 // would be a non-native proxy tell, so these IR block kinds carry no opening frame.
                 crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
@@ -1165,10 +1240,26 @@ impl ProtocolWriter for CohereWriter {
                 crate::ir::IrDelta::SignatureDelta(_) => None,
             },
 
-            IrStreamEvent::BlockStop { index } => Some((
-                "".to_string(),
-                serde_json::json!({ "type": "content-end", "index": index }),
-            )),
+            IrStreamEvent::BlockStop { index } => {
+                // The IR `BlockStop` carries only the integer index, not the block kind. A native
+                // Cohere v2 stream closes a tool-call block with `tool-call-end` and a text-content
+                // block with `content-end`. Emitting `content-end` for BOTH — as a prior revision
+                // did — closed a tool-call block with the text close event, so a native Cohere SDK
+                // (which keys on event type to track tool-call state) mis-decoded the stream and the
+                // tool block was never properly terminated (the HIGH finding). So consult the
+                // per-stream open-tool set: a tool-call index (recorded by its `tool-call-start`)
+                // closes with `tool-call-end`, consuming the marker; any other index (a text block)
+                // closes with `content-end`.
+                let close_type = if self.take_tool_open(*index) {
+                    "tool-call-end"
+                } else {
+                    "content-end"
+                };
+                Some((
+                    "".to_string(),
+                    serde_json::json!({ "type": close_type, "index": index }),
+                ))
+            }
 
             IrStreamEvent::MessageDelta {
                 stop_reason,
@@ -1592,7 +1683,8 @@ mod tests {
             !ir.system.is_empty(),
             "anthropic system must land in IrRequest.system"
         );
-        let cohere = CohereWriter.write_request(&ir);
+        let writer = CohereWriter;
+        let cohere = writer.write_request(&ir);
         let msgs = cohere.get("messages").unwrap().as_array().unwrap();
         assert_eq!(
             msgs[0].get("role").and_then(|r| r.as_str()),
@@ -1680,7 +1772,8 @@ mod tests {
             stop_sequence: None,
         };
 
-        let json = CohereWriter.write_response(&resp);
+        let writer = CohereWriter;
+        let json = writer.write_response(&resp);
         // tool_calls are nested under the `message` object (native Cohere v2 shape).
         let tool_calls = json
             .get("message")
@@ -1716,7 +1809,8 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
-        let json = CohereWriter.write_request(&ir);
+        let writer = CohereWriter;
+        let json = writer.write_request(&ir);
         let msgs = json.get("messages").unwrap().as_array().unwrap();
         let assistant = &msgs[0];
         assert!(
@@ -1749,7 +1843,8 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let j = CohereWriter.write_request(&single);
+        let writer = CohereWriter;
+        let j = writer.write_request(&single);
         assert_eq!(
             j.get("messages").unwrap().as_array().unwrap()[0].get("content"),
             Some(&serde_json::json!("hi"))
@@ -1773,7 +1868,7 @@ mod tests {
             }],
             ..single
         };
-        let j = CohereWriter.write_request(&multi);
+        let j = writer.write_request(&multi);
         let content = j.get("messages").unwrap().as_array().unwrap()[0]
             .get("content")
             .unwrap()
@@ -1859,7 +1954,8 @@ mod tests {
             "upstream id captured verbatim into the IR"
         );
 
-        let out = CohereWriter.write_response(&resp);
+        let writer = CohereWriter;
+        let out = writer.write_response(&resp);
         assert_eq!(
             out.get("id").and_then(|i| i.as_str()),
             Some(upstream_id),
@@ -1888,7 +1984,8 @@ mod tests {
         };
         assert_eq!(captured.as_deref(), Some(upstream_id));
 
-        let (_, frame) = CohereWriter
+        let writer = CohereWriter;
+        let (_, frame) = writer
             .write_response_event(&evs[0])
             .expect("message-start must serialize");
         assert_eq!(
@@ -1923,7 +2020,8 @@ mod tests {
             stop_sequence: None,
         };
 
-        let out = CohereWriter.write_response(&resp);
+        let writer = CohereWriter;
+        let out = writer.write_response(&resp);
         let id = out
             .get("id")
             .and_then(|i| i.as_str())
@@ -2010,7 +2108,8 @@ mod tests {
             stop_sequence: None,
         };
 
-        let body = CohereWriter.write_response(&resp);
+        let writer = CohereWriter;
+        let body = writer.write_response(&resp);
 
         // tool_calls live under message, NOT at the top level.
         assert!(
@@ -2056,7 +2155,8 @@ mod tests {
             index: 0,
             delta: crate::ir::IrDelta::TextDelta("chunk".to_string()),
         };
-        let (_, frame) = CohereWriter
+        let writer = CohereWriter;
+        let (_, frame) = writer
             .write_response_event(&ev)
             .expect("content-delta must serialize");
         let content = frame
@@ -2192,13 +2292,14 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
-        let non_streaming = CohereWriter.write_request(&base);
+        let writer = CohereWriter;
+        let non_streaming = writer.write_request(&base);
         assert!(
             non_streaming.get("stream").is_none(),
             "non-streaming request must omit the `stream` key, got {non_streaming}"
         );
 
-        let streaming = CohereWriter.write_request(&crate::ir::IrRequest {
+        let streaming = writer.write_request(&crate::ir::IrRequest {
             stream: true,
             ..base
         });
@@ -2222,7 +2323,8 @@ mod tests {
             .read_request(&native)
             .expect("read_request should succeed");
         assert!(!ir.stream, "absent `stream` reads as false");
-        let out = CohereWriter.write_request(&ir);
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
         assert!(
             out.get("stream").is_none(),
             "round-trip must not inject a `stream` field, got {out}"
@@ -2244,7 +2346,8 @@ mod tests {
                 cache_read_input_tokens: None,
             },
         };
-        let (_, frame) = CohereWriter
+        let writer = CohereWriter;
+        let (_, frame) = writer
             .write_response_event(&ev)
             .expect("message-end must serialize");
         assert_eq!(
@@ -2280,7 +2383,8 @@ mod tests {
                 cache_read_input_tokens: None,
             },
         };
-        let (_, frame) = CohereWriter
+        let writer = CohereWriter;
+        let (_, frame) = writer
             .write_response_event(&ev)
             .expect("message-end must serialize");
         let tokens = frame
@@ -2305,7 +2409,8 @@ mod tests {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
         };
-        let (_, frame) = CohereWriter
+        let writer = CohereWriter;
+        let (_, frame) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
                 stop_reason: Some("end_turn".to_string()),
                 stop_sequence: None,
@@ -2360,7 +2465,8 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let out = CohereWriter.write_request(&ir);
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
         let msgs = out.get("messages").unwrap().as_array().unwrap();
         assert_eq!(msgs.len(), 1, "one tool message emitted");
         let content = msgs[0].get("content").and_then(|c| c.as_str()).unwrap();
@@ -2394,7 +2500,8 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let out = CohereWriter.write_request(&ir);
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
         let msgs = out.get("messages").unwrap().as_array().unwrap();
         assert_eq!(
             msgs.len(),
@@ -3002,7 +3109,8 @@ mod tests {
         let ir = CohereReader
             .read_request(&body)
             .expect("read_request should succeed");
-        let out = CohereWriter.write_request(&ir);
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
         let msgs = out.get("messages").unwrap().as_array().unwrap();
         let tool_msg = msgs
             .iter()
@@ -3128,6 +3236,183 @@ mod tests {
             state.open_tools.len() <= MAX_TRACKED_TOOL_FRAMES,
             "open_tools must be capped at MAX_TRACKED_TOOL_FRAMES, got {}",
             state.open_tools.len()
+        );
+    }
+
+    /// Regression (HIGH/conformance): a `BlockStop` that closes a TOOL-CALL block (one opened by a
+    /// `tool-call-start` frame) must emit `tool-call-end`, NOT `content-end`. A native Cohere v2 SDK
+    /// distinguishes content events from tool-call events by type; closing a tool block with the
+    /// text `content-end` event leaves the tool call never terminated and breaks cross-protocol
+    /// streaming tool use.
+    #[test]
+    fn test_block_stop_closes_tool_block_with_tool_call_end() {
+        let writer = CohereWriter;
+        // Open a tool-call block at index 0.
+        let (_, start) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                },
+            })
+            .expect("tool-call-start must emit");
+        assert_eq!(
+            start.get("type").and_then(|t| t.as_str()),
+            Some("tool-call-start")
+        );
+        // Closing it must use tool-call-end at the SAME index.
+        let (_, stop) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("tool block stop must emit");
+        assert_eq!(
+            stop.get("type").and_then(|t| t.as_str()),
+            Some("tool-call-end"),
+            "a tool-call block must close with tool-call-end, not content-end"
+        );
+        assert_eq!(stop.get("index").and_then(|i| i.as_u64()), Some(0));
+    }
+
+    /// Regression (HIGH/conformance): a `BlockStop` that closes a TEXT block (one opened by a
+    /// `content-start`/text `BlockStart`) must still emit `content-end`. Only tool-call blocks use
+    /// `tool-call-end`.
+    #[test]
+    fn test_block_stop_closes_text_block_with_content_end() {
+        let writer = CohereWriter;
+        // Open a text block at index 0.
+        let (_, start) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text,
+            })
+            .expect("content-start must emit");
+        assert_eq!(
+            start.get("type").and_then(|t| t.as_str()),
+            Some("content-start")
+        );
+        let (_, stop) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("text block stop must emit");
+        assert_eq!(
+            stop.get("type").and_then(|t| t.as_str()),
+            Some("content-end"),
+            "a text block must close with content-end"
+        );
+        assert_eq!(stop.get("index").and_then(|i| i.as_u64()), Some(0));
+    }
+
+    /// Regression (HIGH/conformance): a mixed stream (text block at index 0, then a tool-call block
+    /// at index 1) must close EACH block with its own correct end event — `content-end` for the text
+    /// index and `tool-call-end` for the tool index — based on which kind opened that index.
+    #[test]
+    fn test_block_stop_mixed_text_and_tool_close_events() {
+        let writer = CohereWriter;
+        // Text block at index 0.
+        writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text,
+            })
+            .expect("text start");
+        // Tool block at index 1.
+        writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 1,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_2".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("tool start");
+
+        let (_, stop_text) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("text stop");
+        assert_eq!(
+            stop_text.get("type").and_then(|t| t.as_str()),
+            Some("content-end"),
+            "index 0 (text) must close with content-end"
+        );
+
+        let (_, stop_tool) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
+            .expect("tool stop");
+        assert_eq!(
+            stop_tool.get("type").and_then(|t| t.as_str()),
+            Some("tool-call-end"),
+            "index 1 (tool) must close with tool-call-end"
+        );
+    }
+
+    /// The writer's tool open/close pair round-trips through this protocol's OWN reader: a
+    /// BlockStart{ToolUse} followed by a BlockStop emits `tool-call-start` then `tool-call-end`,
+    /// which the reader maps back to a BlockStart{ToolUse} then a BlockStop.
+    #[test]
+    fn test_tool_block_open_close_roundtrip_through_reader() {
+        let writer = CohereWriter;
+        let (_, start_frame) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_z".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("start frame");
+        let (_, stop_frame) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("stop frame");
+        assert_eq!(
+            stop_frame.get("type").and_then(|t| t.as_str()),
+            Some("tool-call-end")
+        );
+
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = CohereReader;
+        let start_evs = reader.read_response_events("", &start_frame, &mut state);
+        assert!(matches!(
+            &start_evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                block: crate::ir::IrBlockMeta::ToolUse { .. },
+                ..
+            }
+        ));
+        let stop_evs = reader.read_response_events("", &stop_frame, &mut state);
+        assert!(
+            matches!(&stop_evs[0], crate::ir::IrStreamEvent::BlockStop { .. }),
+            "tool-call-end must map back to a BlockStop, got {stop_evs:?}"
+        );
+    }
+
+    /// A tool index is consumed on close: a second `BlockStop` at the same index (an over-eager or
+    /// duplicate close) falls back to `content-end` rather than mis-reporting `tool-call-end` for a
+    /// block that is no longer tracked as a tool.
+    #[test]
+    fn test_block_stop_tool_index_consumed_on_close() {
+        let writer = CohereWriter;
+        writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 3,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "c".to_string(),
+                    name: "f".to_string(),
+                },
+            })
+            .expect("start");
+        let (_, first) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 3 })
+            .expect("first stop");
+        assert_eq!(
+            first.get("type").and_then(|t| t.as_str()),
+            Some("tool-call-end")
+        );
+        let (_, second) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 3 })
+            .expect("second stop");
+        assert_eq!(
+            second.get("type").and_then(|t| t.as_str()),
+            Some("content-end"),
+            "a tool index consumed on first close must not re-report tool-call-end"
         );
     }
 }

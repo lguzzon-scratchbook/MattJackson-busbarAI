@@ -517,6 +517,30 @@ mod tests {
         assert_eq!(event_type_for_frame(&h2), "throttlingException");
     }
 
+    /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:104-109): an exception-typed frame
+    /// (`:message-type: exception`) that carries NO `:exception-type` header must fall through to the
+    /// empty string — never panic and never misreport. This guards the `None` arm of the
+    /// `:exception-type` lookup, which a future refactor adding an assertion/panic there would break.
+    #[test]
+    fn test_event_type_exception_without_exception_type_yields_empty() {
+        // Only `:message-type: exception` is present; no `:exception-type`, no `:event-type`.
+        let h = string_header(":message-type", "exception");
+        assert_eq!(
+            event_type_for_frame(&h),
+            "",
+            "exception frame missing :exception-type falls through to empty, no panic"
+        );
+
+        // Same, but with an unrelated (non-exception) header riding along — still empty.
+        let mut h2 = string_header(":message-type", "exception");
+        h2.extend_from_slice(&string_header(":content-type", "application/json"));
+        assert_eq!(
+            event_type_for_frame(&h2),
+            "",
+            "exception frame with only :message-type + :content-type is still empty"
+        );
+    }
+
     /// A frame with `:message-type: event` (the normal case) must still report its `:event-type`,
     /// never an exception name, even if a stray `:exception-type` somehow rode along.
     #[test]

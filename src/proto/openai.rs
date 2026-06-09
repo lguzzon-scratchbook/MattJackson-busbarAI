@@ -28,31 +28,63 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Process-local monotonic counter for synthesized id uniqueness. Combined with the timestamp it
-/// yields ids that don't collide within a process even when many responses are minted in the same
-/// second. No crate dependency — just `std`.
+/// Process-local monotonic counter that GUARANTEES synthesized-id uniqueness within a process. It
+/// never repeats while the process lives, so even on the astronomically unlikely event of the OS
+/// CSPRNG returning a duplicate (or being unavailable, when we fall back to it entirely) two
+/// distinct calls still mint distinct ids. No crate dependency — just `std`.
 static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Synthesize a protocol-correct OpenAI completion id (`"chatcmpl-<token>"`) for cross-protocol
-/// responses where the backend supplied none. The official OpenAI SDKs treat `id` as an opaque
-/// string and only require it be present and a string (the `chatcmpl-` prefix is the documented
-/// shape for chat.completions); uniqueness here is a timestamp plus an atomic counter rendered in
-/// base-36, so it is collision-free within a process and needs no RNG crate.
+/// Width of a native OpenAI chat-completion id's random suffix: the `chatcmpl-` prefix is followed
+/// by exactly 24 base62 characters (total 33 chars), the shape every native `chat.completion` /
+/// `chat.completion.chunk` id carries. Matching this length AND alphabet is what keeps the
+/// synthesized id structurally indistinguishable from a native one to any client that length-checks
+/// or regex-validates `id` (SDK validators, logging/dedup tooling).
+const COMPLETION_ID_TOKEN_LEN: usize = 24;
+
+/// Lowercase+uppercase+digit base62 alphabet — the character class native OpenAI completion ids draw
+/// their suffix from. Shared by [`synth_completion_id`].
+const BASE62: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Synthesize a protocol-correct OpenAI completion id (`"chatcmpl-<24 base62 chars>"`) for
+/// cross-protocol responses where the backend supplied none. Native OpenAI chat-completion ids are
+/// `chatcmpl-` plus a fixed-width 24-char base62 token (33 chars total); the official SDKs treat
+/// `id` as opaque, but tooling that length-checks or regex-validates the id immediately fingerprints
+/// a too-short or wrong-alphabet value as non-native. The previous base-36 form produced a
+/// variable-width ~7-char little-endian suffix (~16 chars total) — both too short and non-canonical.
+///
+/// The 24-char suffix is filled from the OS CSPRNG (mirroring `synth_anthropic_request_id` /
+/// `synth_amzn_request_id` in `proto::mod`), giving native-looking entropy. To keep the
+/// collision-free guarantee unconditionally — independent of the RNG — the strictly-monotonic
+/// process counter is folded MSB-first into the leading characters of the token: two calls that
+/// happen to draw the same random bytes still differ because their counter values differ, and if the
+/// CSPRNG is unavailable the token degrades to a pure counter/timestamp encoding that is still
+/// unique and still 24 base62 chars wide. Never panics on the request path.
 fn synth_completion_id() -> String {
     let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = unix_now_secs();
-    // Render the timestamp and the atomic counter as base-36 fields and CONCATENATE them with NO
-    // internal separator. Native OpenAI chat-completion ids have exactly one hyphen — the one in the
-    // `chatcmpl-` prefix — and no internal field delimiter (e.g. `chatcmpl-abc123xyz`); the previous
-    // `chatcmpl-<ts>-<n>` form inserted a second hyphen, a structurally distinguishable proxy tell
-    // to any client that validates the id shape (regex / startswith / visual inspection). Process
-    // uniqueness no longer relies on the (ts, n) string being injective: the atomic counter `n` is
-    // strictly monotonic and never repeats within the process, so it alone guarantees distinct ids;
-    // the timestamp prefix only mirrors the native shape's entropy distribution. The previous XOR
-    // scheme (`(ts<<24) ^ n`) collided whenever the counter advanced by exactly 2^24 between two
-    // seconds (e.g. ts=1000/n=0 and ts=1001/n=16777216 produced the same value), silently minting
-    // duplicate ids under sustained high request rates; this form has no such failure mode.
-    format!("chatcmpl-{}{}", base36(ts), base36(n))
+
+    // Fill the suffix with CSPRNG bytes mapped into base62. On entropy failure we leave the buffer
+    // zeroed (all '0'); the counter overlay below still makes the id unique, so we never panic.
+    let mut rand_bytes = [0u8; COMPLETION_ID_TOKEN_LEN];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let mut token = [b'0'; COMPLETION_ID_TOKEN_LEN];
+    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
+        *slot = BASE62[(byte % 62) as usize];
+    }
+
+    // Overlay the monotonic counter MSB-first across the leading characters so the per-process
+    // uniqueness guarantee holds regardless of the RNG. 62^11 > 2^65 > u64::MAX, so 11 leading
+    // characters fully encode any `u64` counter without losing low bits; the remaining 13 stay
+    // random. Big-endian (MSB-first) so the digits read naturally rather than reversed.
+    let mut counter = n;
+    for slot in token.iter_mut().take(11).rev() {
+        *slot = BASE62[(counter % 62) as usize];
+        counter /= 62;
+    }
+
+    // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards
+    // against an impossible non-ASCII byte and keeps the path panic-free.
+    let token = std::str::from_utf8(&token).unwrap_or("000000000000000000000000");
+    format!("chatcmpl-{token}")
 }
 
 /// Derive the native OpenAI `error.code` value for a given OpenAI error `type`.
@@ -84,20 +116,6 @@ fn openai_error_code(error_type: &str) -> serde_json::Value {
             serde_json::Value::Null
         }
     }
-}
-
-/// Render a u64 as a compact base-36 (lowercase alphanumeric) string. Zero renders as "0".
-fn base36(mut value: u64) -> String {
-    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    if value == 0 {
-        return "0".to_string();
-    }
-    let mut token = String::new();
-    while value > 0 {
-        token.push(ALPHABET[(value % 36) as usize] as char);
-        value /= 36;
-    }
-    token
 }
 
 /// OpenAI reader implementation.
@@ -2217,27 +2235,42 @@ mod tests {
         assert_eq!(msgs[1]["content"], serde_json::json!(""));
     }
 
-    // --- Round 3 fix 1: synthesized ids must not collide under the old XOR scheme ---
+    // --- Round 10 HIGH: synthesized ids must match the native length AND base62 alphabet ---
 
     #[test]
-    fn synth_id_no_collision_across_second_and_counter_jump() {
-        // The old `(ts<<24) ^ n` scheme collided when the counter advanced by exactly 2^24 between
-        // two adjacent seconds: ts=1000/n=0 and ts=1001/n=16_777_216 hashed to the same value.
-        // The field-concatenation scheme maps each (ts, n) pair injectively, so these differ.
-        let a = format!("chatcmpl-{}-{}", base36(1000), base36(0));
-        let b = format!("chatcmpl-{}-{}", base36(1001), base36(16_777_216));
-        assert_ne!(a, b);
+    fn synth_completion_id_matches_native_length_and_alphabet() {
+        // Native OpenAI chat-completion ids are `chatcmpl-` + 24 base62 chars (33 chars total). A
+        // too-short or wrong-alphabet suffix is an SDK-/tooling-visible proxy tell.
+        let id = synth_completion_id();
+        let suffix = id
+            .strip_prefix("chatcmpl-")
+            .expect("synthesized id has the chatcmpl- prefix");
+        assert_eq!(
+            suffix.len(),
+            COMPLETION_ID_TOKEN_LEN,
+            "suffix is exactly the native 24-char width: {id}"
+        );
+        assert_eq!(id.len(), "chatcmpl-".len() + 24, "total length is 33: {id}");
+        // Exactly one hyphen (the prefix's) — no internal field delimiter.
+        assert_eq!(id.matches('-').count(), 1, "no internal delimiter: {id}");
+        // Every suffix char is in the base62 alphabet [0-9A-Za-z].
+        assert!(
+            suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "suffix is base62: {id}"
+        );
     }
 
     #[test]
-    fn base36_renders_zero_and_roundtrips_fields() {
-        assert_eq!(base36(0), "0");
-        assert_eq!(base36(35), "z");
-        // The hyphen delimiter is not a base-36 digit, so the (ts, n) split is unambiguous: even
-        // when one field's digits could otherwise run into the next, the separator keeps them apart.
-        let id = format!("chatcmpl-{}-{}", base36(36), base36(1));
-        // base36(36) == "01" (little-endian digits: 36 = 0 + 1*36), base36(1) == "1".
-        assert_eq!(id, "chatcmpl-01-1");
+    fn synth_completion_id_unique_even_with_identical_entropy() {
+        // The monotonic counter guarantees uniqueness independent of the RNG: minting many ids in a
+        // tight loop (where the timestamp does not advance) must never collide. The counter is folded
+        // MSB-first into the leading chars, so adjacent ids differ in those positions.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let id = synth_completion_id();
+            assert_eq!(id.len(), "chatcmpl-".len() + 24);
+            assert!(seen.insert(id.clone()), "duplicate synthesized id: {id}");
+        }
     }
 
     // --- Round 3 fix 2/5: streaming MessageDelta with no stop_reason emits finish_reason null ---
@@ -2757,7 +2790,7 @@ mod tests {
             "id must keep the native prefix: {id}"
         );
         // Native ids have exactly one hyphen (the one in `chatcmpl-`); the token after the prefix is
-        // pure base-36 with no internal delimiter. An extra hyphen is a structural proxy tell.
+        // pure base62 with no internal delimiter. An extra hyphen is a structural proxy tell.
         assert_eq!(
             id.matches('-').count(),
             1,
@@ -2766,10 +2799,8 @@ mod tests {
         let token = id.strip_prefix("chatcmpl-").expect("prefix present");
         assert!(!token.is_empty(), "token after prefix must be non-empty");
         assert!(
-            token
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-            "token must be base-36 (lowercase alnum), got: {token}"
+            token.chars().all(|c| c.is_ascii_alphanumeric()),
+            "token must be base62 ([0-9A-Za-z]), got: {token}"
         );
     }
 

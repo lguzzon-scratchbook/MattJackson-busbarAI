@@ -1231,6 +1231,22 @@ mod tests {
             upstream.get("messages").is_some(),
             "non-stream gemini request reached the openai backend; got {upstream}"
         );
+        // MEDIUM/test-coverage: the CLIENT-facing response must be the native Gemini
+        // `GenerateContentResponse` shape (a top-level `candidates` array), NOT the raw OpenAI
+        // `choices[]` body the backend returned. A regression that skipped the IR→Gemini write step
+        // (returning the upstream OpenAI body verbatim) would still be a 200 but a protocol
+        // indistinguishability violation a Gemini SDK would choke on. Mirrors the streaming-case
+        // `candidates` assertion in `test_gemini_stream_generate_content_no_alt_sse_is_json_array`.
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("candidates").is_some(),
+            "non-stream gemini ingress returns a native GenerateContentResponse (candidates[]); \
+             got {body}"
+        );
+        assert!(
+            body.get("choices").is_none(),
+            "no OpenAI `choices` field may leak to a Gemini client; got {body}"
+        );
         handle.abort();
         server.shutdown().await;
     }
@@ -1336,6 +1352,32 @@ mod tests {
             ct.starts_with("application/json"),
             "non-stream bedrock returns JSON; got {ct}"
         );
+        // HIGH/test-coverage: a real AWS Bedrock Converse (non-stream) result ALWAYS exposes a
+        // request id via `*Output::request_id()`, which the AWS SDK reads from the `x-amzn-RequestId`
+        // response header. busbar synthesizes one on the success path (maybe_attach_bedrock_amzn_id);
+        // an absent or malformed header makes the SDK's `request_id()` return None — an impossibility
+        // for a native endpoint and a deterministic proxy tell. Assert the header is present AND
+        // UUID-v4 shaped (8-4-4-4-12 lowercase hex), mirroring the streaming-case assertion in
+        // `test_bedrock_converse_stream_returns_binary_eventstream`.
+        let req_id = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|h| h.to_str().ok())
+            .expect("bedrock converse (non-stream) success carries x-amzn-RequestId")
+            .to_string();
+        let segs: Vec<&str> = req_id.split('-').collect();
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "x-amzn-RequestId is UUID-v4 shaped (8-4-4-4-12); got {req_id}"
+        );
+        assert!(
+            req_id
+                .chars()
+                .all(|c| (c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) || c == '-'),
+            "x-amzn-RequestId is lowercase hex with dashes; got {req_id}"
+        );
+
         // The body must be the Bedrock Converse native shape produced by the bedrock writer.
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(
@@ -1578,6 +1620,104 @@ mod tests {
                 "metadata"
             ],
             "the exact upstream frame sequence is relayed verbatim, in order; got {event_types:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// CORE-deferred cross-file test: a TRUE mid-stream TRANSPORT failure on a SAME-PROTOCOL
+    /// bedrock→bedrock streaming passthrough. The companion
+    /// `test_bedrock_ingress_mid_stream_transport_error_appends_binary_exception` drives the
+    /// CROSS-protocol (openai-backend, SSE→binary reframe) path; this one drives the same-protocol
+    /// VERBATIM relay (`translate=None`): the upstream is a Bedrock backend emitting binary
+    /// `application/vnd.amazon.eventstream` frames that then drops the connection mid-binary-body. The
+    /// proxy must (a) preserve the eventstream Content-Type, (b) relay the real first frame, and (c)
+    /// after the first byte append a CRC-valid BINARY `:message-type: exception` frame
+    /// (`InternalServerException`) — NEVER SSE `event:`/`data:` ASCII text, which would yield an
+    /// undecodable prelude/CRC for the AWS SDK's eventstream decoder. Exercises `FirstByteBody`'s
+    /// `Poll::Ready(Some(Err))` arm with `is_sse=true` (eventstream upstream CT) and
+    /// `ingress_eventstream=true` (bedrock ingress) on the passthrough branch the cross-protocol
+    /// variants cannot reach.
+    #[tokio::test]
+    async fn test_bedrock_same_protocol_stream_mid_stream_transport_error_appends_binary_exception()
+    {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::EventStreamTransportError {
+            ok_frames: vec![("messageStart", br#"{"role":"assistant"}"#.to_vec())],
+            amzn_request_id: "fixed-upstream-amzn-req-id-err1",
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Bedrock ingress → BEDROCK backend (same-protocol verbatim relay). The mock only serves
+        // `/v1/messages`; the same-protocol relay keys off the upstream Content-Type, not the URL, so
+        // point the lane's upstream path at a route the mock answers.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::bedrock(), &server.base_url())
+                    .provider("aws")
+                    .path("/v1/messages"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse-stream"))
+            .bearer_auth("t")
+            .body(
+                json!({ "messages": [{"role": "user", "content": [{"text": "hi"}]}] }).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "bedrock→bedrock converse-stream 2xx before the mid-stream drop"
+        );
+        // (a) the upstream eventstream Content-Type is preserved (verbatim relay, not reframed).
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/vnd.amazon.eventstream"),
+            "same-protocol bedrock stream preserves the eventstream CT; got {ct}"
+        );
+
+        let body = resp.bytes().await.unwrap();
+        // (c) NO SSE ASCII may be spliced into the binary body — it must be pure binary frames.
+        assert!(
+            !body.windows(7).any(|w| w == b"event: ") && !body.windows(6).any(|w| w == b"data: "),
+            "same-protocol bedrock mid-stream error must NOT contain SSE ASCII; body: {body:?}"
+        );
+        // The body decodes as a whole sequence of CRC-valid binary frames (real frame(s) + the
+        // appended exception frame), with no trailing partial bytes.
+        let mut buf = body.to_vec();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "body must be a whole sequence of CRC-valid frames; {} bytes left",
+            buf.len()
+        );
+        assert!(
+            !frames.is_empty(),
+            "at least the first real frame decodes before the drop"
+        );
+        // A trailing BINARY exception frame is present (drain_frames yields an empty event type for
+        // it; re-scan the raw bytes to confirm the modeled-exception headers/name).
+        let raw_str = String::from_utf8_lossy(&body);
+        assert!(
+            raw_str.contains(":exception-type"),
+            "a binary :message-type:exception frame must be appended after the real frames; \
+             body: {body:?}"
+        );
+        assert!(
+            raw_str.contains("InternalServerException"),
+            "the mid-stream transport failure maps to InternalServerException"
         );
         handle.abort();
         server.shutdown().await;
@@ -2888,6 +3028,89 @@ mod tests {
                 .and_then(|t| t.as_str()),
             Some("invalid_request_error"),
             "missing-model 400 carries the OpenAI invalid_request_error type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage: an EMPTY `"model"` string (`""`) is a distinct branch from a MISSING
+    /// model in `ingress_body_model`'s guard (`Some(m) if !m.is_empty()`), and must produce the SAME
+    /// native 400 `invalid_request_error` for every body-model protocol — NOT fall through to
+    /// resolution (which would surface a 404 a native SDK reads differently). If the `!m.is_empty()`
+    /// guard were dropped or weakened to `.is_some()`, an empty model would reach `forward_resolved`
+    /// and 404 on a pool/by_model miss; these three tests (openai/cohere/responses) lock the 400.
+    #[tokio::test]
+    async fn test_openai_empty_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(json!({"model": "", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "empty model ⇒ 400 (not 404)");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("invalid_request_error"),
+            "openai empty-model 400 carries invalid_request_error; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage twin: Cohere `/v2/chat` with `"model": ""` ⇒ native Cohere 400 envelope
+    /// (a BARE top-level `message`, NO `error`/`type` wrapper).
+    #[tokio::test]
+    async fn test_cohere_empty_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth("t")
+            .body(json!({"model": "", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "empty model ⇒ 400 (not 404)");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("message").and_then(|m| m.as_str()).is_some(),
+            "cohere empty-model 400 envelope carries a bare top-level message; got {body}"
+        );
+        assert!(
+            body.get("error").is_none() && body.get("type").is_none(),
+            "cohere empty-model 400 envelope has NO error/type wrapper; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage twin: Responses `/v1/responses` with `"model": ""` ⇒ native Responses 400
+    /// envelope (`{"error":{"type":"invalid_request_error"}}`).
+    #[tokio::test]
+    async fn test_responses_empty_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth("t")
+            .body(json!({"model": "", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "empty model ⇒ 400 (not 404)");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("invalid_request_error"),
+            "responses empty-model 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
     }
