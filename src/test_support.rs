@@ -151,6 +151,12 @@ impl MockServer {
         let app = Router::new()
             .route("/v1/messages", any(mock_handler))
             .route("/v1/chat/completions", any(mock_handler))
+            // Serve EVERY other upstream path through the same handler so backends whose writer
+            // builds a model-scoped path (Bedrock `/model/{model}/converse[-stream]`, Gemini
+            // `/v1beta/models/...`, Cohere `/v2/chat`) reach the queued mock response instead of a
+            // 404. The queued `MockResponse` already encodes the protocol-specific body shape, so a
+            // catch-all route is sufficient and keeps the named routes above for clarity.
+            .fallback(any(mock_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

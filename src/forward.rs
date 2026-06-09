@@ -28,6 +28,18 @@ use crate::store::{now, Permit};
 /// Without this the upstream 400s with `max_tokens: Field required`. Uses the lane's configured
 /// `default_max_tokens`, falling back to `crate::proto::DEFAULT_MAX_TOKENS`. No-op when the IR
 /// already carries a value or the egress protocol treats `max_tokens` as optional.
+/// Current unix time in whole seconds, or 0 if the system clock predates the epoch. Never panics —
+/// it is on the request path, where a clock error must degrade (a `created: 0` is still a valid int
+/// every SDK accepts) rather than abort. Mirrors the per-protocol `unix_now_secs` helpers; used at
+/// the cross-protocol seam to stamp a synthesized `created` so an identity-empty egress reader's IR
+/// (e.g. Bedrock) trips the writers' `created`-based boundary signal.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
     if ir.max_tokens.is_none() && lane.protocol.writer().requires_max_tokens() {
         ir.max_tokens = Some(
@@ -2305,6 +2317,35 @@ pub(crate) async fn forward_with_pool(
                                 ir.id = None;
                                 ir.system_fingerprint = None;
                                 ir.stop_sequence = None;
+                                // CROSS-PROTOCOL BOUNDARY SIGNAL (class fix). Some egress readers
+                                // return an identity-EMPTY IR — notably Bedrock, whose Converse body
+                                // carries no body-level `id`/`created`/`model` (its `read_response`
+                                // returns all three `None`). After the strip above such an IR is
+                                // indistinguishable, AT THE WRITER, from a MINIMAL SAME-protocol body
+                                // that legitimately omitted identity. Writers that gate identity
+                                // emission on the boundary signal `created.is_some() ||
+                                // model.is_some()` (the Gemini writer) therefore emitted NEITHER a
+                                // synthesized `responseId` NOR `usageMetadata.totalTokenCount` for a
+                                // Bedrock→Gemini hop, so a google-genai client read
+                                // `response_id`/`total_token_count` as absent — a token-accounting gap
+                                // and a distinguishability tell.
+                                //
+                                // Fix the CLASS at the seam, not per-writer: this code runs ONLY when
+                                // ingress != egress (same-protocol passthrough relays the raw upstream
+                                // body and never reaches a writer), so a populated `created` here is an
+                                // unambiguous, protocol-AGNOSTIC marker that a translation occurred.
+                                // Stamp a synthesized unix-epoch `created` whenever the egress reader
+                                // left it empty, so EVERY identity-empty egress (Bedrock today; any
+                                // future one) trips the same boundary signal and every ingress writer
+                                // emits full native identity. `created` is format-neutral on the wire
+                                // (anthropic omits it; openai/responses re-emit it as an int they would
+                                // otherwise synthesize anyway; gemini/cohere never serialize it), so
+                                // stamping it changes no wire shape beyond turning identity emission
+                                // back ON. The same-protocol minimal roundtrip is unaffected because it
+                                // never enters this seam.
+                                if ir.created.is_none() {
+                                    ir.created = Some(unix_now_secs());
+                                }
                                 // Bedrock ingress that requested ConverseStream (`wants_stream`) but
                                 // got a BUFFERED (non-SSE) 2xx upstream: a native AWS SDK
                                 // ConverseStream decoder expects binary `eventstream` frames, NOT an
@@ -2812,6 +2853,12 @@ async fn forward_once(
                             ir.id = None;
                             ir.system_fingerprint = None;
                             ir.stop_sequence = None;
+                            // Cross-protocol boundary signal for an identity-empty egress (Bedrock):
+                            // stamp a synthesized `created` so the ingress writers trip their
+                            // `created`-based identity gate, exactly as on the main forward path above.
+                            if ir.created.is_none() {
+                                ir.created = Some(unix_now_secs());
+                            }
                             // Bedrock ConverseStream request answered by a buffered (non-SSE) 2xx:
                             // emit the native binary eventstream frame sequence, not an
                             // `application/json` Converse body the SDK's stream decoder cannot parse
@@ -4141,6 +4188,92 @@ mod ingress_indistinguishability_tests {
         assert!(
             !raw.contains("fp_backend"),
             "backend system_fingerprint must not leak across protocols: {raw}"
+        );
+        server.shutdown().await;
+    }
+
+    /// CLASS regression (forward.rs cross-protocol seam): a Bedrock backend returns an
+    /// identity-EMPTY non-stream IR (`read_response` yields `id`/`created`/`model` all `None`, since
+    /// a Converse body carries no body-level identity). On a Bedrock→Gemini hop the Gemini writer
+    /// gates `usageMetadata.totalTokenCount` and a synthesized `responseId` on the cross-protocol
+    /// BOUNDARY signal (`created.is_some() || model.is_some()`); before the seam stamped a synthesized
+    /// `created`, that signal never fired for Bedrock and a google-genai client read
+    /// `total_token_count`/`response_id` as ABSENT (a token-accounting gap + distinguishability tell).
+    /// This asserts both are now present on the translated Gemini body.
+    #[tokio::test]
+    async fn test_cross_protocol_bedrock_to_gemini_carries_total_tokens_and_response_id() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // Native AWS Converse (non-stream) 2xx: NO body-level id/created/model — only output,
+        // stopReason, and usage. This is exactly the identity-empty shape the Bedrock reader returns.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "Hi"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 7, "outputTokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        // Lane speaks Bedrock; ingress is Gemini → cross-protocol translation hop.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-bedrock",
+                    crate::proto::Protocol::bedrock(),
+                    &server.base_url(),
+                )
+                .provider("aws"),
+            )
+            .pool("pg", &[(0, 1)])
+            .build();
+        // Native Gemini generateContent (non-stream) request body.
+        let body =
+            serde_json::to_vec(&json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}))
+                .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pg",
+            None,
+            "gemini",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "non-stream cross-protocol response uses the ingress (Gemini) JSON Content-Type"
+        );
+        use http_body_util::BodyExt as _;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        // totalTokenCount = promptTokenCount + candidatesTokenCount (7 + 3); a strict google-genai
+        // client reads this for billing/accounting. Absent before the seam fix.
+        assert_eq!(
+            v["usageMetadata"]["totalTokenCount"],
+            json!(10u64),
+            "Bedrock→Gemini must carry usageMetadata.totalTokenCount; body: {v}"
+        );
+        assert_eq!(v["usageMetadata"]["promptTokenCount"], json!(7u64));
+        assert_eq!(v["usageMetadata"]["candidatesTokenCount"], json!(3u64));
+        // responseId is synthesized (Gemini-shaped, no foreign prefix) so the SDK's
+        // GenerateContentResponse.response_id is always populated. Absent before the seam fix.
+        let rid = v["responseId"].as_str().unwrap_or("");
+        assert!(
+            !rid.is_empty(),
+            "Bedrock→Gemini must carry a synthesized responseId; body: {v}"
+        );
+        // No foreign-format identity leaked (Converse has none, but guard the contract anyway).
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            !raw.contains("chatcmpl-") && !raw.contains("msg_"),
+            "no foreign-format id may appear in the Gemini body: {raw}"
         );
         server.shutdown().await;
     }

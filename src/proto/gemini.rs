@@ -1523,9 +1523,13 @@ impl ProtocolWriter for GeminiWriter {
         // google-genai SDK then read `usage_metadata.total_token_count` as None, breaking billing).
         // The Anthropic and Cohere readers DO populate `model` from the upstream body (a real
         // Anthropic `Message` / Cohere response always names its model), so OR-ing `model.is_some()`
-        // closes the gap for those two as well. (Bedrock's Converse body carries no body-level model
-        // or timestamp, so its IR is identity-field-empty here — that residual cannot be distinguished
-        // from a minimal native body without crossing into a non-owned reader.)
+        // closes the gap for those two as well. Bedrock's Converse body carries no body-level model
+        // or timestamp, so its IR was identity-field-empty here — the residual that this gate alone
+        // could not distinguish from a minimal native body. That residual is now closed UPSTREAM at
+        // the cross-protocol seam (`forward.rs`), which stamps a synthesized `created` on any
+        // identity-empty egress IR before this writer runs, so a Bedrock→Gemini hop arrives with
+        // `created.is_some()` and emits `totalTokenCount` here just like the other backends. The OR
+        // on `model` stays as defense-in-depth for any caller of this writer that bypasses the seam.
         //
         // This still keeps a SAME-protocol read→write idempotent on the in-IR identity invariant that
         // `src/proto/mod.rs::test_gemini_read_write_response_roundtrip` guards: that fixture is a

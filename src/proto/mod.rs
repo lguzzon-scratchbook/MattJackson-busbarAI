@@ -5396,6 +5396,51 @@ mod gemini_tests {
         assert_eq!(roundtrip, j, "whole-response round-trip must be identical");
     }
 
+    // CLASS regression companion to the cross-protocol seam fix
+    // (forward.rs::test_cross_protocol_bedrock_to_gemini_carries_total_tokens_and_response_id):
+    // the SAME-protocol minimal roundtrip must stay LOSSLESS. A native Gemini body that legitimately
+    // omits `responseId` and any timestamp reads into an IR with `id`/`created`/`model` all `None`
+    // (the cross-protocol boundary signal is NOT set, because this path never crosses the seam — the
+    // seam only stamps a synthesized `created` on a cross-protocol hop). The writer must therefore
+    // emit NEITHER a synthesized `responseId` NOR `usageMetadata.totalTokenCount`, so a Gemini→Gemini
+    // read→write is byte-identical and a minimal native body never gains fabricated identity.
+    #[test]
+    fn test_gemini_same_protocol_minimal_response_omits_synthesized_identity() {
+        let j = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3
+            }
+        });
+
+        let reader = GeminiReader;
+        let writer = GeminiWriter;
+        let ir = reader.read_response(&j).expect("should parse");
+        // The minimal native body carries no identity signal at all.
+        assert_eq!(ir.id, None, "no responseId in the minimal native body");
+        assert_eq!(ir.created, None, "Gemini bodies carry no timestamp");
+        assert_eq!(ir.model, None, "no modelVersion in the minimal body");
+
+        let out = writer.write_response(&ir);
+        assert!(
+            out.get("responseId").is_none(),
+            "minimal same-protocol roundtrip must NOT synthesize a responseId: {out}"
+        );
+        assert!(
+            out["usageMetadata"].get("totalTokenCount").is_none(),
+            "minimal same-protocol roundtrip must NOT inject totalTokenCount: {out}"
+        );
+        // And the whole body stays byte-identical to the native input.
+        assert_eq!(
+            out, j,
+            "Gemini→Gemini minimal response roundtrip must remain byte-identical"
+        );
+    }
+
     // stream fan-out - feed Gemini chunk sequence through StreamDecodeState
     #[test]
     fn test_gemini_read_response_events_stream_fanout() {
