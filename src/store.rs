@@ -33,14 +33,28 @@ const OUTCOME_WINDOW_CAPACITY: usize = 1024;
 /// Lock a `std::sync::Mutex` on the production request path WITHOUT panicking on poison.
 ///
 /// `.lock().unwrap()` panics if the mutex is poisoned (a thread panicked while holding the guard).
-/// On the Tokio request path this is catastrophic and silent: one poisoned `pool_cells` / `swrr_lock`
-/// / `outcome_window` / `dead_reason` mutex would make EVERY subsequent request that touches it panic
+/// On the Tokio request path this is catastrophic and silent: one poisoned SWRR shard /
+/// `outcome_window` / `dead_reason` mutex (or the `pool_cells` RwLock) would make EVERY subsequent
+/// request that touches it panic
 /// too — a poisoned-mutex DoS cascade. The data behind these mutexes is always still valid after a
 /// poison (the critical sections only push to a bounded ring, mutate a small map, or swap a String),
 /// so we recover the inner guard via `into_inner()` instead of propagating the poison. This keeps the
 /// no-panic-on-request-path invariant: a single stray panic can never wedge the whole router.
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-recovering shared READ acquire for an `RwLock` on the request path — the `RwLock`
+/// analogue of [`lock_recover`]. A reader panic cannot leave inconsistent data behind the
+/// `pool_cells` lock (readers only iterate), so recover the guard instead of cascading the poison.
+fn read_recover<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-recovering exclusive WRITE acquire for an `RwLock` — used only on the rare lazy
+/// cell-insert path. Same no-panic-on-request-path rationale as [`lock_recover`].
+fn write_recover<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Get current time in seconds since epoch.
@@ -257,6 +271,14 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     #[must_use]
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
+    /// Return one previously-spent unit to the lane's lifetime request budget. Used to COMPENSATE a
+    /// `spend_budget` that was charged optimistically on the 2xx response HEADERS when the response
+    /// body then failed to transfer intact — no usable response was delivered, so the spend must be
+    /// reversed or every post-headers transport failure permanently drains the lane's `max_requests`
+    /// budget and stealthily removes capacity. A no-op for an unlimited lane. Never raises the budget
+    /// above the configured `max_requests` ceiling (a refund is only ever the inverse of a spend).
+    fn refund_budget(&self, lane: usize);
+
     // weighted member selection (SWRR algorithm)
     /// Select a candidate from the given list using smooth weighted round-robin over healthy members.
     /// `candidates` are indices into the store's lane array.
@@ -418,15 +440,29 @@ impl BreakerCellAccess for LaneState {
 /// Keyed by (pool name, lane index). Lazily populated.
 type PoolCellMap = std::collections::HashMap<(Box<str>, usize), Arc<BreakerCell>>;
 
+/// Number of SWRR lock shards. The SWRR weight read-modify-write only needs to be serialized
+/// PER POOL (the `Σ current_weight == 0` invariant is pool-local — two disjoint pools share no
+/// `current_weight` cells), so a single global lock needlessly serialized every pool's selection.
+/// A fixed shard array keyed by the pool-name hash lets disjoint pools select in parallel; only
+/// pools that hash to the same shard contend (rare with this many shards), and the shard array
+/// itself needs no allocation or new dependency. A power of two so the modulo is a cheap mask.
+const SWRR_SHARDS: usize = 64;
+
 pub(crate) struct InMemoryStore {
     lanes: Vec<Arc<LaneState>>,
     /// Per-(pool, lane) breaker cells, created lazily on first access. The lane-global fields
     /// (sem/budget/dead/ok) always live on `lanes[lane]`; only the breaker FSM is isolated per pool.
-    pool_cells: std::sync::Mutex<PoolCellMap>,
-    /// Serializes the SWRR weight read-modify-write so concurrent selections don't interleave their
-    /// `current_weight` updates (which would desync the algorithm's `Σ current_weight == 0` invariant
-    /// and bias distribution). Selection is microsecond-fast, so the contention is negligible.
-    swrr_lock: std::sync::Mutex<()>,
+    ///
+    /// An `RwLock` (not a plain `Mutex`): the overwhelmingly common access is a READ of an
+    /// already-created cell on the hot dispatch path (`cell()` / the `/stats` aggregators), and many
+    /// such reads can proceed concurrently under a shared lock. Only the rare lazy first-touch insert
+    /// of a new (pool, lane) cell takes the exclusive write lock. The previous `Mutex` forced an
+    /// exclusive acquisition for every read, serializing the selection path.
+    pool_cells: std::sync::RwLock<PoolCellMap>,
+    /// Sharded SWRR locks (see `SWRR_SHARDS`). A selection serializes only against other selections
+    /// whose pool hashes to the same shard, so concurrent selections for disjoint pools run in
+    /// parallel. Boxed slice so the struct stays movable without a const-generic array literal.
+    swrr_shards: Box<[std::sync::Mutex<()>]>,
 }
 
 struct LaneState {
@@ -487,13 +523,34 @@ impl InMemoryStore {
             .collect();
         Self {
             lanes: lane_states,
-            pool_cells: std::sync::Mutex::new(std::collections::HashMap::new()),
-            swrr_lock: std::sync::Mutex::new(()),
+            pool_cells: std::sync::RwLock::new(std::collections::HashMap::new()),
+            swrr_shards: (0..SWRR_SHARDS)
+                .map(|_| std::sync::Mutex::new(()))
+                .collect(),
         }
     }
 
     fn get_lane(&self, lane: usize) -> &Arc<LaneState> {
         &self.lanes[lane]
+    }
+
+    /// Select the SWRR shard lock for a pool. The shard is keyed by the pool-name hash so all
+    /// selections for a given pool serialize against each other (preserving the pool-local
+    /// `Σ current_weight == 0` invariant), while selections for pools hashing to other shards run in
+    /// parallel. `SWRR_SHARDS` is a power of two, so the index is a cheap mask.
+    fn swrr_shard(&self, pool: &str) -> &std::sync::Mutex<()> {
+        // FNV-1a over the pool name — a cheap, stable, well-distributed shard index. (Distribution,
+        // not cryptographic strength, is all that matters here: it only picks which lock shard a
+        // pool's selections serialize on.)
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for &byte in pool.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        let idx = (hash as usize) & (SWRR_SHARDS - 1);
+        &self.swrr_shards[idx]
     }
 
     /// Resolve the breaker cell for a (pool, lane). An empty pool name selects the lane-global
@@ -503,7 +560,21 @@ impl InMemoryStore {
         if pool.is_empty() {
             return self.lanes[lane].clone();
         }
-        let mut cells = lock_recover(&self.pool_cells);
+        // Fast path: the cell almost always already exists (it is created once, on the pool's first
+        // request, then read on every subsequent dispatch). Take a SHARED read lock and look it up
+        // WITHOUT allocating a `Box<str>` key — concurrent readers don't block each other, and the
+        // hot path does zero heap allocation. Only a genuine first-touch miss falls through to the
+        // exclusive write lock below.
+        {
+            let cells = read_recover(&self.pool_cells);
+            if let Some(c) = cells
+                .iter()
+                .find(|((p, l), _)| *l == lane && p.as_ref() == pool)
+            {
+                return c.1.clone();
+            }
+        }
+        let mut cells = write_recover(&self.pool_cells);
         cells
             .entry((Box::from(pool), lane))
             .or_insert_with(|| {
@@ -1102,7 +1173,7 @@ impl InMemoryStore {
         if Self::cell_ready_breaker(self.get_lane(lane).as_ref(), now) {
             return true;
         }
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         cells
             .iter()
             .any(|((_, l), cell)| *l == lane && Self::cell_ready_breaker(cell.as_ref(), now))
@@ -1117,7 +1188,7 @@ impl InMemoryStore {
             .cooldown_until
             .load(Ordering::Acquire)
             .saturating_sub(now);
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane {
                 worst = worst.max(
@@ -1135,7 +1206,7 @@ impl InMemoryStore {
     /// pool-routed traffic — see `lane_usable_any_cell`).
     fn lane_max_streak(&self, lane: usize) -> u32 {
         let mut worst = self.get_lane(lane).streak.load(Ordering::Relaxed);
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane {
                 worst = worst.max(cell.streak().load(Ordering::Relaxed));
@@ -1251,9 +1322,11 @@ impl InMemoryStore {
 
         // Smooth weighted round-robin over the healthy subset, using each cell's per-pool
         // current_weight. The add/find-max/subtract is one logical step, so serialize it across
-        // concurrent selections (otherwise interleaving corrupts the `Σ current_weight == 0`
-        // invariant and biases distribution).
-        let _swrr = lock_recover(&self.swrr_lock);
+        // concurrent selections FOR THIS POOL (otherwise interleaving corrupts the
+        // `Σ current_weight == 0` invariant and biases distribution). The invariant is pool-local —
+        // disjoint pools share no `current_weight` cells — so a per-pool (sharded) lock suffices and
+        // lets selections for different pools proceed in parallel (see `swrr_shard`).
+        let _swrr = lock_recover(self.swrr_shard(pool));
         let total: i64 = healthy.iter().map(|(_, _, w)| *w).sum();
         for (_, cell, eff_wt) in &healthy {
             cell.current_weight().fetch_add(*eff_wt, Ordering::Relaxed);
@@ -1407,7 +1480,7 @@ impl StateStore for InMemoryStore {
         // Every existing per-pool cell for this lane — the cells organic pool-routed traffic is
         // selected against. (A cell not yet created inherits the lane default lazily on first
         // access.)
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane {
                 trip(cell.as_ref());
@@ -1428,7 +1501,7 @@ impl StateStore for InMemoryStore {
         if suppressed(ls.as_ref()) {
             Self::cell_closed(ls.as_ref());
         }
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane && suppressed(cell.as_ref()) {
                 Self::cell_closed(cell.as_ref());
@@ -1446,7 +1519,7 @@ impl StateStore for InMemoryStore {
         Self::cell_record_failure(self.get_lane(lane).as_ref(), now, cfg, None);
         // Every existing per-pool cell for this lane — the cells organic traffic is selected
         // against. (A cell not yet created inherits health lazily on first access via `cell`.)
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane {
                 Self::cell_record_failure(cell.as_ref(), now, cfg, None);
@@ -1462,7 +1535,7 @@ impl StateStore for InMemoryStore {
         if suppressed(self.get_lane(lane).as_ref()) {
             return true;
         }
-        let cells = lock_recover(&self.pool_cells);
+        let cells = read_recover(&self.pool_cells);
         cells
             .iter()
             .any(|((_, l), cell)| *l == lane && suppressed(cell.as_ref()))
@@ -1508,6 +1581,17 @@ impl StateStore for InMemoryStore {
                 Err(observed) => cur = observed, // racing spender won; retry with the fresh value
             }
         }
+    }
+
+    fn refund_budget(&self, lane: usize) {
+        let ls = self.get_lane(lane);
+        if !ls.limited {
+            return; // unlimited budget — nothing was spent
+        }
+        // Inverse of a single `spend_budget`: return the one unit charged on the 2xx headers when the
+        // body then failed to transfer. This is ALWAYS paired with a prior successful spend on the
+        // same request, so a plain increment can never push the budget above its configured ceiling.
+        ls.budget.fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self, lane: usize, t: u64) -> LaneSnapshot {
@@ -2554,6 +2638,61 @@ mod tests {
         );
     }
 
+    /// MEDIUM/performance (store.rs swrr shards): the SWRR lock is now per-pool (sharded), not a
+    /// single global lock. Correctness must be unchanged — each pool's weighted distribution stays
+    /// proportional and pool-local (disjoint pools share no `current_weight` state). Drive two
+    /// disjoint pools and assert each independently honors its own weights.
+    #[test]
+    fn test_sharded_swrr_keeps_per_pool_distribution_proportional() {
+        let store = Arc::new(InMemoryStore::new(vec![
+            make_lane_data(0, 100),
+            make_lane_data(1, 100),
+        ]));
+        set_now_for_test(1000);
+        // Pool A: 3:1 over lanes 0,1. Pool B (disjoint shard usage): 1:1 over the same lanes.
+        let mut a0 = 0;
+        let mut a1 = 0;
+        for _ in 0..40 {
+            match store.select_weighted_in("pool-A", &[0, 1], &[3, 1], 1000) {
+                Some(0) => a0 += 1,
+                Some(1) => a1 += 1,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(a0, 30, "pool A: 3:1 weight => 30/40 to lane 0");
+        assert_eq!(a1, 10, "pool A: 3:1 weight => 10/40 to lane 1");
+
+        let mut b0 = 0;
+        let mut b1 = 0;
+        for _ in 0..40 {
+            match store.select_weighted_in("pool-B", &[0, 1], &[1, 1], 1000) {
+                Some(0) => b0 += 1,
+                Some(1) => b1 += 1,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(b0, 20, "pool B: 1:1 weight => even split");
+        assert_eq!(b1, 20, "pool B: 1:1 weight => even split");
+    }
+
+    /// The pool cell read path (`cell`) must return the SAME `Arc<BreakerCell>` for repeated reads of
+    /// an existing (pool, lane) — the read-then-write fast path must not mint a duplicate cell that
+    /// would split a lane's per-pool breaker state across two objects.
+    #[test]
+    fn test_cell_read_path_returns_stable_identity() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        // First touch creates the cell (write path); subsequent reads (read path) must reuse it.
+        store.record_success_in("p", 0);
+        store.record_transient_in("p", 0, "x", &BreakerCfg::default(), None);
+        // A failure recorded through the same cell must be visible on the next read of that cell —
+        // proving the read path resolves the SAME object, not a fresh Closed duplicate.
+        assert!(
+            store.cell_err_for_test("p", 0) >= 1,
+            "the read path must resolve the existing per-pool cell, not a fresh duplicate"
+        );
+    }
+
     /// The concurrency budget (max_requests) is lane-global: spending it through one pool must
     /// exhaust it for every pool, since they share the one upstream.
     #[test]
@@ -2581,6 +2720,48 @@ mod tests {
         assert!(
             !store.usable(0, 8100),
             "exhausted budget blocks direct route"
+        );
+    }
+
+    /// MEDIUM/correctness (forward.rs:~2175): a body transfer that fails AFTER the 2xx headers
+    /// (which optimistically spent one budget unit) must REFUND that unit — no usable response was
+    /// delivered, so a failed transfer must not permanently drain the lane's lifetime `max_requests`
+    /// budget. `refund_budget` is the inverse of one `spend_budget`.
+    #[test]
+    fn test_refund_budget_restores_a_spent_unit() {
+        let mut ld = make_lane_data(0, 10);
+        ld.limited = true;
+        ld.budget = 2;
+        let store = Arc::new(InMemoryStore::new(vec![ld]));
+        set_now_for_test(8100);
+
+        assert!(store.spend_budget(0), "spend 1 of 2");
+        assert!(store.spend_budget(0), "spend 2 of 2 (now exhausted)");
+        assert!(!store.spend_budget(0), "budget exhausted");
+
+        // A failed body transfer refunds one of the two optimistic spends.
+        store.refund_budget(0);
+        assert!(
+            store.spend_budget(0),
+            "after a refund the lane has one spendable unit again"
+        );
+        assert!(
+            !store.spend_budget(0),
+            "and only one — refund is not a reset"
+        );
+    }
+
+    /// `refund_budget` on an UNLIMITED lane is a no-op (nothing was ever spent): it must not turn an
+    /// unlimited lane into a counted one or otherwise perturb admission.
+    #[test]
+    fn test_refund_budget_unlimited_is_noop() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)])); // budget -1 = unlimited
+        set_now_for_test(8100);
+        store.refund_budget(0);
+        assert!(store.spend_budget(0), "unlimited lane still spends freely");
+        assert!(
+            store.usable(0, 8100),
+            "unlimited lane still usable after refund"
         );
     }
 

@@ -465,6 +465,14 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Vendor-neutral, infrastructure-free detail used for EVERY client-facing mid-stream / pre-first-byte
+/// transport-error frame. The raw `reqwest::Error` Display embeds hyper/reqwest/tokio internals and the
+/// egress backend URL (hostname, region, port) — both a protocol-indistinguishability tell (no native
+/// AI vendor emits hyper/reqwest strings) and an infrastructure-disclosure leak. The real cause is
+/// logged server-side via `tracing`; only this static string ever reaches the client. Single source of
+/// truth so a future edit cannot reintroduce `e.to_string()` at one site unnoticed.
+pub(crate) const MID_STREAM_GENERIC_DETAIL: &str = "upstream stream interrupted";
+
 /// Build the bytes for a mid-stream error to send to the CLIENT, framed in the INGRESS protocol.
 ///
 /// After the first byte has reached the client, failover is no longer possible, so an upstream
@@ -639,8 +647,11 @@ fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Optio
             }
             // Thinking/ToolResult/Image blocks have no native ConverseStream content-delta frame on
             // this synthesized path (the Bedrock writer maps their start/delta to None); skip them
-            // rather than emit an orphaned/empty frame.
-            _ => {}
+            // rather than emit an orphaned/empty frame. These are enumerated EXPLICITLY (no `_`
+            // catch-all) so that adding a future `IrBlock` variant (e.g. a document or
+            // redacted-thinking block) is a COMPILE error here rather than silent data loss in the
+            // synthesized ConverseStream output — this is the newest, least-tested encoder path.
+            IrBlock::Thinking { .. } | IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {}
         }
     }
 
@@ -834,6 +845,24 @@ impl UsageTap {
                 self.input_tokens = Some(v);
             }
             if let Some(v) = u.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+                self.output_tokens = Some(v);
+            }
+        }
+        // Cohere v2 native streaming terminal frame:
+        // `{"type":"message-end","delta":{"usage":{"tokens":{"input_tokens":N,"output_tokens":M}}}}`.
+        // The token counts are nested under `delta.usage.tokens`, NOT the top-level `usage` the loops
+        // above scan, so without this arm a same-protocol Cohere→Cohere streaming passthrough reports
+        // zero tokens and the virtual key's TPM/spend budget is silently undercharged. Descend the
+        // delta.usage.tokens path explicitly.
+        if let Some(tokens) = obj
+            .get("delta")
+            .and_then(|d| d.get("usage"))
+            .and_then(|u| u.get("tokens"))
+        {
+            if let Some(v) = tokens.get("input_tokens").and_then(|v| v.as_u64()) {
+                self.input_tokens = Some(v);
+            }
+            if let Some(v) = tokens.get("output_tokens").and_then(|v| v.as_u64()) {
                 self.output_tokens = Some(v);
             }
         }
@@ -1097,6 +1126,18 @@ where
                         // failure double-counted against the breaker.
                         drop(this.permit.take());
                         this.ended = true;
+                        // The raw reqwest/transport error (`e`) must NEVER reach the client body: its
+                        // Display embeds hyper/reqwest/tokio internals and the egress backend URL
+                        // (hostname, region, port) — a protocol-indistinguishability tell (no native
+                        // AI vendor emits hyper/reqwest strings) AND an infrastructure-disclosure leak.
+                        // Log the real cause server-side for operator observability, then put only a
+                        // static, vendor-neutral detail into the client-facing frame. A native vendor
+                        // mid-stream interruption carries a generic message, never a backend URL.
+                        tracing::warn!(
+                            ingress = %this.ingress_protocol,
+                            error = %e,
+                            "mid-stream upstream transport error; returning generic interruption to client"
+                        );
                         // Gemini JSON-array ingress (non-`alt=sse`): the client has been receiving a
                         // streaming JSON ARRAY (`[obj,obj`), so the in-band error MUST be a valid
                         // trailing array element followed by the closing `]` — NOT the SSE text frame
@@ -1106,8 +1147,11 @@ where
                         // Route the error through the framer instead: a Gemini `google.rpc.Status`
                         // element + `]`.
                         if let Some(framer) = this.json_array.as_mut() {
-                            let err_bytes =
-                                framer.finish_with_error(500, "INTERNAL", &e.to_string());
+                            let err_bytes = framer.finish_with_error(
+                                500,
+                                "INTERNAL",
+                                MID_STREAM_GENERIC_DETAIL,
+                            );
                             return Poll::Ready(Some(Ok(Bytes::from(err_bytes))));
                         }
                         // Emit the error in the INGRESS protocol's framing, NOT a hard-coded SSE
@@ -1119,12 +1163,22 @@ where
                         let err_bytes = mid_stream_error_bytes(
                             &this.ingress_protocol,
                             this.ingress_eventstream,
-                            &e.to_string(),
+                            MID_STREAM_GENERIC_DETAIL,
                         );
                         return Poll::Ready(Some(Ok(Bytes::from(err_bytes))));
                     } else {
-                        // Before first byte or non-SSE: propagate error (allows failover at caller level)
-                        return Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))));
+                        // Before first byte or non-SSE: terminate the body stream with an error. The
+                        // raw reqwest error (with its embedded backend URL / hyper internals) must not
+                        // ride out on the io::Error either — log the real cause server-side and surface
+                        // only a generic, vendor-neutral message on the stream item.
+                        tracing::warn!(
+                            ingress = %this.ingress_protocol,
+                            error = %e,
+                            "pre-first-byte upstream transport error; terminating body stream generically"
+                        );
+                        return Poll::Ready(Some(Err(std::io::Error::other(
+                            MID_STREAM_GENERIC_DETAIL,
+                        ))));
                     }
                 }
                 Poll::Ready(None) => {
@@ -1428,13 +1482,30 @@ fn ingress_stream_content_type(ingress: &str) -> Option<&'static str> {
     }
 }
 
-/// extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
-/// header. base_urls are already trailing-slash-trimmed and carry no path.
+/// extract the host (no scheme, no trailing slash, no userinfo) from a base URL, for SigV4's signed
+/// `host` header. base_urls are already trailing-slash-trimmed and carry no path.
+///
+/// A `base_url` carrying an embedded `user:pass@` userinfo component (accidental misconfiguration)
+/// must NOT leak into the signed `host` value: the HTTP stack sends `Host: host.example.com` while
+/// SigV4 would otherwise sign `host: user:pass@host.example.com`, producing a signature mismatch
+/// (every Bedrock request fails) AND embedding the credential in the signed string (which may surface
+/// in request logs/traces). Strip any userinfo (everything up to and including the last `@` in the
+/// authority) so the signed host always matches what the HTTP layer transmits.
 pub(crate) fn host_from_base(base: &str) -> String {
-    base.strip_prefix("https://")
+    let no_scheme = base
+        .strip_prefix("https://")
         .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or(base)
-        .to_string()
+        .unwrap_or(base);
+    // The authority ends at the first `/`, `?`, or `#`; userinfo (if any) precedes the LAST `@`
+    // within that authority. Split on the authority boundary first so an `@` appearing later in a
+    // path/query (not userinfo) is never mistaken for a userinfo delimiter.
+    let authority_end = no_scheme.find(['/', '?', '#']).unwrap_or(no_scheme.len());
+    let (authority, rest) = no_scheme.split_at(authority_end);
+    let host_authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    format!("{host_authority}{rest}")
 }
 
 /// Build outbound auth headers for a lane. Defaults to the protocol's native auth via
@@ -2163,14 +2234,18 @@ pub(crate) async fn forward_with_pool(
                         // The transfer failed mid-body. We optimistically recorded breaker success +
                         // spent the budget on the 2xx HEADERS above (shared with the streaming path),
                         // but the BODY never arrived intact: do NOT charge tokens for a corrupt
-                        // fragment, and record a compensating transient failure so the breaker sees
-                        // the transfer as failed (a clean 2xx success followed by a truncated body is
-                        // an upstream failure, not a completion). Return an ingress-native error.
+                        // fragment, record a compensating transient failure so the breaker sees the
+                        // transfer as failed (a clean 2xx success followed by a truncated body is an
+                        // upstream failure, not a completion), AND refund the request budget unit spent
+                        // on the headers — no usable response was delivered, so a failed body transfer
+                        // must not permanently drain the lane's `max_requests` budget (which would
+                        // stealthily remove capacity under sustained post-headers transport failures).
+                        // Return an ingress-native error.
                         tracing::warn!(
                             ingress = %ingress_protocol,
                             egress = %app.lanes[i].protocol.name(),
                             "cross-protocol non-stream upstream body failed mid-transfer; \
-                             not recording success/usage, returning ingress-native error"
+                             not recording success/usage, refunding budget, returning ingress-native error"
                         );
                         app.store.record_transient_in(
                             pool_name,
@@ -2179,6 +2254,7 @@ pub(crate) async fn forward_with_pool(
                             &breaker_cfg,
                             None,
                         );
+                        app.store.refund_budget(i);
                         return ingress_error(
                             ingress_protocol,
                             StatusCode::BAD_GATEWAY,
@@ -2685,13 +2761,16 @@ async fn forward_once(
                 if read_end == ReadEnd::TransportError {
                     // Body failed mid-transfer after an optimistic success/budget recording on the
                     // 2xx headers (see the main forward path): don't charge tokens for a corrupt
-                    // fragment, record a compensating transient failure, and return an ingress-native
-                    // error. No pool context on the degraded path, so use the bare-lane forms.
+                    // fragment, record a compensating transient failure, refund the request budget
+                    // unit spent on the headers (no usable response was delivered, so a failed body
+                    // transfer must not permanently drain the lane's `max_requests` budget), and
+                    // return an ingress-native error. No pool context on the degraded path, so use the
+                    // bare-lane forms.
                     tracing::warn!(
                         ingress = %ingress_protocol,
                         egress = %egress_name,
                         "cross-protocol non-stream upstream body failed mid-transfer; \
-                         not recording success/usage, returning ingress-native error"
+                         not recording success/usage, refunding budget, returning ingress-native error"
                     );
                     app.store.record_transient(
                         i,
@@ -2699,6 +2778,7 @@ async fn forward_once(
                         &crate::store::BreakerCfg::default(),
                         None,
                     );
+                    app.store.refund_budget(i);
                     return Ok(ingress_error(
                         ingress_protocol,
                         StatusCode::BAD_GATEWAY,
@@ -3065,6 +3145,17 @@ mod usage_tap_tests {
         ));
         assert_eq!(t.input_tokens, Some(7));
         assert_eq!(t.output_tokens, Some(3));
+
+        // Cohere v2 native streaming terminal frame: token counts nested under
+        // `delta.usage.tokens`, NOT the top-level `usage`. Before the dedicated arm this reported
+        // zero tokens on a same-protocol Cohere passthrough, silently undercharging the key's
+        // TPM/spend budget.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"type":"message-end","delta":{"usage":{"tokens":{"input_tokens":11,"output_tokens":9}}}}"#,
+        ));
+        assert_eq!(t.input_tokens, Some(11));
+        assert_eq!(t.output_tokens, Some(9));
     }
 
     #[test]
@@ -3346,6 +3437,35 @@ mod auth_style_tests {
             assert_eq!(headers[0].1.to_str().unwrap(), "Bearer SECRETKEY");
         }
     }
+
+    #[test]
+    fn test_host_from_base_strips_scheme_and_userinfo() {
+        use super::host_from_base;
+        // Plain host: scheme stripped, nothing else touched.
+        assert_eq!(
+            host_from_base("https://bedrock-runtime.us-east-1.amazonaws.com"),
+            "bedrock-runtime.us-east-1.amazonaws.com"
+        );
+        assert_eq!(host_from_base("http://localhost:8080"), "localhost:8080");
+        // No scheme: returned unchanged.
+        assert_eq!(host_from_base("example.com"), "example.com");
+        // Embedded userinfo MUST be stripped so the SigV4-signed `host` matches the `Host` header
+        // the HTTP stack actually transmits (otherwise: signature mismatch + credential in the
+        // signed string). The host (and port) survive; the credential is gone.
+        assert_eq!(
+            host_from_base("https://user:pass@host.example.com"),
+            "host.example.com"
+        );
+        assert_eq!(
+            host_from_base("https://user:pass@host.example.com:443"),
+            "host.example.com:443"
+        );
+        // An `@` later in a path/query is NOT userinfo and must not be treated as one.
+        assert_eq!(
+            host_from_base("https://host.example.com/x@y"),
+            "host.example.com/x@y"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3385,10 +3505,59 @@ mod on_exhausted_tests {
 mod mid_stream_error_tests {
     use super::{
         client_fault_kind, extract_error_message, mid_stream_error_bytes, strip_router_shim_keys,
-        strip_same_protocol_model_shim, GEMINI_JSON_ARRAY_SHIM_KEY,
+        strip_same_protocol_model_shim, GEMINI_JSON_ARRAY_SHIM_KEY, MID_STREAM_GENERIC_DETAIL,
     };
     use crate::proto::StatusClass;
     use serde_json::{json, Value};
+
+    /// HIGH (forward.rs:~1108 gemini JSON-array path, + the SSE/eventstream + pre-first-byte twins):
+    /// the client-facing mid-stream transport-error detail MUST be a static, vendor-neutral string —
+    /// NEVER the raw `reqwest::Error` Display, which embeds hyper/reqwest internals and the egress
+    /// backend URL (a protocol tell + infrastructure leak). All three call sites pass the single
+    /// `MID_STREAM_GENERIC_DETAIL` const; pin that the const itself carries no leak markers, and that
+    /// both error-framing helpers it feeds emit a body free of them.
+    #[test]
+    fn test_mid_stream_generic_detail_has_no_leak_markers() {
+        let detail = MID_STREAM_GENERIC_DETAIL;
+        for marker in [
+            "http://",
+            "https://",
+            "reqwest",
+            "hyper",
+            "tcp",
+            "dns",
+            "connect",
+            "amazonaws",
+            "url",
+            "error sending request",
+        ] {
+            assert!(
+                !detail.to_ascii_lowercase().contains(marker),
+                "generic mid-stream detail must not contain leak marker {marker:?}: {detail:?}"
+            );
+        }
+        // The Gemini JSON-array path (the HIGH finding): a `google.rpc.Status` element whose message
+        // is exactly the generic detail, with no transport/URL markers spliced in.
+        let mut framer = crate::proto::GeminiJsonArrayFramer::new();
+        let arr = framer.finish_with_error(500, "INTERNAL", MID_STREAM_GENERIC_DETAIL);
+        let arr_text = String::from_utf8_lossy(&arr);
+        assert!(arr_text.contains(MID_STREAM_GENERIC_DETAIL));
+        for marker in ["https://", "reqwest", "hyper", "amazonaws"] {
+            assert!(
+                !arr_text.contains(marker),
+                "gemini json-array error body leaked {marker:?}: {arr_text}"
+            );
+        }
+        // The SSE ingress twins carry the same generic detail in their native error envelope.
+        for proto in ["openai", "anthropic", "gemini", "cohere", "responses"] {
+            let bytes = mid_stream_error_bytes(proto, false, MID_STREAM_GENERIC_DETAIL);
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains(MID_STREAM_GENERIC_DETAIL),
+                "{proto} mid-stream error must carry the generic detail; got {text}"
+            );
+        }
+    }
 
     /// HIGH (forward.rs:353-380 / 372-380): a mid-stream upstream failure on a BEDROCK-ingress stream
     /// (the client decodes binary `application/vnd.amazon.eventstream`) MUST be emitted as a valid
