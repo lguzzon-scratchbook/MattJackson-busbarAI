@@ -5512,6 +5512,69 @@ mod gemini_tests {
         );
     }
 
+    /// MEDIUM/test-coverage (proto/mod.rs:754-763): the `apply_openai_chunk_identity` guard skips any
+    /// frame that is not a `chat.completion.chunk` (no `object` field). The in-band ERROR envelope the
+    /// OpenAI writer emits mid-stream (`{"error":{...}}`, no `object`) must therefore pass through
+    /// UNCHANGED — no synthetic `id`/`created` injected, which would corrupt the error JSON shape a
+    /// strict SDK rejects. Drive an anthropic egress → OpenAI ingress stream with a real opening chunk
+    /// (to LATCH the stream identity) followed by a mid-stream error event, then assert the resulting
+    /// error frame carries neither `id` nor `created`.
+    #[test]
+    fn test_openai_ingress_mid_stream_error_envelope_unchanged_by_identity() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("openai ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            // Opening chunk: latches id/created/model in apply_openai_chunk_identity.
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\",\"model\":\"claude-x\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            // Mid-stream error: the writer emits an in-band `{"error":{...}}` envelope (no `object`).
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n",
+        ] {
+            raw.extend(t.feed(frame.as_bytes()));
+        }
+        raw.extend(t.finish());
+
+        let chunks = openai_sse_chunks(&raw);
+        // There must be at least one error envelope; locate it.
+        let error_frame = chunks
+            .iter()
+            .find(|c| c.get("error").is_some())
+            .expect("a mid-stream error envelope must be emitted to the OpenAI client");
+        // The guard must have left it untouched: NO synthetic id/created injected onto the error.
+        assert!(
+            error_frame.get("id").is_none(),
+            "error envelope must NOT receive an injected `id` (would corrupt the shape); got {error_frame}"
+        );
+        assert!(
+            error_frame.get("created").is_none(),
+            "error envelope must NOT receive an injected `created`; got {error_frame}"
+        );
+        assert!(
+            error_frame.get("object").is_none(),
+            "error envelope is not a chat.completion.chunk and carries no `object`; got {error_frame}"
+        );
+        // And the error body itself is well-formed (the writer's standard in-band shape).
+        assert!(
+            error_frame
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "error envelope must carry an `error.type`; got {error_frame}"
+        );
+        // The chat.completion.chunk frames before the error still carry a latched identity (proving
+        // identity injection IS active on real chunks — the guard is selective, not globally off).
+        let had_identity_chunk = chunks.iter().any(|c| {
+            c.get("object").and_then(|v| v.as_str()) == Some("chat.completion.chunk")
+                && c.get("id").is_some()
+        });
+        assert!(
+            had_identity_chunk,
+            "real chat.completion.chunk frames must still carry the latched id (guard is selective)"
+        );
+    }
+
     /// Finding (bedrock messageStop+metadata fan-out, real latencyMs): a bedrock->bedrock stream must
     /// round-trip — the egress reader collapses the native two-frame stop/usage split into ONE
     /// combined IR MessageDelta, and the ingress writer fan-out RE-SPLITS it back into the native

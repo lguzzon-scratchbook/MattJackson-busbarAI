@@ -176,6 +176,10 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // `record_rate_limit`, `record_hard_down` are genuinely release-dead and keep the allow.
     #[cfg_attr(not(test), allow(dead_code))]
     fn breaker_state(&self, lane: usize) -> BreakerState;
+    // `snapshot()` now reports the lane-GLOBAL (worst-across-all-pool-cells) cooldown via
+    // `lane_max_cooldown_remaining`, not the default-cell-only `cooldown_remaining` (which stayed 0
+    // for pool-routed traffic), so this bare-lane form is release-dead and exercised only by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
     fn cooldown_remaining_in(&self, pool: &str, lane: usize, now: u64) -> u64;
     /// True if the breaker is suppressing this lane in ANY cell (default or any pool) — either a
@@ -748,10 +752,28 @@ impl InMemoryStore {
             ST_OPEN => {
                 let until = c.cooldown_until().load(Ordering::Acquire);
                 if now >= until {
-                    c.breaker_state().store(ST_HALF_OPEN, Ordering::Release);
-                    c.probe_in_flight()
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    // Single CAS Open→HalfOpen: the state and probe acquisition must move as an
+                    // atomic pair. A non-CAS `store(ST_HALF_OPEN)` followed by a separate
+                    // `probe_in_flight` CAS opens a window where a delayed store can clobber a
+                    // concurrent `cell_closed` (which writes ST_CLOSED + clears the probe flag),
+                    // leaving a Closed cell with probe_in_flight wedged true and permanently
+                    // benching the lane. Only the thread that wins this CAS owns the cell's
+                    // single-flight probe; losers observed the transition already happened and
+                    // must treat the probe as taken.
+                    if c.breaker_state()
+                        .compare_exchange(
+                            ST_OPEN,
+                            ST_HALF_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
                         .is_ok()
+                    {
+                        c.probe_in_flight().store(true, Ordering::Release);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -1062,6 +1084,62 @@ impl InMemoryStore {
             .cooldown_until()
             .load(Ordering::Acquire)
             .saturating_sub(now)
+    }
+
+    /// Lane-global readiness for `/stats`: true iff the lane is admissible (not dead / in budget) AND
+    /// at least one breaker cell (the default cell or ANY per-pool cell) would admit a request right
+    /// now. Production traffic routes through NAMED pools, whose cells the default-cell-only
+    /// `is_ready("", ...)` never sees — so reading only the default cell reports `usable=true` even
+    /// when every per-pool breaker for the lane is tripped Open. Iterating all known cells makes the
+    /// `/stats` `usable` flag reflect real admissibility. Side-effect-free (uses the non-mutating
+    /// `cell_ready_breaker`, never the probe-stealing `usable`).
+    fn lane_usable_any_cell(&self, lane: usize, now: u64) -> bool {
+        if !self.lane_admissible(lane) {
+            return false;
+        }
+        if Self::cell_ready_breaker(self.get_lane(lane).as_ref(), now) {
+            return true;
+        }
+        let cells = lock_recover(&self.pool_cells);
+        cells
+            .iter()
+            .any(|((_, l), cell)| *l == lane && Self::cell_ready_breaker(cell.as_ref(), now))
+    }
+
+    /// Worst-case remaining cooldown across the default cell and every per-pool cell for the lane.
+    /// `/stats` must surface the lane's most-tripped state, not the default cell's (which never moves
+    /// for pool-routed traffic — see `lane_usable_any_cell`).
+    fn lane_max_cooldown_remaining(&self, lane: usize, now: u64) -> u64 {
+        let mut worst = self
+            .get_lane(lane)
+            .cooldown_until
+            .load(Ordering::Acquire)
+            .saturating_sub(now);
+        let cells = lock_recover(&self.pool_cells);
+        for ((_, l), cell) in cells.iter() {
+            if *l == lane {
+                worst = worst.max(
+                    cell.cooldown_until()
+                        .load(Ordering::Acquire)
+                        .saturating_sub(now),
+                );
+            }
+        }
+        worst
+    }
+
+    /// Worst-case consecutive-failure streak across the default cell and every per-pool cell for the
+    /// lane (the lane-global health signal for `/stats`; the default cell's streak stays 0 for
+    /// pool-routed traffic — see `lane_usable_any_cell`).
+    fn lane_max_streak(&self, lane: usize) -> u32 {
+        let mut worst = self.get_lane(lane).streak.load(Ordering::Relaxed);
+        let cells = lock_recover(&self.pool_cells);
+        for ((_, l), cell) in cells.iter() {
+            if *l == lane {
+                worst = worst.max(cell.streak().load(Ordering::Relaxed));
+            }
+        }
+        worst
     }
 
     fn record_failure_for(
@@ -1443,11 +1521,11 @@ impl StateStore for InMemoryStore {
             // HalfOpen and CAS-acquire the single-flight recovery probe, so a monitor polling /stats
             // would steal the probe from organic traffic and falsely flip the reported state. `is_ready`
             // reports the same admission verdict without touching the breaker FSM.
-            usable: self.is_ready(lane, t),
+            usable: self.lane_usable_any_cell(lane, t),
             dead: ls.dead.load(Ordering::Relaxed),
             dead_reason: lock_recover(&ls.dead_reason).clone(),
-            cooldown_remaining_s: self.cooldown_remaining(lane, t),
-            streak: ls.streak.load(Ordering::Relaxed),
+            cooldown_remaining_s: self.lane_max_cooldown_remaining(lane, t),
+            streak: self.lane_max_streak(lane),
             budget: if ls.limited {
                 ls.budget.load(Ordering::Relaxed)
             } else {
@@ -2050,6 +2128,137 @@ mod tests {
             !store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
             "the single-flight probe must be released on recovery"
         );
+    }
+
+    /// Concurrency regression for the non-CAS Open→HalfOpen transition (Round 11 HIGH). Two threads
+    /// racing an expired-Open cell must yield EXACTLY ONE probe winner, and the `probe_in_flight`
+    /// flag must never end up wedged `true` on a cell that did not retain the probe. The old code
+    /// did `store(ST_HALF_OPEN)` unconditionally then a separate `probe_in_flight` CAS, so a delayed
+    /// store could clobber a concurrent `cell_closed` and force `probe_in_flight=true` on a Closed
+    /// cell — permanently benching the lane on the next Open cycle. The fix makes the state move a
+    /// single Open→HalfOpen CAS, with only the winner setting the probe.
+    #[test]
+    fn test_concurrent_open_to_half_open_single_probe_winner() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
+
+        // Many independent races to make the (formerly ~1-in-2) interleaving overwhelmingly likely.
+        for _ in 0..2000 {
+            let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+            let now = 3000u64;
+
+            // Lane Open with an already-expired cooldown — both racers are probe-eligible.
+            store
+                .get_lane(0)
+                .cooldown_until
+                .store(1000, Ordering::Relaxed);
+            store
+                .get_lane(0)
+                .breaker_state
+                .store(ST_OPEN, Ordering::Relaxed);
+
+            let winners = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(2));
+
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let store = Arc::clone(&store);
+                    let winners = Arc::clone(&winners);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if store.usable(0, now) {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("racing thread must not panic");
+            }
+
+            assert_eq!(
+                winners.load(Ordering::Relaxed),
+                1,
+                "exactly one thread must win the single-flight recovery probe"
+            );
+            // Winner left the cell HalfOpen with the probe held.
+            assert_eq!(
+                store.breaker_state(0),
+                BreakerState::HalfOpen,
+                "the probe winner must leave the cell HalfOpen"
+            );
+            assert!(
+                store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+                "the winner must hold the single-flight probe"
+            );
+        }
+    }
+
+    /// Companion race: probe winner SUCCEEDS (cell → Closed, probe cleared) while a second thread is
+    /// concurrently attempting the Open→HalfOpen acquisition. The loser must NOT clobber the Closed
+    /// state nor wedge `probe_in_flight=true` on the now-Closed cell. Drives the exact interleaving
+    /// described in the HIGH finding: a delayed transition racing a completing `cell_closed`.
+    #[test]
+    fn test_concurrent_acquire_racing_probe_success_never_wedges_flag() {
+        use std::sync::Barrier;
+
+        for _ in 0..2000 {
+            let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+            let now = 3000u64;
+            store
+                .get_lane(0)
+                .cooldown_until
+                .store(1000, Ordering::Relaxed);
+            store
+                .get_lane(0)
+                .breaker_state
+                .store(ST_OPEN, Ordering::Relaxed);
+
+            // Thread A wins the probe (deterministically, before the race) and will report success.
+            // Thread B races a fresh acquisition against A's success.
+            let barrier = Arc::new(Barrier::new(2));
+
+            let store_a = Arc::clone(&store);
+            let barrier_a = Arc::clone(&barrier);
+            let a = std::thread::spawn(move || {
+                // A acquires the probe first so the cell is HalfOpen with probe held.
+                assert!(store_a.usable(0, now), "A must win the initial probe");
+                barrier_a.wait();
+                // A's probe succeeds → cell_closed clears probe_in_flight and writes ST_CLOSED.
+                store_a.record_success(0);
+            });
+
+            let store_b = Arc::clone(&store);
+            let barrier_b = Arc::clone(&barrier);
+            let b = std::thread::spawn(move || {
+                barrier_b.wait();
+                // B races against A's success. Whatever it observes, it must never wedge the flag.
+                let _ = store_b.usable(0, now);
+            });
+
+            a.join().expect("A must not panic");
+            b.join().expect("B must not panic");
+
+            // After the dust settles the cell is either Closed (A's success won) or HalfOpen (B
+            // re-acquired after A closed). In neither outcome may a Closed cell hold the probe.
+            let state = store.breaker_state(0);
+            let probe_held = store.get_lane(0).probe_in_flight.load(Ordering::Relaxed);
+            match state {
+                BreakerState::Closed => assert!(
+                    !probe_held,
+                    "a Closed cell must never retain probe_in_flight=true (wedged lane)"
+                ),
+                BreakerState::HalfOpen => assert!(
+                    probe_held,
+                    "a HalfOpen cell that B re-acquired must hold the probe"
+                ),
+                BreakerState::Open { .. } => {
+                    // Acceptable transient end-state only if the probe is not stuck held.
+                    assert!(!probe_held, "an Open cell must not retain the probe flag");
+                }
+            }
+        }
     }
 
     // ── per-(pool, lane) breaker isolation ──────────────────────────────────────────────────────

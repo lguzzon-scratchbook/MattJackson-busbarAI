@@ -6,7 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::{body::Body, http::header::CONTENT_TYPE, response::IntoResponse, response::Response};
+use axum::{
+    body::Body,
+    http::header::{CONTENT_TYPE, USER_AGENT},
+    response::IntoResponse,
+    response::Response,
+};
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::StatusCode;
@@ -370,10 +375,25 @@ const MAX_TRANSLATED_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// bytes remained at the cap), so a caller that must parse the whole body (cross-protocol 2xx
 /// translation) can distinguish "too large to translate" from "genuinely unparseable" instead of
 /// silently mis-reporting a truncated success as an untranslatable error.
-async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, bool) {
+/// Why a [`read_capped`] read stopped — distinguishes a body that arrived in full from one that
+/// was cut short, so the buffered cross-protocol translate path can avoid mis-accounting a
+/// half-received completion as a clean success (recording breaker success + charging tokens on a
+/// body that is in fact a truncated/corrupt fragment of a failed transfer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadEnd {
+    /// The upstream signalled end-of-body (`Ok(None)`): the buffer holds the complete response.
+    Complete,
+    /// The body overran `cap` before EOF: the buffer holds a prefix, more bytes existed.
+    Truncated,
+    /// The transport failed mid-body (`Err(_)` from `chunk()`): the buffer holds an incomplete,
+    /// possibly-corrupt fragment of a transfer that never finished. NOT a clean completion.
+    TransportError,
+}
+
+async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, ReadEnd) {
     let mut buf: Vec<u8> = Vec::new();
     let mut r = r;
-    let mut truncated = false;
+    let mut end = ReadEnd::Complete;
     loop {
         match r.chunk().await {
             Ok(Some(chunk)) => {
@@ -381,21 +401,28 @@ async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, bool) {
                 if remaining == 0 {
                     // Cap already full but more bytes arrived — the body overran the cap. Stop
                     // reading; the connection is dropped when `r` falls out of scope.
-                    truncated = true;
+                    end = ReadEnd::Truncated;
                     break;
                 }
                 let take = remaining.min(chunk.len());
                 buf.extend_from_slice(&chunk[..take]);
                 if take < chunk.len() {
-                    truncated = true; // this chunk filled the cap with bytes left over
+                    end = ReadEnd::Truncated; // this chunk filled the cap with bytes left over
                     break;
                 }
             }
-            Ok(None) => break, // end of body
-            Err(_) => break, // transport error mid-body — keep what we have (was unwrap_or_default)
+            Ok(None) => break, // clean end of body — buffer is complete
+            Err(_) => {
+                // Transport error mid-body. Keep what we have for any best-effort error relay, but
+                // flag it so the buffered translate path does NOT treat a half-received body as a
+                // clean 2xx completion (which would record breaker success and charge tokens on a
+                // corrupt fragment). (Was previously indistinguishable from clean EOF.)
+                end = ReadEnd::TransportError;
+                break;
+            }
         }
     }
-    (Bytes::from(buf), truncated)
+    (Bytes::from(buf), end)
 }
 
 /// Read an upstream ERROR / verbatim-relay body under the tight [`MAX_UPSTREAM_BUFFERED_BYTES`] cap.
@@ -1430,6 +1457,31 @@ pub(crate) fn lane_auth_headers(
     }
 }
 
+/// Plausible native-SDK `User-Agent` for the chosen EGRESS protocol. reqwest sends NO default
+/// User-Agent unless one is set, so without this every proxied upstream request reaches the backend
+/// with no UA at all — a trivial backend-side fingerprint distinguishing busbar-proxied traffic from
+/// a native vendor SDK (which always sends a recognizable UA). Returned strings mirror the shape a
+/// real first-party SDK emits for that provider's API. (Backend-facing only; does not affect client
+/// indistinguishability.)
+fn egress_user_agent(egress_protocol: &str) -> &'static str {
+    match egress_protocol {
+        // Anthropic Python SDK UA shape (api.anthropic.com).
+        "anthropic" => "anthropic-sdk-python/0.39.0",
+        // OpenAI Python SDK shape; the Responses API is served by the same SDK/UA.
+        "openai" | "responses" => "OpenAI/Python 1.54.0",
+        // Google GenAI SDK shape (generativelanguage.googleapis.com).
+        "gemini" => "google-genai-sdk/0.8.0 gl-python/3.11",
+        // AWS Bedrock is reached via boto3/botocore.
+        "bedrock" => "Boto3/1.35.0 md/Botocore#1.35.0",
+        // Cohere Python SDK shape (api.cohere.com).
+        "cohere" => "cohere-python/5.11.0",
+        // Unknown/foreign egress protocol: a generic-but-present UA still beats sending none (no UA
+        // at all is the most distinctive tell). Enumerated default, not a wildcard on a disposition
+        // match — this is a UA-string lookup, not a breaker/disposition decision.
+        _ => "okhttp/4.12.0",
+    }
+}
+
 /// Charge a non-streaming response's token usage to the virtual key's budget. The streaming path
 /// taps tokens incrementally inside `FirstByteBody`; buffered (non-streaming) responses have no
 /// such wrapper, so without this the per-key token counter (and any TPM limit derived from it)
@@ -1695,6 +1747,9 @@ pub(crate) async fn forward_with_pool(
             .post(format!("{base}{url_path}"))
             .headers(convert_headers(auth))
             .header(CONTENT_TYPE, "application/json")
+            // Native-SDK User-Agent for the egress protocol. The shared client sets none, so without
+            // this the backend sees a UA-less request — a proxy fingerprint (see egress_user_agent).
+            .header(USER_AGENT, egress_user_agent(egress_name))
             .body(payload);
         // reqwest's per-request `.timeout()` bounds the ENTIRE request lifecycle, INCLUDING reading
         // the response body. For a STREAMING response that body is a long-lived generation stream
@@ -2102,11 +2157,38 @@ pub(crate) async fn forward_with_pool(
                     // legitimate 2xx completion can far exceed 256 KiB and must be buffered WHOLE to
                     // parse+translate. `truncated` distinguishes "too large to translate" from
                     // "genuinely unparseable" so a too-large success is not mis-reported as a 500.
-                    let (bytes, truncated) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
+                    let (bytes, read_end) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
                     drop(permit); // upstream call complete; a non-streamed response holds no permit
-                                  // Token accounting: no FirstByteBody on this buffered path, so tap here.
+                    if read_end == ReadEnd::TransportError {
+                        // The transfer failed mid-body. We optimistically recorded breaker success +
+                        // spent the budget on the 2xx HEADERS above (shared with the streaming path),
+                        // but the BODY never arrived intact: do NOT charge tokens for a corrupt
+                        // fragment, and record a compensating transient failure so the breaker sees
+                        // the transfer as failed (a clean 2xx success followed by a truncated body is
+                        // an upstream failure, not a completion). Return an ingress-native error.
+                        tracing::warn!(
+                            ingress = %ingress_protocol,
+                            egress = %app.lanes[i].protocol.name(),
+                            "cross-protocol non-stream upstream body failed mid-transfer; \
+                             not recording success/usage, returning ingress-native error"
+                        );
+                        app.store.record_transient_in(
+                            pool_name,
+                            i,
+                            "transport",
+                            &breaker_cfg,
+                            None,
+                        );
+                        return ingress_error(
+                            ingress_protocol,
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            "upstream response transfer failed mid-body",
+                        );
+                    }
+                    // Token accounting: no FirstByteBody on this buffered path, so tap here.
                     record_nonstream_usage(&bytes, &usage_sink);
-                    if truncated {
+                    if read_end == ReadEnd::Truncated {
                         tracing::warn!(
                             ingress = %ingress_protocol,
                             egress = %app.lanes[i].protocol.name(),
@@ -2506,6 +2588,8 @@ async fn forward_once(
         .post(format!("{base}{url_path}"))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, "application/json")
+        // Native-SDK User-Agent for the egress protocol (mirrors the main forward path).
+        .header(USER_AGENT, egress_user_agent(egress_name))
         .body(payload);
     // See the main forward path: reqwest's `.timeout()` bounds the whole body read, so applying the
     // failover deadline to a STREAMING request truncates a healthy long generation at that wall-clock
@@ -2596,12 +2680,36 @@ async fn forward_once(
                 // COMPLETION cap (not the tight error-body cap): a legitimate 2xx can far exceed
                 // 256 KiB and must be buffered whole to translate; `truncated` lets us return a
                 // clear error instead of mis-reporting a too-large success as untranslatable.
-                let (bytes, truncated) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
+                let (bytes, read_end) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
                 drop(permit); // a buffered (non-streamed) response holds no permit
-                              // Token accounting: no FirstByteBody on this buffered path, so tap the
-                              // usage here and charge it to the key's budget (mirrors the main path).
+                if read_end == ReadEnd::TransportError {
+                    // Body failed mid-transfer after an optimistic success/budget recording on the
+                    // 2xx headers (see the main forward path): don't charge tokens for a corrupt
+                    // fragment, record a compensating transient failure, and return an ingress-native
+                    // error. No pool context on the degraded path, so use the bare-lane forms.
+                    tracing::warn!(
+                        ingress = %ingress_protocol,
+                        egress = %egress_name,
+                        "cross-protocol non-stream upstream body failed mid-transfer; \
+                         not recording success/usage, returning ingress-native error"
+                    );
+                    app.store.record_transient(
+                        i,
+                        "transport",
+                        &crate::store::BreakerCfg::default(),
+                        None,
+                    );
+                    return Ok(ingress_error(
+                        ingress_protocol,
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "upstream response transfer failed mid-body",
+                    ));
+                }
+                // Token accounting: no FirstByteBody on this buffered path, so tap the usage here and
+                // charge it to the key's budget (mirrors the main path).
                 record_nonstream_usage(&bytes, &usage_sink);
-                if truncated {
+                if read_end == ReadEnd::Truncated {
                     tracing::warn!(
                         ingress = %ingress_protocol,
                         egress = %egress_name,
@@ -3986,6 +4094,73 @@ mod ingress_indistinguishability_tests {
             rid.starts_with("req_"),
             "anthropic-ingress 2xx MUST carry a synthesized `request-id` header in the native req_ \
              shape; got {rid:?}"
+        );
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/test-coverage (forward.rs:66-81, STREAMING branch at forward.rs:2377): an anthropic-
+    /// INGRESS STREAMING 2xx must ALSO carry the `request-id` response header. The non-streaming test
+    /// above exercises only the buffered builder; the streaming builder is a separate code path, so a
+    /// regression on the stream branch alone would otherwise pass CI. The official SDK reads
+    /// `request-id` into `Message._request_id` on streamed responses too — an absent header is a proxy
+    /// tell. Same-protocol anthropic stream (no upstream id supplied by the mock) → synthesized `req_`.
+    #[tokio::test]
+    async fn test_anthropic_ingress_streaming_carries_request_id_header() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // A minimal anthropic-shaped SSE stream (the mock serves `text/event-stream`, driving the
+        // streaming branch). The header attachment is independent of the event payloads.
+        state.push(MockResponse::Sse {
+            events: vec![
+                r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_x","role":"assistant","content":[],"usage":{"input_tokens":3,"output_tokens":0}}}"#
+                    .to_string(),
+                r#"event: message_stop
+data: {"type":"message_stop"}"#
+                    .to_string(),
+            ],
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-x",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic"),
+            )
+            .pool("ps", &[(0, 1)])
+            .build();
+        let body = serde_json::to_vec(&json!({
+            "model": "ps",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 50,
+            "stream": true
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "ps",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let rid = resp
+            .headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            rid.starts_with("req_"),
+            "anthropic-ingress STREAMING 2xx MUST carry a `request-id` header in the native req_ \
+             shape (forward.rs:2377 path); got {rid:?}"
         );
         server.shutdown().await;
     }
