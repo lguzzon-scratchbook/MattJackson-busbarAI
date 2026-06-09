@@ -61,24 +61,31 @@ pub(crate) fn synth_amzn_request_id() -> Option<String> {
 /// tell. Used by `forward.rs` on anthropic-ingress success/relay 2xx responses that have NO upstream
 /// `request-id` to forward (the error path mirrors the writer's own body `request_id` into the header
 /// instead; the same-protocol passthrough forwards the UPSTREAM `request-id` verbatim and never calls
-/// this). The shape mirrors a native id: the `req_` prefix, the `01` version marker, then a fixed-width
-/// lowercase-base62 token from the OS CSPRNG. Returns `None` (caller OMITS the header) only if entropy
-/// is unavailable — on the request path, must never panic.
+/// this). The shape mirrors a native id EXACTLY: the `req_` prefix, the `01` version marker, then a
+/// fixed-width 24-char lowercase/mixed-base62 token from the OS CSPRNG — `req_01` + 24 = 30 chars
+/// total, matching `anthropic.rs::synth_id_with_prefix("req_")` (used for the body `request_id`) so
+/// the response-header length is not a fingerprint tell (a 22-char value would be 8 chars short of
+/// native). Returns `None` (caller OMITS the header) only if entropy is unavailable — on the request
+/// path, must never panic.
 pub(crate) fn synth_anthropic_request_id() -> Option<String> {
-    // 96 bits of CSPRNG entropy → 16 base62 chars (collision-free in practice), matching the
-    // fixed-width base62 token shape of a native `req_01…` id.
-    let mut buf = [0u8; 12];
-    getrandom::getrandom(&mut buf).ok()?;
     const ALPHABET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    // Accumulate the 12 bytes as a u128 and emit 16 base62 digits (62^16 > 2^95, so 12 bytes fit).
-    let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
-    let mut token = [0u8; 16];
-    for slot in token.iter_mut().rev() {
-        *slot = ALPHABET[(n % 62) as usize];
-        n /= 62;
+    // 24 base62 chars (≈143 bits) of CSPRNG entropy. A u128 holds at most 12 base62 digits worth of
+    // headroom safely (62^12 < 2^128), so build the 24-char token from two independent 9-byte (72-bit)
+    // draws, each emitting 12 base62 digits — collision-free in practice and matching the native
+    // `req_01` + 24 = 30-char shape.
+    let mut token = [0u8; 24];
+    for half in 0..2 {
+        let mut buf = [0u8; 9];
+        getrandom::getrandom(&mut buf).ok()?;
+        // 72 bits → 12 base62 digits (62^12 > 2^71, so 9 bytes fit in 12 digits).
+        let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+        for slot in token[half * 12..half * 12 + 12].iter_mut().rev() {
+            *slot = ALPHABET[(n % 62) as usize];
+            n /= 62;
+        }
     }
     // token is ASCII base62, always valid UTF-8.
-    let token = std::str::from_utf8(&token).unwrap_or("0000000000000000");
+    let token = std::str::from_utf8(&token).unwrap_or("000000000000000000000000");
     Some(format!("req_01{token}"))
 }
 
@@ -582,30 +589,28 @@ impl ToolIdRemap {
     }
 }
 
-/// Recover the ORIGINAL egress tool id from a busbar-reshaped native id (the reverse of
-/// [`ToolIdRemap::native_for`]). Returns `Some(original)` when `id` carries the busbar marker after a
-/// known native prefix AND the hex tail decodes to valid UTF-8; otherwise `None` (a client-authored id
-/// — pass it through verbatim). Pure and stateless, so the reverse needs no shared map across rounds.
-pub(crate) fn decode_native_tool_id(id: &str) -> Option<String> {
-    // Try every known native prefix (including the empty Cohere prefix, tried last so a non-empty
-    // prefix wins first). The id must be `<prefix><MARKER><hex>`.
-    for prefix in ["toolu_", "call_", "tooluse_", ""] {
-        let Some(rest) = id.strip_prefix(prefix) else {
-            continue;
-        };
-        let Some(hexpart) = rest.strip_prefix(TOOL_ID_REMAP_MARKER) else {
-            continue;
-        };
-        // A valid busbar id has an even-length lowercase-hex tail; reject anything else so a genuine
-        // client id that merely happens to start with `call_bb1`/etc. is not mangled.
-        let Ok(bytes) = hex::decode(hexpart) else {
-            continue;
-        };
-        if let Ok(s) = String::from_utf8(bytes) {
-            return Some(s);
-        }
-    }
-    None
+/// Recover the ORIGINAL egress tool id from a busbar-reshaped native id (the EXACT reverse of
+/// [`ToolIdRemap::native_for`]). Returns `Some(original)` when `id` carries the busbar marker after
+/// the INGRESS protocol's OWN native prefix AND the hex tail decodes to valid UTF-8; otherwise `None`
+/// (a client-authored id — pass it through verbatim). Pure and stateless, so the reverse needs no
+/// shared map across rounds.
+///
+/// The decode is gated on the SAME `native_tool_id_prefix(ingress_protocol)` the encode used — NOT a
+/// best-effort scan over every known prefix. Trying foreign prefixes (or the empty Cohere prefix on a
+/// non-Cohere ingress) would mis-detect a genuine CLIENT-authored id of the colliding shape
+/// (`<any-known-prefix>bb1<even-len-hex>`, or a bare `bb1<hex>` via the empty prefix) as
+/// busbar-reshaped and silently hex-decode it, corrupting the tool_use/tool_result correlation for
+/// that turn. Restricting to the ingress's own prefix makes this the precise inverse of the encode.
+pub(crate) fn decode_native_tool_id(ingress_protocol: &str, id: &str) -> Option<String> {
+    // The ingress protocol's own native prefix — exactly what `native_for` prepended on encode.
+    // Gemini (and any protocol without a prefix) never has ids reshaped, so nothing to decode.
+    let prefix = native_tool_id_prefix(ingress_protocol)?;
+    let rest = id.strip_prefix(prefix)?;
+    let hexpart = rest.strip_prefix(TOOL_ID_REMAP_MARKER)?;
+    // A valid busbar id has an even-length lowercase-hex tail; reject anything else so a genuine
+    // client id that merely happens to start with `<prefix>bb1` is not mangled.
+    let bytes = hex::decode(hexpart).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Walk a request-body IR (messages → blocks, recursing into `ToolResult.content`) and decode any
@@ -613,11 +618,14 @@ pub(crate) fn decode_native_tool_id(id: &str) -> Option<String> {
 /// cross-protocol response references the id the egress backend actually issued. A no-op for ids that
 /// carry no busbar marker (client-authored / same-protocol). Applied at the request seam (ingress !=
 /// egress) AFTER `read_request`, BEFORE the egress `write_request`.
-pub(crate) fn decode_request_tool_ids(messages: &mut [crate::ir::IrMessage]) {
-    fn walk(block: &mut crate::ir::IrBlock) {
+pub(crate) fn decode_request_tool_ids(
+    ingress_protocol: &str,
+    messages: &mut [crate::ir::IrMessage],
+) {
+    fn walk(ingress_protocol: &str, block: &mut crate::ir::IrBlock) {
         match block {
             crate::ir::IrBlock::ToolUse { id, .. } => {
-                if let Some(orig) = decode_native_tool_id(id) {
+                if let Some(orig) = decode_native_tool_id(ingress_protocol, id) {
                     *id = orig;
                 }
             }
@@ -626,11 +634,11 @@ pub(crate) fn decode_request_tool_ids(messages: &mut [crate::ir::IrMessage]) {
                 content,
                 ..
             } => {
-                if let Some(orig) = decode_native_tool_id(tool_use_id) {
+                if let Some(orig) = decode_native_tool_id(ingress_protocol, tool_use_id) {
                     *tool_use_id = orig;
                 }
                 for inner in content {
-                    walk(inner);
+                    walk(ingress_protocol, inner);
                 }
             }
             crate::ir::IrBlock::Text { .. }
@@ -640,7 +648,7 @@ pub(crate) fn decode_request_tool_ids(messages: &mut [crate::ir::IrMessage]) {
     }
     for msg in messages {
         for block in &mut msg.content {
-            walk(block);
+            walk(ingress_protocol, block);
         }
     }
 }
@@ -1180,6 +1188,25 @@ impl StreamTranslate {
     /// Anthropic → empty: its `message_stop` event already carries termination).
     pub(crate) fn finish(&mut self) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
+        // Bedrock-INGRESS abort path: the SSE reassembly buffer overflowed `MAX_BUF` without a frame
+        // terminator (a malformed/adversarial upstream that never emits `\n\n`), so the translator was
+        // abandoned and no `messageStop`/`metadata` was ever translated. A bare TCP close with neither
+        // a terminal `:message-type: exception` frame nor `metadata` is structurally impossible from a
+        // real ConverseStream endpoint (it ALWAYS ends with messageStop+metadata or an exception
+        // frame) — a protocol-indistinguishability tell, and it leaves an AWS SDK keying on the final
+        // exception/metadata event in an ambiguous state. Emit a modeled `InternalServerException`
+        // frame so the close is well-formed for the native decoder, mirroring the inner-stream
+        // transport-error path in forward.rs (`mid_stream_error_bytes`, also keyed off
+        // `ingress_eventstream`). This is the only terminator on an aborted stream, so return early.
+        if self.aborted {
+            if self.ingress_eventstream {
+                out.extend_from_slice(&crate::eventstream::encode_exception_frame(
+                    "InternalServerException",
+                    "The response stream was interrupted.",
+                ));
+            }
+            return out;
+        }
         // Bedrock-INGRESS: if a combined stop-delta deferred the `metadata` frame (zero usage,
         // expecting a trailing usage-only delta) and that delta never arrived — the DEFAULT OpenAI
         // streaming case (no `stream_options.include_usage`) — flush a single best-effort zero-usage
@@ -1561,12 +1588,22 @@ mod tests {
             id.starts_with("req_01"),
             "anthropic request-id must carry the native req_01 prefix; got {id}"
         );
-        assert!(
-            id.len() > "req_01".len(),
-            "anthropic request-id must have a token suffix; got {id}"
+        // Native Anthropic `request-id` is EXACTLY 30 chars (`req_01` + 24-char token). A short value
+        // (the old 22-char form) is a length-based fingerprint tell and must not regress. Match the
+        // body `request_id` produced by `synth_id_with_prefix("req_")`.
+        assert_eq!(
+            id.len(),
+            30,
+            "anthropic request-id must be exactly 30 chars to match native; got {} ({id})",
+            id.len()
         );
         // ASCII base62 token (no padding/special chars that a native id never carries).
         let token = &id["req_01".len()..];
+        assert_eq!(
+            token.len(),
+            24,
+            "token must be 24 base62 chars; got {token}"
+        );
         assert!(
             token.bytes().all(|b| b.is_ascii_alphanumeric()),
             "the token must be base62 (alphanumeric); got {token}"
@@ -4309,7 +4346,7 @@ mod stream_translate_tests {
             "Bedrock client must see a native `tooluse_` id, not the foreign `toolu_abc`; got {emitted_tool_id}"
         );
         assert_eq!(
-            decode_native_tool_id(emitted_tool_id).as_deref(),
+            decode_native_tool_id("bedrock", emitted_tool_id).as_deref(),
             Some("toolu_abc"),
             "the reshaped id must decode back to the original egress tool id; got {emitted_tool_id}"
         );
@@ -4937,7 +4974,7 @@ mod stream_translate_tests {
             "emitted tool id must be Anthropic-native; got {emitted}"
         );
         assert_eq!(
-            decode_native_tool_id(&emitted).as_deref(),
+            decode_native_tool_id("anthropic", &emitted).as_deref(),
             Some("call_1"),
             "the reshaped id must decode back to the original egress `call_1`; got {emitted}"
         );
@@ -5086,6 +5123,60 @@ mod stream_translate_tests {
         assert!(
             t.feed(b"data: {\"choices\":[]}\n\n").is_empty(),
             "feeds after abort must be ignored"
+        );
+    }
+
+    /// MEDIUM/conformance (StreamTranslate::abort_overflow / finish for bedrock ingress): when the SSE
+    /// reassembly buffer overflows MAX_BUF without a frame terminator on a BEDROCK-INGRESS stream, the
+    /// stream must NOT end with a bare TCP close. A real ConverseStream ALWAYS terminates with
+    /// messageStop+metadata or a modeled exception frame; a bare close with neither is structurally
+    /// impossible and a protocol-indistinguishability tell that leaves an AWS SDK's
+    /// exception/metadata callbacks in an ambiguous state. `finish()` must emit a modeled
+    /// `InternalServerException` frame (drain_frames surfaces it lowercased as `internalServerException`).
+    #[test]
+    fn test_bedrock_ingress_overflow_abort_emits_exception_frame() {
+        // openai egress → bedrock ingress: ingress_eventstream == true.
+        let mut t = StreamTranslate::new("bedrock", "openai").expect("translator");
+        assert!(
+            t.ingress_is_eventstream(),
+            "bedrock ingress must be eventstream"
+        );
+        let chunk = vec![b'x'; 1024 * 1024]; // garbage, no `\n\n`
+        for _ in 0..18 {
+            let _ = t.feed(&chunk);
+            if t.aborted {
+                break;
+            }
+        }
+        assert!(t.aborted, "stream must abort after exceeding MAX_BUF");
+        // finish() on the aborted bedrock-ingress stream must emit a well-formed terminal exception
+        // frame, not an empty/bare close.
+        let mut tail = t.finish();
+        assert!(
+            !tail.is_empty(),
+            "aborted bedrock-ingress finish must emit a terminal exception frame, not a bare close"
+        );
+        let frames = crate::eventstream::drain_frames(&mut tail);
+        let names: Vec<&str> = frames.iter().map(|(ty, _)| ty.as_str()).collect();
+        assert_eq!(
+            names.as_slice(),
+            ["internalServerException"],
+            "aborted bedrock-ingress stream must terminate with a single modeled exception frame; got {names:?}"
+        );
+
+        // A NON-bedrock ingress (SSE client) aborted the same way must NOT get a binary exception
+        // frame (its wire is SSE; the abort yields an empty tail, as before).
+        let mut t2 = StreamTranslate::new("openai", "anthropic").expect("translator");
+        for _ in 0..18 {
+            let _ = t2.feed(&chunk);
+            if t2.aborted {
+                break;
+            }
+        }
+        assert!(t2.aborted);
+        assert!(
+            t2.finish().is_empty(),
+            "a non-bedrock-ingress aborted stream must not emit a binary exception frame"
         );
     }
 
@@ -5387,13 +5478,42 @@ mod stream_translate_tests {
         let b = remap.native_for("anthropic", "call_two");
         assert_eq!(a1, a2, "a repeated egress id must map stably");
         assert_ne!(a1, b, "distinct egress ids must map to distinct native ids");
-        assert_eq!(decode_native_tool_id(&a1).as_deref(), Some("call_one"));
-        assert_eq!(decode_native_tool_id(&b).as_deref(), Some("call_two"));
+        assert_eq!(
+            decode_native_tool_id("anthropic", &a1).as_deref(),
+            Some("call_one")
+        );
+        assert_eq!(
+            decode_native_tool_id("anthropic", &b).as_deref(),
+            Some("call_two")
+        );
 
         // A client-authored id (no busbar marker) is NOT a busbar id → decode returns None so the
         // request path passes it through verbatim (must not mangle a genuine native tool id).
-        assert_eq!(decode_native_tool_id("toolu_01RealClientId"), None);
-        assert_eq!(decode_native_tool_id("call_genuine"), None);
+        assert_eq!(
+            decode_native_tool_id("anthropic", "toolu_01RealClientId"),
+            None
+        );
+        // The colliding-shape guard: a CLIENT-authored id matching `<foreign-prefix>bb1<hex>` or the
+        // bare empty-prefix `bb1<hex>` must NOT be decoded when the ingress is not that foreign
+        // protocol. `call_bb1<hex>` looks busbar-shaped under the OpenAI prefix, but for an Anthropic
+        // ingress the only valid prefix is `toolu_`, so it stays verbatim (no silent corruption).
+        let foreign_shaped = format!("call_{TOOL_ID_REMAP_MARKER}{}", hex::encode("x"));
+        assert_eq!(
+            decode_native_tool_id("anthropic", &foreign_shaped),
+            None,
+            "a foreign-prefix busbar-shaped id must not be decoded on a non-matching ingress"
+        );
+        let bare_shaped = format!("{TOOL_ID_REMAP_MARKER}{}", hex::encode("y"));
+        assert_eq!(
+            decode_native_tool_id("anthropic", &bare_shaped),
+            None,
+            "a bare `bb1<hex>` (empty-prefix) id must not be decoded on a non-Cohere ingress"
+        );
+        // Sanity: the matching ingress DOES decode its own prefix.
+        assert_eq!(
+            decode_native_tool_id("openai", &foreign_shaped).as_deref(),
+            Some("x")
+        );
     }
 
     #[test]
@@ -5435,7 +5555,7 @@ mod stream_translate_tests {
                 is_error: false,
             }],
         }];
-        decode_request_tool_ids(&mut messages);
+        decode_request_tool_ids("anthropic", &mut messages);
         match &messages[0].content[0] {
             crate::ir::IrBlock::ToolResult { tool_use_id, .. } => {
                 assert_eq!(
@@ -5464,7 +5584,10 @@ mod stream_translate_tests {
                 ..
             } => {
                 assert!(id.starts_with("toolu_") && id != "call_stream");
-                assert_eq!(decode_native_tool_id(&id).as_deref(), Some("call_stream"));
+                assert_eq!(
+                    decode_native_tool_id("anthropic", &id).as_deref(),
+                    Some("call_stream")
+                );
             }
             other => panic!("expected BlockStart ToolUse, got {other:?}"),
         }

@@ -319,7 +319,7 @@ pub(crate) fn translate_request_cross_protocol(
                 // egress id here so the backend sees the id it actually issued and the tool-call
                 // correlation survives the round trip. Client-authored ids (no busbar marker) pass
                 // through untouched. Same-protocol passthrough never enters this branch.
-                crate::proto::decode_request_tool_ids(&mut ir.messages);
+                crate::proto::decode_request_tool_ids(ingress_protocol, &mut ir.messages);
                 // CROSS-PROTOCOL extra-key leak guard (the structural class fix). Every reader sweeps
                 // unmodeled top-level request keys into `ir.extra`; on a SAME-protocol round-trip the
                 // egress writer re-emits them verbatim (lossless passthrough, the intended behavior).
@@ -756,6 +756,54 @@ impl UsageTap {
         Self::default()
     }
 
+    /// Feed a COMPLETE, already-bounded buffered body (a non-stream cross-protocol success body,
+    /// capped upstream by `MAX_TRANSLATED_BODY_BYTES`) and extract its usage. This path is NOT inside
+    /// a stream `poll_next`, so the per-poll `MAX_SCAN_BYTES` latency guard in `feed` does not apply
+    /// — applying it would SILENTLY DROP usage for any completion whose body exceeds 512 KiB (large
+    /// outputs / big tool-call arguments), undercounting TPM/spend for exactly the large responses
+    /// `MAX_TRANSLATED_BODY_BYTES` exists to permit. A non-stream body is a single complete JSON
+    /// document with usage at the TOP LEVEL (and, for an LLM completion, conceptually at the tail), so
+    /// parse it whole first; only if that fails (e.g. a buffered SSE/`[DONE]` body) fall back to the
+    /// uncapped brace-scan over the whole slice so a trailing usage frame is still found.
+    pub(crate) fn feed_whole(&mut self, body: &[u8]) {
+        if let Ok(obj) = serde_json::from_slice::<Value>(body) {
+            self.extract_usage_from_delta(&obj);
+            self.extract_usage_from_stop(&obj);
+            self.extract_usage_any(&obj);
+            self.extract_terminal_error(&obj);
+            return;
+        }
+        // Not a single JSON document (e.g. a buffered SSE body): scan all embedded objects with no
+        // front-scan cap. The body is already bounded, and this runs synchronously off the poll loop,
+        // so there is no per-poll latency to guard — the trailing usage frame is reliably reached.
+        self.scan_objects(body);
+    }
+
+    /// Scan a byte slice for every complete top-level JSON object and feed each to the usage/terminal
+    /// extractors. Shared by `feed` (per-poll, after the size guard) and `feed_whole` (uncapped).
+    fn scan_objects(&mut self, chunk: &[u8]) {
+        let mut pos = 0;
+        while pos < chunk.len() {
+            if let Some(delta_idx) = find_json_start(&chunk[pos..]) {
+                let start = pos + delta_idx;
+                if let Some(end) = find_matching_brace(&chunk[start..]) {
+                    let json_bytes = &chunk[start..start + end];
+                    if let Ok(obj) = serde_json::from_slice::<Value>(json_bytes) {
+                        self.extract_usage_from_delta(&obj);
+                        self.extract_usage_from_stop(&obj);
+                        self.extract_usage_any(&obj);
+                        self.extract_terminal_error(&obj);
+                    }
+                    pos = start + end;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Feed a chunk to the tap and extract any usage fields. Bounded: it only scans complete JSON
     /// objects within this chunk and keeps no cross-chunk buffer.
     pub(crate) fn feed(&mut self, chunk: &Bytes) {
@@ -778,26 +826,7 @@ impl UsageTap {
             );
             return;
         }
-        let mut pos = 0;
-        while pos < chunk.len() {
-            if let Some(delta_idx) = find_json_start(&chunk[pos..]) {
-                let start = pos + delta_idx;
-                if let Some(end) = find_matching_brace(&chunk[start..]) {
-                    let json_bytes = &chunk[start..start + end];
-                    if let Ok(obj) = serde_json::from_slice::<Value>(json_bytes) {
-                        self.extract_usage_from_delta(&obj);
-                        self.extract_usage_from_stop(&obj);
-                        self.extract_usage_any(&obj);
-                        self.extract_terminal_error(&obj);
-                    }
-                    pos = start + end;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        self.scan_objects(chunk);
     }
 
     /// Feed a chunk of a BINARY `application/vnd.amazon.eventstream` body (a same-protocol
@@ -1599,6 +1628,12 @@ fn ingress_stream_content_type(ingress: &str) -> Option<&'static str> {
 /// (every Bedrock request fails) AND embedding the credential in the signed string (which may surface
 /// in request logs/traces). Strip any userinfo (everything up to and including the last `@` in the
 /// authority) so the signed host always matches what the HTTP layer transmits.
+///
+/// Returns the AUTHORITY ONLY (`host[:port]`) — never any path/query/fragment. The HTTP stack always
+/// transmits `Host: <authority>` regardless of any path in `base_url`, so a `host` value that
+/// included a path (e.g. a misconfigured `https://bedrock.../prefix`) would be signed but never sent,
+/// yielding a silent `SignatureDoesNotMatch` on every request. Stripping the path here makes the
+/// signed `host` equal to the transmitted `Host` byte-for-byte even if config validation is bypassed.
 pub(crate) fn host_from_base(base: &str) -> String {
     let no_scheme = base
         .strip_prefix("https://")
@@ -1606,14 +1641,14 @@ pub(crate) fn host_from_base(base: &str) -> String {
         .unwrap_or(base);
     // The authority ends at the first `/`, `?`, or `#`; userinfo (if any) precedes the LAST `@`
     // within that authority. Split on the authority boundary first so an `@` appearing later in a
-    // path/query (not userinfo) is never mistaken for a userinfo delimiter.
+    // path/query (not userinfo) is never mistaken for a userinfo delimiter. Only the authority is
+    // returned — the path/query/fragment (`rest`) is intentionally discarded (see doc above).
     let authority_end = no_scheme.find(['/', '?', '#']).unwrap_or(no_scheme.len());
-    let (authority, rest) = no_scheme.split_at(authority_end);
-    let host_authority = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    format!("{host_authority}{rest}")
+    let authority = &no_scheme[..authority_end];
+    match authority.rfind('@') {
+        Some(at) => authority[at + 1..].to_string(),
+        None => authority.to_string(),
+    }
 }
 
 /// Produce the path that is BOTH signed (as the SigV4 canonical URI) and sent on the wire, so the
@@ -1682,7 +1717,10 @@ fn egress_user_agent(egress_protocol: &str) -> &'static str {
 fn record_nonstream_usage(upstream_body: &[u8], usage_sink: &Option<UsageSink>) {
     if let Some(sink) = usage_sink {
         let mut tap = UsageTap::new();
-        tap.feed(&Bytes::copy_from_slice(upstream_body));
+        // Buffered body is complete and already bounded by `MAX_TRANSLATED_BODY_BYTES`; use the
+        // uncapped whole-body parse so usage in a >512 KiB completion is NOT silently dropped by the
+        // streaming-only per-poll `MAX_SCAN_BYTES` guard (which exists solely to bound poll latency).
+        tap.feed_whole(upstream_body);
         let tokens = tap.input_tokens.unwrap_or(0) + tap.output_tokens.unwrap_or(0);
         if tokens > 0 {
             sink.gov
@@ -2391,15 +2429,23 @@ pub(crate) async fn forward_with_pool(
                             GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
-                    // Token accounting: no FirstByteBody on this buffered path, so tap here.
-                    record_nonstream_usage(&bytes, &usage_sink);
                     if read_end == ReadEnd::Truncated {
+                        // The upstream body exceeded OUR translation cap, so we cannot translate it
+                        // and the client receives a 500 with NO completion. Token accounting is
+                        // therefore deliberately NOT done here (it lives after this guard): charging
+                        // the key's TPM/spend budget for a completion the client never received is
+                        // incorrect, and would also be inconsistent with the TransportError branch
+                        // above (which likewise charges no tokens for an undelivered body). Unlike
+                        // TransportError this is OUR cap, not an upstream fault: the upstream genuinely
+                        // succeeded, so the optimistic breaker success recorded on the 2xx headers
+                        // stands and the request budget unit is NOT refunded (the lane DID serve a
+                        // request; refunding would mis-credit capacity for our own size limit).
                         tracing::warn!(
                             ingress = %ingress_protocol,
                             egress = %app.lanes[i].protocol.name(),
                             cap = MAX_TRANSLATED_BODY_BYTES,
                             "cross-protocol non-stream success body exceeded the translation cap; \
-                             cannot translate, returning ingress-native error"
+                             cannot translate, not charging tokens, returning ingress-native error"
                         );
                         return ingress_error(
                             ingress_protocol,
@@ -2408,6 +2454,9 @@ pub(crate) async fn forward_with_pool(
                             GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
+                    // Token accounting: full body read successfully and about to be translated and
+                    // delivered. No FirstByteBody on this buffered path, so tap here.
+                    record_nonstream_usage(&bytes, &usage_sink);
                     if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                         if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                             if let Some(ingress_proto) =
@@ -2959,16 +3008,18 @@ async fn forward_once(
                         GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
-                // Token accounting: no FirstByteBody on this buffered path, so tap the usage here and
-                // charge it to the key's budget (mirrors the main path).
-                record_nonstream_usage(&bytes, &usage_sink);
                 if read_end == ReadEnd::Truncated {
+                    // Upstream body exceeded OUR translation cap → client gets a 500 with no
+                    // completion, so tokens are NOT charged here (accounting lives after this guard),
+                    // matching the TransportError branch and the main forward path. This is our own
+                    // size limit, not an upstream fault, so the optimistic breaker success stands and
+                    // the budget unit is NOT refunded.
                     tracing::warn!(
                         ingress = %ingress_protocol,
                         egress = %egress_name,
                         cap = MAX_TRANSLATED_BODY_BYTES,
                         "cross-protocol non-stream success body exceeded the translation cap; \
-                         cannot translate, returning ingress-native error"
+                         cannot translate, not charging tokens, returning ingress-native error"
                     );
                     return Ok(ingress_error(
                         ingress_protocol,
@@ -2977,6 +3028,9 @@ async fn forward_once(
                         GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
+                // Token accounting: full body read successfully and about to be delivered. No
+                // FirstByteBody on this buffered path, so tap the usage here (mirrors the main path).
+                record_nonstream_usage(&bytes, &usage_sink);
                 if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                     if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
@@ -3337,6 +3391,58 @@ mod usage_tap_tests {
         assert_eq!(t.output_tokens, Some(9));
     }
 
+    /// HIGH (forward.rs `record_nonstream_usage` / `UsageTap` MAX_SCAN_BYTES guard): a buffered
+    /// non-stream success body LARGER than the streaming per-poll `MAX_SCAN_BYTES` (512 KiB) cap must
+    /// still have its usage counted. The streaming `feed` HARD-SKIPS an oversized chunk (a poll-latency
+    /// guard), which would silently DROP the usage block on exactly the large completions that
+    /// `MAX_TRANSLATED_BODY_BYTES` (32 MiB) exists to allow — undercounting TPM/spend governance.
+    /// `feed_whole` (used by `record_nonstream_usage`) must NOT apply that cap.
+    #[test]
+    fn test_feed_whole_counts_usage_on_large_buffered_body_past_scan_cap() {
+        // An OpenAI chat.completion body whose CONTENT is > 512 KiB, with the LLM usage block at the
+        // TAIL (the real wire order). A single huge string field pushes the body well past the cap.
+        let big_content = "x".repeat(1024 * 1024); // 1 MiB — comfortably over the 512 KiB cap
+        let body = format!(
+            r#"{{"id":"chatcmpl-big","object":"chat.completion","choices":[{{"message":{{"role":"assistant","content":"{big_content}"}}}}],"usage":{{"prompt_tokens":4000,"completion_tokens":9000}}}}"#
+        );
+        assert!(
+            body.len() > 512 * 1024,
+            "test body must exceed the per-poll MAX_SCAN_BYTES to be meaningful"
+        );
+
+        // The streaming per-poll `feed` SKIPS this oversized chunk → usage dropped (the bug).
+        let mut streamed = UsageTap::new();
+        streamed.feed(&Bytes::from(body.clone()));
+        assert_eq!(
+            streamed.input_tokens, None,
+            "the streaming feed is expected to skip the oversized chunk (poll-latency guard)"
+        );
+
+        // `feed_whole` (the buffered, already-bounded path) MUST still count the trailing usage.
+        let mut whole = UsageTap::new();
+        whole.feed_whole(body.as_bytes());
+        assert_eq!(
+            whole.input_tokens,
+            Some(4000),
+            "buffered body usage must be counted regardless of size"
+        );
+        assert_eq!(whole.output_tokens, Some(9000));
+
+        // And it must remain robust on a buffered SSE-shaped body (multiple objects, trailing usage),
+        // which is not a single JSON document — the uncapped brace-scan fallback handles it.
+        let sse_like = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{big_content}\"}}}}]}}\n\ndata: {{\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":34}}}}\n\n"
+        );
+        let mut sse = UsageTap::new();
+        sse.feed_whole(sse_like.as_bytes());
+        assert_eq!(
+            sse.input_tokens,
+            Some(12),
+            "trailing SSE usage must be found"
+        );
+        assert_eq!(sse.output_tokens, Some(34));
+    }
+
     #[test]
     fn test_tap_detects_terminal_error_across_shapes() {
         // Anthropic SSE error event: {"type":"error", "error":{...}}.
@@ -3691,10 +3797,27 @@ mod auth_style_tests {
             host_from_base("https://user:pass@host.example.com:443"),
             "host.example.com:443"
         );
-        // An `@` later in a path/query is NOT userinfo and must not be treated as one.
+        // An `@` later in a path/query is NOT userinfo and must not be treated as one — and the path
+        // itself is discarded, so only the host survives.
         assert_eq!(
             host_from_base("https://host.example.com/x@y"),
-            "host.example.com/x@y"
+            "host.example.com"
+        );
+        // A path-bearing base_url yields ONLY the authority: a signed `host` that included the path
+        // would never match the `Host:` header the HTTP stack transmits (SignatureDoesNotMatch).
+        assert_eq!(
+            host_from_base("https://bedrock.us-east-1.amazonaws.com/some-prefix"),
+            "bedrock.us-east-1.amazonaws.com"
+        );
+        // Port preserved, path discarded.
+        assert_eq!(
+            host_from_base("https://host.example.com:8443/v1/foo?x=1"),
+            "host.example.com:8443"
+        );
+        // Userinfo stripped AND path discarded together.
+        assert_eq!(
+            host_from_base("https://user:pass@host.example.com/p"),
+            "host.example.com"
         );
     }
 
@@ -5037,6 +5160,242 @@ data: {"type":"message_stop"}"#
         assert!(names.contains(&"contentBlockDelta"), "frames: {names:?}");
         assert!(names.contains(&"messageStop"), "frames: {names:?}");
         assert!(names.contains(&"metadata"), "frames: {names:?}");
+        server.shutdown().await;
+    }
+
+    /// HIGH/test-coverage (forward.rs gemini JSON-array buffered-synthesis branch in
+    /// `forward_with_pool`): a native Gemini `:streamGenerateContent` WITHOUT `?alt=sse` routed
+    /// cross-protocol to an OpenAI lane that answers with a BUFFERED (non-SSE) 2xx must emit a
+    /// one-element JSON ARRAY (`[{...}]`) of native `GenerateContentResponse` under
+    /// `application/json` — NOT a bare `{...}` object (undecodable by a Gemini SDK parsing a
+    /// non-alt=sse streaming body as an array) and NOT SSE. Mirrors the bedrock buffered test above;
+    /// the SSE-backend tests only exercise the live `GeminiJsonArrayFramer`, never this branch.
+    #[tokio::test]
+    async fn test_gemini_json_array_buffered_cross_protocol_emits_one_element_array() {
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-buf",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "gpt-4o",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("openai"),
+            )
+            .pool("pg", &[(0, 1)])
+            .build();
+        // Gemini ingress `:streamGenerateContent` (no alt=sse): the route injects `stream:true` and
+        // the JSON-array shim key. Cross-protocol to an OpenAI lane that answers buffered (non-SSE).
+        let body = serde_json::to_vec(&json!({
+            "model": "pg",
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "stream": true,
+            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY: true
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pg",
+            None,
+            "gemini",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        // (a) Content-Type is application/json (the native non-alt=sse streaming CT).
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "buffered gemini JSON-array stream must be application/json"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+        // (b) body parses as a JSON ARRAY, (c) with exactly one element.
+        let arr = parsed.as_array().expect("body must be a JSON array");
+        assert_eq!(arr.len(), 1, "exactly one element; got {parsed}");
+        // (d) the element is a native GenerateContentResponse carrying `candidates`, with no OpenAI
+        // `choices` leak.
+        let el = &arr[0];
+        assert!(
+            el.get("candidates").is_some(),
+            "element must be a native GenerateContentResponse with `candidates`; got {el}"
+        );
+        assert!(
+            el.get("choices").is_none(),
+            "no OpenAI `choices` may leak to a Gemini client; got {el}"
+        );
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/test-coverage (forward.rs gemini JSON-array buffered-synthesis branch in `forward_once`,
+    /// the FallbackPool/exhaustion path): the SECOND copy of the branch must match the primary path.
+    /// Drive a gemini `:streamGenerateContent` (no alt=sse) through the degraded `forward_once` route
+    /// (lane parked in long cooldown + LeastBad on_exhausted, as in
+    /// `test_forward_once_cross_protocol_strips_source_only_extra_keys`) to a buffered cross-protocol
+    /// backend, and assert the same one-element JSON array under `application/json`.
+    #[tokio::test]
+    async fn test_gemini_json_array_buffered_via_forward_once_matches_primary() {
+        use crate::store::now as store_now;
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-buf2",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "gpt-4o",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("openai")
+                .cooldown_until(t0 + 600)
+                .streak(3)
+                .err(5),
+            )
+            .pool("leastbad-g", &[(0, 1)])
+            .on_exhausted("leastbad-g", crate::config::OnExhausted::LeastBad)
+            .build();
+        let body = serde_json::to_vec(&json!({
+            "model": "leastbad-g",
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "stream": true,
+            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY: true
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "leastbad-g",
+            None,
+            "gemini",
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "LeastBad serves via forward_once"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "forward_once buffered gemini JSON-array stream must be application/json"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+        let arr = parsed.as_array().expect("body must be a JSON array");
+        assert_eq!(arr.len(), 1, "exactly one element; got {parsed}");
+        let el = &arr[0];
+        assert!(
+            el.get("candidates").is_some(),
+            "forward_once element must carry native `candidates`; got {el}"
+        );
+        assert!(
+            el.get("choices").is_none(),
+            "no OpenAI `choices` may leak via forward_once; got {el}"
+        );
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/correctness (forward.rs `record_nonstream_usage` vs `ReadEnd::Truncated` guard):
+    /// CHOSEN SEMANTICS — a cross-protocol non-stream success body that exceeds OUR translation cap
+    /// (`MAX_TRANSLATED_BODY_BYTES`, 32 MiB) is UNTRANSLATABLE: the client receives HTTP 500 with NO
+    /// completion, so token usage is NOT charged (the `record_nonstream_usage` call now lives AFTER
+    /// the Truncated guard, consistent with the TransportError branch which also charges nothing for
+    /// an undelivered body). The breaker success recorded on the 2xx headers stands (this is our cap,
+    /// not an upstream fault) and the budget is NOT refunded. This test pins the client-visible
+    /// outcome: an over-cap cross-protocol non-stream body returns the ingress-native 500 rather than
+    /// being translated and delivered (which is what would let its tokens be charged).
+    #[tokio::test]
+    async fn test_cross_protocol_nonstream_over_cap_body_returns_500_uncharged() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // An OpenAI chat.completion whose `content` alone is > 32 MiB, so the whole body overruns
+        // MAX_TRANSLATED_BODY_BYTES and `read_capped` reports ReadEnd::Truncated.
+        let huge = "x".repeat(super::MAX_TRANSLATED_BODY_BYTES + 1024);
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-huge",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": huge}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 999999}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "gpt-4o",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("openai"),
+            )
+            .pool("pc", &[(0, 1)])
+            .build();
+        // Anthropic ingress, non-stream, cross-protocol to the OpenAI lane → buffered translate path.
+        let body = serde_json::to_vec(&json!({
+            "model": "pc",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pc",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        // The over-cap body is untranslatable → ingress-native 500, NOT a translated 2xx (which is the
+        // only path that would charge the body's usage tokens).
+        assert_eq!(
+            resp.status().as_u16(),
+            500,
+            "an over-cap cross-protocol non-stream body must return 500, not a charged 2xx"
+        );
         server.shutdown().await;
     }
 }

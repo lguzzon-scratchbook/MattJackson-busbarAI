@@ -438,7 +438,13 @@ impl BreakerCellAccess for LaneState {
 
 /// InMemoryStore wraps the existing atomics/semaphores per lane with FSM breaker logic.
 /// Keyed by (pool name, lane index). Lazily populated.
-type PoolCellMap = std::collections::HashMap<(Box<str>, usize), Arc<BreakerCell>>;
+/// Per-lane breaker cells, keyed by lane index for an O(1) lane lookup. Each lane maps to its small
+/// set of per-pool cells (`(pool name, cell)`), so a (pool, lane) point lookup is an O(1) hash probe
+/// plus a scan bounded by the number of POOLS ON THAT LANE (typically tiny) — never the full
+/// cross-product of pools×lanes — and the per-lane aggregation/recovery sweeps touch only the
+/// relevant lane's cells instead of scanning every cell in the deployment. No per-call key allocation
+/// on the hot path (the lane index is `Copy`; the pool name is compared by `&str`).
+type PoolCellMap = std::collections::HashMap<usize, Vec<(Box<str>, Arc<BreakerCell>)>>;
 
 /// Number of SWRR lock shards. The SWRR weight read-modify-write only needs to be serialized
 /// PER POOL (the `Σ current_weight == 0` invariant is pool-local — two disjoint pools share no
@@ -567,48 +573,51 @@ impl InMemoryStore {
         // exclusive write lock below.
         {
             let cells = read_recover(&self.pool_cells);
-            if let Some(c) = cells
-                .iter()
-                .find(|((p, l), _)| *l == lane && p.as_ref() == pool)
-            {
-                return c.1.clone();
+            // O(1) lane lookup, then a scan bounded by #pools-on-this-lane (typically tiny) with no
+            // owned-key allocation — never the full pools×lanes cross-product.
+            if let Some(per_lane) = cells.get(&lane) {
+                if let Some((_, c)) = per_lane.iter().find(|(p, _)| p.as_ref() == pool) {
+                    return c.clone();
+                }
             }
         }
         let mut cells = write_recover(&self.pool_cells);
-        cells
-            .entry((Box::from(pool), lane))
-            .or_insert_with(|| {
-                // A new pool cell inherits the lane's current known health (breaker state + pending
-                // cooldown + streak) rather than blindly assuming Closed — so a pool whose first
-                // request arrives while the lane is mid-cooldown respects it. In production cells are
-                // created while the lane is healthy, so this is normally a no-op.
-                let ls = &self.lanes[lane];
-                let c = BreakerCell::new();
-                // Normalize an inherited HalfOpen to Open. HalfOpen encodes "some cell owns the
-                // single-flight probe right now" — but `probe_in_flight` lives on the cell that won
-                // it, NOT on this freshly-created sibling (born with `probe_in_flight == false`). A
-                // sibling cell born ST_HALF_OPEN is wedged: both `cell_ready_breaker` and
-                // `cell_acquire_breaker` return false unconditionally for HalfOpen, and no probe
-                // outcome (cell_open/cell_closed) ever runs against it, so it never self-recovers —
-                // organic traffic to this (pool, lane) is benched until an out-of-band recover_lane
-                // happens to touch it (indefinitely when health probing is disabled). Storing Open
-                // instead lets the inherited (already-expired) cooldown drive a fresh probe
-                // acquisition on this cell's first request. The Open+cooldown inheritance below is
-                // still honored verbatim so a sibling created mid-cooldown respects it.
-                let inherited = ls.breaker_state.load(Ordering::Acquire);
-                let normalized = if inherited == ST_HALF_OPEN {
-                    ST_OPEN
-                } else {
-                    inherited
-                };
-                c.breaker_state.store(normalized, Ordering::Release);
-                c.cooldown_until
-                    .store(ls.cooldown_until.load(Ordering::Acquire), Ordering::Release);
-                c.streak
-                    .store(ls.streak.load(Ordering::Relaxed), Ordering::Relaxed);
-                Arc::new(c)
-            })
-            .clone()
+        let per_lane = cells.entry(lane).or_default();
+        // Re-check under the write lock: a racing writer may have inserted this (pool, lane) between
+        // the read-lock miss above and acquiring the write lock.
+        if let Some((_, c)) = per_lane.iter().find(|(p, _)| p.as_ref() == pool) {
+            return c.clone();
+        }
+        // A new pool cell inherits the lane's current known health (breaker state + pending cooldown
+        // + streak) rather than blindly assuming Closed — so a pool whose first request arrives while
+        // the lane is mid-cooldown respects it. In production cells are created while the lane is
+        // healthy, so this is normally a no-op.
+        let ls = &self.lanes[lane];
+        let c = BreakerCell::new();
+        // Normalize an inherited HalfOpen to Open. HalfOpen encodes "some cell owns the single-flight
+        // probe right now" — but `probe_in_flight` lives on the cell that won it, NOT on this freshly-
+        // created sibling (born with `probe_in_flight == false`). A sibling cell born ST_HALF_OPEN is
+        // wedged: both `cell_ready_breaker` and `cell_acquire_breaker` return false unconditionally
+        // for HalfOpen, and no probe outcome (cell_open/cell_closed) ever runs against it, so it never
+        // self-recovers — organic traffic to this (pool, lane) is benched until an out-of-band
+        // recover_lane happens to touch it (indefinitely when health probing is disabled). Storing
+        // Open instead lets the inherited (already-expired) cooldown drive a fresh probe acquisition
+        // on this cell's first request. The Open+cooldown inheritance below is still honored verbatim
+        // so a sibling created mid-cooldown respects it.
+        let inherited = ls.breaker_state.load(Ordering::Acquire);
+        let normalized = if inherited == ST_HALF_OPEN {
+            ST_OPEN
+        } else {
+            inherited
+        };
+        c.breaker_state.store(normalized, Ordering::Release);
+        c.cooldown_until
+            .store(ls.cooldown_until.load(Ordering::Acquire), Ordering::Release);
+        c.streak
+            .store(ls.streak.load(Ordering::Relaxed), Ordering::Relaxed);
+        let c = Arc::new(c);
+        per_lane.push((Box::from(pool), c.clone()));
+        c
     }
 
     // ── Generic breaker-FSM core ──────────────────────────────────────────────────────────────
@@ -925,11 +934,23 @@ impl InMemoryStore {
         }
     }
 
-    /// Record a success against the cell: reset the streak, push the outcome, and — if this was the
-    /// half-open probe — complete recovery to Closed. (The lane-global `ok` counter is bumped by the
-    /// caller, since it is shared across pools.)
+    /// Record a success against the cell: reset the streak (unless the cell is Open — see below),
+    /// push the outcome, and — if this was the half-open probe — complete recovery to Closed. (The
+    /// lane-global `ok` counter is bumped by the caller, since it is shared across pools.)
     fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
-        c.streak().store(0, Ordering::Release);
+        // Reset the consecutive-failure streak on a success — but NOT while the cell is Open. A bare
+        // `record_success(lane)` can land on an Open cell via the degraded-forward path
+        // (forward.rs `record_success` on a lane whose cell is still Open): the HalfOpen→Closed CAS
+        // below then fails (Open ≠ HalfOpen) so no recovery occurs, yet an unconditional reset would
+        // already have wiped the streak. In Consecutive mode the streak drives the escalating
+        // backoff cooldown (`compute_cooldown_with_retry_after`); zeroing it on a still-Open cell
+        // resets that escalation, letting a persistently-failing upstream be re-probed more
+        // aggressively than designed. So only reset when the cell is NOT Open — the Closed happy path
+        // resets here, and the HalfOpen→Closed recovery resets again via `cell_closed` below (which
+        // also zeroes the streak), keeping the recovered cell's memory clean.
+        if c.breaker_state().load(Ordering::Acquire) != ST_OPEN {
+            c.streak().store(0, Ordering::Release);
+        }
         lock_recover(c.outcome_window()).push(now_time, false); // success outcome
                                                                 // CAS HalfOpen → Closed rather than a plain load-then-act. A non-atomic
                                                                 // `load(HalfOpen) … store(Closed)` opens a TOCTOU window: a concurrent
@@ -1187,8 +1208,10 @@ impl InMemoryStore {
         }
         let cells = read_recover(&self.pool_cells);
         cells
-            .iter()
-            .any(|((_, l), cell)| *l == lane && Self::cell_ready_breaker(cell.as_ref(), now))
+            .get(&lane)
+            .into_iter()
+            .flatten()
+            .any(|(_, cell)| Self::cell_ready_breaker(cell.as_ref(), now))
     }
 
     /// Worst-case remaining cooldown across the default cell and every per-pool cell for the lane.
@@ -1201,14 +1224,12 @@ impl InMemoryStore {
             .load(Ordering::Acquire)
             .saturating_sub(now);
         let cells = read_recover(&self.pool_cells);
-        for ((_, l), cell) in cells.iter() {
-            if *l == lane {
-                worst = worst.max(
-                    cell.cooldown_until()
-                        .load(Ordering::Acquire)
-                        .saturating_sub(now),
-                );
-            }
+        for (_, cell) in cells.get(&lane).into_iter().flatten() {
+            worst = worst.max(
+                cell.cooldown_until()
+                    .load(Ordering::Acquire)
+                    .saturating_sub(now),
+            );
         }
         worst
     }
@@ -1219,10 +1240,8 @@ impl InMemoryStore {
     fn lane_max_streak(&self, lane: usize) -> u32 {
         let mut worst = self.get_lane(lane).streak.load(Ordering::Relaxed);
         let cells = read_recover(&self.pool_cells);
-        for ((_, l), cell) in cells.iter() {
-            if *l == lane {
-                worst = worst.max(cell.streak().load(Ordering::Relaxed));
-            }
+        for (_, cell) in cells.get(&lane).into_iter().flatten() {
+            worst = worst.max(cell.streak().load(Ordering::Relaxed));
         }
         worst
     }
@@ -1493,10 +1512,8 @@ impl StateStore for InMemoryStore {
         // selected against. (A cell not yet created inherits the lane default lazily on first
         // access.)
         let cells = read_recover(&self.pool_cells);
-        for ((_, l), cell) in cells.iter() {
-            if *l == lane {
-                trip(cell.as_ref());
-            }
+        for (_, cell) in cells.get(&lane).into_iter().flatten() {
+            trip(cell.as_ref());
         }
     }
 
@@ -1514,8 +1531,8 @@ impl StateStore for InMemoryStore {
             Self::cell_closed(ls.as_ref());
         }
         let cells = read_recover(&self.pool_cells);
-        for ((_, l), cell) in cells.iter() {
-            if *l == lane && suppressed(cell.as_ref()) {
+        for (_, cell) in cells.get(&lane).into_iter().flatten() {
+            if suppressed(cell.as_ref()) {
                 Self::cell_closed(cell.as_ref());
             }
         }
@@ -1532,10 +1549,8 @@ impl StateStore for InMemoryStore {
         // Every existing per-pool cell for this lane — the cells organic traffic is selected
         // against. (A cell not yet created inherits health lazily on first access via `cell`.)
         let cells = read_recover(&self.pool_cells);
-        for ((_, l), cell) in cells.iter() {
-            if *l == lane {
-                Self::cell_record_failure(cell.as_ref(), now, cfg, None);
-            }
+        for (_, cell) in cells.get(&lane).into_iter().flatten() {
+            Self::cell_record_failure(cell.as_ref(), now, cfg, None);
         }
     }
 
@@ -1549,8 +1564,10 @@ impl StateStore for InMemoryStore {
         }
         let cells = read_recover(&self.pool_cells);
         cells
-            .iter()
-            .any(|((_, l), cell)| *l == lane && suppressed(cell.as_ref()))
+            .get(&lane)
+            .into_iter()
+            .flatten()
+            .any(|(_, cell)| suppressed(cell.as_ref()))
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
@@ -2034,6 +2051,54 @@ mod tests {
             store.get_lane(0).streak.load(Ordering::Relaxed),
             0,
             "streak should reset on success"
+        );
+    }
+
+    /// MEDIUM/correctness (store.rs `cell_record_success` streak reset before the HalfOpen→Closed
+    /// CAS): a success recorded against a cell still in ST_OPEN — reachable via the bare
+    /// `record_success(lane)` on the degraded-forward path — must NOT zero the streak. In Consecutive
+    /// mode the streak drives the escalating backoff cooldown; wiping it on a still-Open cell resets
+    /// the per-cell failure memory and lets a persistently-failing upstream be re-probed more
+    /// aggressively than designed. The reset is now gated on `state != Open`.
+    #[test]
+    fn test_success_on_open_cell_preserves_streak_for_backoff_escalation() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+
+        // Park the default cell Open with an accumulated streak (as after several consecutive
+        // failures tripped the breaker and escalation is in progress).
+        store
+            .get_lane(0)
+            .breaker_state
+            .store(ST_OPEN, Ordering::Relaxed);
+        store.get_lane(0).streak.store(5, Ordering::Relaxed);
+
+        // A bare success lands on the still-Open cell (degraded-forward path). The HalfOpen→Closed
+        // CAS fails (Open ≠ HalfOpen) so no recovery occurs — and the streak must be preserved.
+        store.record_success(0);
+
+        assert_eq!(
+            store.get_lane(0).streak.load(Ordering::Relaxed),
+            5,
+            "a success on a still-Open cell must NOT zero the streak (preserves backoff escalation)"
+        );
+        assert_eq!(
+            store.get_lane(0).breaker_state.load(Ordering::Relaxed),
+            ST_OPEN,
+            "the cell must remain Open (success on Open does not recover it)"
+        );
+
+        // Sanity: a success on a CLOSED cell still resets the streak (the normal happy path).
+        store
+            .get_lane(0)
+            .breaker_state
+            .store(ST_CLOSED, Ordering::Relaxed);
+        store.get_lane(0).streak.store(4, Ordering::Relaxed);
+        store.record_success(0);
+        assert_eq!(
+            store.get_lane(0).streak.load(Ordering::Relaxed),
+            0,
+            "a success on a Closed cell must reset the streak"
         );
     }
 

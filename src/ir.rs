@@ -74,9 +74,14 @@ pub(crate) enum IrStreamEvent {
         /// synthesized when the backend supplies none).
         ///
         /// Synthesized-ID contract: on a CROSS-PROTOCOL stream the foreign-format identity is stripped
-        /// (`StreamTranslate::translate_event` sets `id`/`created`/`model` to `None`) so the ingress
+        /// (`StreamTranslate::translate_event` sets ONLY `id` and `created` to `None`) so the ingress
         /// writer mints a NATIVE-format id rather than leaking the backend's `chatcmpl-…`/`msg_…` to a
-        /// different-protocol client. A same-protocol round-trip is untouched and stays byte-exact.
+        /// different-protocol client. `model` is DELIBERATELY PRESERVED: it is the format-neutral lane
+        /// model name, and ingress writers use a populated `model` as the anchor for synthesizing the
+        /// full native stream-start skeleton — clearing it produced a degenerate Anthropic
+        /// `message_start` (missing `id`/`type`/`content`/`stop_reason`/`stop_sequence`) and a Gemini
+        /// frame missing `modelVersion` (see the explanation at `proto/mod.rs` `translate_event`). A
+        /// same-protocol round-trip is untouched and stays byte-exact.
         id: Option<String>,
         /// Unix epoch seconds for the stream's creation time (OpenAI chunk top-level `created`).
         created: Option<u64>,
