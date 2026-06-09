@@ -471,6 +471,180 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     }
 }
 
+/// The INGRESS protocol's NATIVE tool-call id prefix, used by [`ToolIdRemap`] to reshape a foreign
+/// egress tool id into the ingress client's expected form. `None` means the protocol either carries
+/// no tool id on the wire (Gemini correlates `functionCall`s by name; its writer ignores the IR
+/// `ToolUse.id`) so no remap is meaningful, OR uses a free-form id with no canonical prefix where we
+/// still want reversibility — those are handled by the empty-prefix branch in [`ToolIdRemap`].
+fn native_tool_id_prefix(protocol_name: &str) -> Option<&'static str> {
+    match protocol_name {
+        // Anthropic `toolu_…`, OpenAI/Responses `call_…`, Bedrock `tooluse_…` are the documented
+        // native shapes. Cohere tool ids are free-form (no canonical prefix) — use an empty prefix so
+        // the reversible sentinel still applies (the foreign id is never emitted verbatim).
+        "anthropic" => Some("toolu_"),
+        "openai" | "responses" => Some("call_"),
+        "bedrock" => Some("tooluse_"),
+        "cohere" => Some(""),
+        // Gemini carries no tool id on the wire — its writer drops `ToolUse.id` entirely — so there is
+        // nothing to reshape and no risk of a foreign id leaking to a Gemini client.
+        _ => None,
+    }
+}
+
+/// Marker segment embedded in a busbar-minted tool id so the reverse (request) translation can tell a
+/// busbar-reshaped id from one the client itself authored, and recover the original egress id without
+/// any cross-request state. Chosen to be alphanumeric (valid inside every native id shape) and
+/// vanishingly unlikely to prefix a genuine client tool id. The original egress id follows as lower
+/// hex, making the whole transform a pure, deterministic bijection: the SAME egress id always maps to
+/// the SAME native id, so a `tool_use` and the `tool_result` that later references it stay consistent
+/// WITHIN a request AND across rounds (the client echoes the native id back; the request path decodes
+/// it to the original before the egress backend sees it).
+const TOOL_ID_REMAP_MARKER: &str = "bb1";
+
+/// Per-request / per-stream tool-id remap applied ONLY at the cross-protocol seam (ingress != egress).
+/// Same-protocol passthrough never constructs one, so native ids pass through verbatim there.
+///
+/// Forward (egress → ingress, on a response): each foreign egress tool id is reshaped to the ingress
+/// protocol's native form — `<prefix><MARKER><hex(egress_id)>` — so e.g. an OpenAI backend's `call_…`
+/// never reaches an Anthropic client as a foreign `call_…` (an immediate proxy tell), it arrives as a
+/// native `toolu_…`. The in-request map memoizes so a repeated egress id maps stably (and the encoding
+/// is deterministic regardless, so the map is an optimization, not a correctness crutch).
+///
+/// Reverse (ingress → egress, on the next request): the client echoes the native id back inside a
+/// `tool_result`; [`decode_native_tool_id`] strips the marker and hex-decodes it to the ORIGINAL
+/// egress id so the backend sees the id it actually issued. An id WITHOUT the marker is client-authored
+/// (or same-protocol) and passes through untouched.
+#[derive(Default)]
+pub(crate) struct ToolIdRemap {
+    map: std::collections::HashMap<String, String>,
+}
+
+impl ToolIdRemap {
+    /// Reshape one egress tool id into the ingress protocol's native form. Deterministic + memoized.
+    /// `None` ingress prefix (Gemini) returns the id unchanged — that protocol drops tool ids anyway.
+    fn native_for(&mut self, ingress_protocol: &str, egress_id: &str) -> String {
+        let Some(prefix) = native_tool_id_prefix(ingress_protocol) else {
+            return egress_id.to_string();
+        };
+        if let Some(existing) = self.map.get(egress_id) {
+            return existing.clone();
+        }
+        let native = format!("{prefix}{TOOL_ID_REMAP_MARKER}{}", hex::encode(egress_id));
+        self.map.insert(egress_id.to_string(), native.clone());
+        native
+    }
+
+    /// Rewrite every tool id in a non-stream `IrResponse` to the ingress-native form (in place).
+    pub(crate) fn remap_response(
+        &mut self,
+        ingress_protocol: &str,
+        ir: &mut crate::ir::IrResponse,
+    ) {
+        for block in &mut ir.content {
+            self.remap_block(ingress_protocol, block);
+        }
+    }
+
+    /// Rewrite every tool id in a streaming `IrStreamEvent` to the ingress-native form (in place).
+    pub(crate) fn remap_event(
+        &mut self,
+        ingress_protocol: &str,
+        event: &mut crate::ir::IrStreamEvent,
+    ) {
+        if let crate::ir::IrStreamEvent::BlockStart {
+            block: crate::ir::IrBlockMeta::ToolUse { id, .. },
+            ..
+        } = event
+        {
+            *id = self.native_for(ingress_protocol, id);
+        }
+    }
+
+    fn remap_block(&mut self, ingress_protocol: &str, block: &mut crate::ir::IrBlock) {
+        match block {
+            crate::ir::IrBlock::ToolUse { id, .. } => {
+                *id = self.native_for(ingress_protocol, id);
+            }
+            crate::ir::IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                *tool_use_id = self.native_for(ingress_protocol, tool_use_id);
+                for inner in content {
+                    self.remap_block(ingress_protocol, inner);
+                }
+            }
+            crate::ir::IrBlock::Text { .. }
+            | crate::ir::IrBlock::Thinking { .. }
+            | crate::ir::IrBlock::Image { .. } => {}
+        }
+    }
+}
+
+/// Recover the ORIGINAL egress tool id from a busbar-reshaped native id (the reverse of
+/// [`ToolIdRemap::native_for`]). Returns `Some(original)` when `id` carries the busbar marker after a
+/// known native prefix AND the hex tail decodes to valid UTF-8; otherwise `None` (a client-authored id
+/// — pass it through verbatim). Pure and stateless, so the reverse needs no shared map across rounds.
+pub(crate) fn decode_native_tool_id(id: &str) -> Option<String> {
+    // Try every known native prefix (including the empty Cohere prefix, tried last so a non-empty
+    // prefix wins first). The id must be `<prefix><MARKER><hex>`.
+    for prefix in ["toolu_", "call_", "tooluse_", ""] {
+        let Some(rest) = id.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(hexpart) = rest.strip_prefix(TOOL_ID_REMAP_MARKER) else {
+            continue;
+        };
+        // A valid busbar id has an even-length lowercase-hex tail; reject anything else so a genuine
+        // client id that merely happens to start with `call_bb1`/etc. is not mangled.
+        let Ok(bytes) = hex::decode(hexpart) else {
+            continue;
+        };
+        if let Ok(s) = String::from_utf8(bytes) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Walk a request-body IR (messages → blocks, recursing into `ToolResult.content`) and decode any
+/// busbar-reshaped tool id back to the original egress id, so a `tool_result` the client echoes after a
+/// cross-protocol response references the id the egress backend actually issued. A no-op for ids that
+/// carry no busbar marker (client-authored / same-protocol). Applied at the request seam (ingress !=
+/// egress) AFTER `read_request`, BEFORE the egress `write_request`.
+pub(crate) fn decode_request_tool_ids(messages: &mut [crate::ir::IrMessage]) {
+    fn walk(block: &mut crate::ir::IrBlock) {
+        match block {
+            crate::ir::IrBlock::ToolUse { id, .. } => {
+                if let Some(orig) = decode_native_tool_id(id) {
+                    *id = orig;
+                }
+            }
+            crate::ir::IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                if let Some(orig) = decode_native_tool_id(tool_use_id) {
+                    *tool_use_id = orig;
+                }
+                for inner in content {
+                    walk(inner);
+                }
+            }
+            crate::ir::IrBlock::Text { .. }
+            | crate::ir::IrBlock::Thinking { .. }
+            | crate::ir::IrBlock::Image { .. } => {}
+        }
+    }
+    for msg in messages {
+        for block in &mut msg.content {
+            walk(block);
+        }
+    }
+}
+
 /// pure cross-protocol response-stream translator. Feed EGRESS-protocol SSE bytes,
 /// get the equivalent INGRESS-protocol SSE bytes — composing `egress.reader().read_response_events`
 /// (wire → IR, stateful fan-out) with `ingress.writer().write_response_event` (IR → wire). Holds
@@ -538,6 +712,14 @@ pub(crate) struct StreamTranslate {
     /// pre-encode JSON instead, decoupling its input from the `ingress_eventstream` framing. Empty for
     /// non-bedrock ingress (the tap reads the SSE output directly there). Drained by `take_tap_json`.
     tap_json: Vec<u8>,
+    /// CROSS-PROTOCOL tool-id native remap (the streaming half of the §Finding-2 class fix). Reshapes
+    /// each egress `tool_use` id (e.g. OpenAI `call_…`) to the INGRESS client's native shape (Anthropic
+    /// `toolu_…`) before the ingress writer serializes it, so a foreign id never reaches the client. The
+    /// map is stream-scoped: a tool id seen on `BlockStart` maps stably for the life of this stream (and
+    /// the transform is deterministic, so the matching `tool_result` the client sends back next round
+    /// decodes to the original egress id). A `StreamTranslate` only exists cross-protocol, so this never
+    /// touches a same-protocol byte-exact passthrough.
+    tool_id_remap: ToolIdRemap,
     /// Input-token usage captured at stream start (`MessageStart.usage`), carried forward so the
     /// terminal `MessageDelta` reports the prompt-token count.
     ///
@@ -585,6 +767,7 @@ impl StreamTranslate {
             bedrock_metadata_emitted: false,
             bedrock_metadata_pending: false,
             tap_json: Vec::new(),
+            tool_id_remap: ToolIdRemap::default(),
             start_usage: None,
         })
     }
@@ -592,11 +775,18 @@ impl StreamTranslate {
     /// Translate one egress event `(event_type, payload)` into ingress wire bytes, advancing the
     /// decode state. Shared by the SSE and event-stream feed paths.
     fn translate_event(&mut self, event_type: &str, data: &serde_json::Value, out: &mut Vec<u8>) {
+        // Ingress protocol name for the tool-id remap below. Captured up front because reshaping
+        // borrows `self.tool_id_remap` mutably while `self.ingress` is borrowed immutably for its name.
+        let ingress_name = self.ingress.name().to_string();
         for mut ev in self
             .egress
             .reader()
             .read_response_events(event_type, data, &mut self.decode)
         {
+            // CROSS-PROTOCOL tool-id native remap: reshape the egress `tool_use` id on a `BlockStart`
+            // to the ingress client's native shape (see `StreamTranslate::tool_id_remap`). Done before
+            // identity-strip/usage-backfill so the rest of the pipeline sees the client-facing id.
+            self.tool_id_remap.remap_event(&ingress_name, &mut ev);
             // Cross-protocol stream identity strip: a `StreamTranslate` only exists when
             // ingress != egress (`new` returns None otherwise), so every event here crosses a
             // protocol boundary. Clear the foreign-format `MessageStart` `id`/`created` so the INGRESS
@@ -905,18 +1095,35 @@ impl StreamTranslate {
         // Drain every complete blank-line-delimited SSE frame currently buffered. Both the LF-LF
         // (`\n\n`) and the spec-legal CRLF (`\r\n\r\n`) terminators are recognized — some gateways /
         // CDNs in front of model APIs emit CRLF SSE, which contains no `\n\n` adjacency, so an
-        // LF-only scanner would buffer the whole stream until MAX_BUF and silently abort it. We back
-        // up to cover a terminator straddling the previous chunk boundary (3 bytes, enough for the
-        // 4-byte CRLF terminator) and only rescan the unsearched tail, keeping `feed()` linear.
+        // LF-only scanner would buffer the whole stream until MAX_BUF and silently abort it.
+        //
+        // `consumed` is a FRONT cursor: each complete frame advances it instead of physically
+        // `drain(..end)`-ing the front, which shifted the entire remaining tail down once PER frame
+        // (O(n^2) when one buffer holds many small frames). We parse each frame as a slice and only
+        // reclaim the consumed prefix ONCE, after the loop.
+        //
+        // `scanned`/`consumed` are absolute offsets into `buf`. The next frame begins exactly at
+        // `consumed`, so the search floor is `consumed` — NEVER below it (a sub-`consumed` start would
+        // re-find the terminator we just consumed → an empty frame and an infinite loop). The 3-byte
+        // backup (to catch a CRLF terminator straddling the previous chunk boundary) and the `scanned`
+        // skip (avoid rescanning the already-searched prefix of a frame split across many feeds) apply
+        // only ABOVE that floor, so `feed()` stays linear without looping.
+        let mut consumed = 0usize;
         loop {
-            let search_from = self.scanned.saturating_sub(3).min(self.buf.len());
+            let search_from = self
+                .scanned
+                .saturating_sub(3)
+                .max(consumed)
+                .min(self.buf.len());
             match find_frame_terminator(&self.buf[search_from..]) {
                 Some((rel, term_len)) => {
                     let end = search_from + rel + term_len;
-                    let frame: Vec<u8> = self.buf.drain(..end).collect();
-                    self.scanned = 0;
+                    let frame = &self.buf[consumed..end];
+                    consumed = end;
+                    self.scanned = end;
 
-                    let Some((event_type, data_str)) = parse_sse_frame(&frame) else {
+                    let parsed = parse_sse_frame(frame);
+                    let Some((event_type, data_str)) = parsed else {
                         continue; // no data: line, or non-utf8 — skip
                     };
                     if data_str.is_empty() || data_str == "[DONE]" {
@@ -933,6 +1140,11 @@ impl StreamTranslate {
                     break;
                 }
             }
+        }
+        // Reclaim the consumed prefix in a single shift (linear), then rebase the cursors.
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+            self.scanned = self.buf.len();
         }
         if self.buf.len() > Self::MAX_BUF {
             self.abort_overflow();
@@ -1113,14 +1325,25 @@ impl GeminiJsonArrayFramer {
         }
         self.buf.extend_from_slice(chunk);
         let mut out: Vec<u8> = Vec::new();
+        // FRONT cursor (mirrors `StreamTranslate::feed`): advance `consumed` per complete frame and
+        // reclaim the prefix in ONE shift after the loop, instead of `drain(..end)` per frame (which
+        // shifted the whole tail once per frame → O(n^2) on a buffer of many small frames). The search
+        // floor is `consumed` — never below it, or the just-consumed terminator is re-found (infinite
+        // loop); the 3-byte straddle backup and the `scanned` skip apply only above that floor.
+        let mut consumed = 0usize;
         loop {
-            let search_from = self.scanned.saturating_sub(3).min(self.buf.len());
+            let search_from = self
+                .scanned
+                .saturating_sub(3)
+                .max(consumed)
+                .min(self.buf.len());
             match find_frame_terminator(&self.buf[search_from..]) {
                 Some((rel, term_len)) => {
                     let end = search_from + rel + term_len;
-                    let frame: Vec<u8> = self.buf.drain(..end).collect();
-                    self.scanned = 0;
-                    let Some((_event_type, data_str)) = parse_sse_frame(&frame) else {
+                    let frame = &self.buf[consumed..end];
+                    consumed = end;
+                    self.scanned = end;
+                    let Some((_event_type, data_str)) = parse_sse_frame(frame) else {
                         continue; // no data: line — keepalive/comment frame
                     };
                     if data_str.is_empty() || data_str == "[DONE]" {
@@ -1144,6 +1367,10 @@ impl GeminiJsonArrayFramer {
                     break;
                 }
             }
+        }
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+            self.scanned = self.buf.len();
         }
         if self.buf.len() > Self::MAX_BUF {
             self.aborted = true;
@@ -4067,11 +4294,24 @@ mod stream_translate_tests {
             Some("get_weather"),
             "toolUse name round-trips; got {v}"
         );
+        // §Finding-2 (cross-protocol tool-id native remap): the egress Anthropic `toolu_abc` id is NO
+        // LONGER emitted verbatim to the Bedrock client — that would leak a foreign id shape. It is
+        // reshaped to the Bedrock-native `tooluse_` form at the seam, and the reshaped id must decode
+        // back to the original `toolu_abc` so the round-trip (client → request path → backend) stays
+        // consistent. (Updated from the prior verbatim-`toolu_abc` assertion — the new, more-correct
+        // contract.)
+        let emitted_tool_id = v
+            .pointer("/start/toolUse/toolUseId")
+            .and_then(|x| x.as_str())
+            .expect("toolUseId present");
+        assert!(
+            emitted_tool_id.starts_with("tooluse_") && emitted_tool_id != "toolu_abc",
+            "Bedrock client must see a native `tooluse_` id, not the foreign `toolu_abc`; got {emitted_tool_id}"
+        );
         assert_eq!(
-            v.pointer("/start/toolUse/toolUseId")
-                .and_then(|x| x.as_str()),
+            decode_native_tool_id(emitted_tool_id).as_deref(),
             Some("toolu_abc"),
-            "toolUse id round-trips; got {v}"
+            "the reshaped id must decode back to the original egress tool id; got {emitted_tool_id}"
         );
 
         // The contentBlockDelta frame must carry the tool input JSON.
@@ -4650,7 +4890,9 @@ mod stream_translate_tests {
         );
     }
 
-    // Cross-protocol tool-calling fidelity: openai tool_calls → anthropic tool_use survives.
+    // Cross-protocol tool-calling fidelity: openai tool_calls → anthropic tool_use survives, and the
+    // foreign `call_1` id is RESHAPED to the Anthropic-native `toolu_` form at the seam (§Finding-2),
+    // never leaked verbatim. (Updated from the prior verbatim-`call_1` assertion — the new contract.)
     #[test]
     fn test_translate_tool_call_fidelity() {
         let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
@@ -4670,9 +4912,34 @@ mod stream_translate_tests {
             out.contains("tool_use"),
             "tool_use block type missing; got {out}"
         );
+        // The tool NAME survives; the foreign `call_1` id must NOT — it is reshaped to a native
+        // `toolu_…` id that decodes back to `call_1`.
         assert!(
-            out.contains("get_weather") && out.contains("call_1"),
-            "tool name/id must survive cross-protocol; got {out}"
+            out.contains("get_weather"),
+            "tool name must survive; got {out}"
+        );
+        assert!(
+            !out.contains("call_1"),
+            "foreign `call_1` id must NOT leak to the Anthropic client; got {out}"
+        );
+        // Pull the emitted tool_use id out of the content_block_start frame and confirm it is native
+        // and reversible.
+        let emitted = data_payloads(&out)
+            .into_iter()
+            .find_map(|p| {
+                p.pointer("/content_block/id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .expect("a content_block_start carrying a tool_use id");
+        assert!(
+            emitted.starts_with("toolu_"),
+            "emitted tool id must be Anthropic-native; got {emitted}"
+        );
+        assert_eq!(
+            decode_native_tool_id(&emitted).as_deref(),
+            Some("call_1"),
+            "the reshaped id must decode back to the original egress `call_1`; got {emitted}"
         );
         assert!(
             out.contains("input_json_delta"),
@@ -4684,6 +4951,66 @@ mod stream_translate_tests {
     fn test_translate_same_protocol_is_none() {
         assert!(StreamTranslate::new("openai", "openai").is_none());
         assert!(StreamTranslate::new("anthropic", "anthropic").is_none());
+    }
+
+    // §Finding-3 (linear SSE drain): a single `feed` carrying MANY complete SSE frames at once must
+    // translate ALL of them (the cursor advances frame-by-frame and reclaims the prefix in one shift —
+    // no per-frame `drain` re-scan, no dropped/duplicated frames, no infinite loop). Large N here would
+    // be quadratic under the old `drain(..end)`-per-frame reassembly; it must complete near-instantly.
+    #[test]
+    fn test_translate_many_frames_in_one_feed_is_linear_and_complete() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        const N: usize = 20_000;
+        let mut blob = String::with_capacity(N * 96);
+        for _ in 0..N {
+            blob.push_str(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            );
+        }
+        let start = std::time::Instant::now();
+        let out = String::from_utf8(t.feed(blob.as_bytes())).expect("utf8");
+        let elapsed = start.elapsed();
+        // Every frame translated exactly once: N openai content deltas out.
+        assert_eq!(
+            out.matches("\"content\":\"x\"").count(),
+            N,
+            "all {N} frames must translate exactly once"
+        );
+        // Generous ceiling — quadratic reassembly of 20k frames would blow well past this; linear
+        // completes in milliseconds. Guards against a regression to per-frame front-draining.
+        assert!(
+            elapsed.as_secs() < 5,
+            "draining {N} frames must be linear; took {elapsed:?}"
+        );
+    }
+
+    // §Finding-3: the same buffer split arbitrarily across many `feed` calls (frames straddling chunk
+    // boundaries) must reassemble identically — the `scanned`/`consumed` cursors carry across feeds.
+    #[test]
+    fn test_translate_frames_split_across_chunks_reassemble() {
+        // ingress=anthropic, egress=openai → feed OpenAI SSE, expect Anthropic `text_delta` output.
+        let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
+        let mut blob = String::new();
+        for i in 0..50 {
+            blob.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"t{i}\"}}}}]}}\n\n"
+            ));
+        }
+        // Feed 7 bytes at a time so terminators land mid-chunk.
+        let mut out = String::new();
+        let bytes = blob.as_bytes();
+        let mut p = 0;
+        while p < bytes.len() {
+            let end = (p + 7).min(bytes.len());
+            out.push_str(&String::from_utf8(t.feed(&bytes[p..end])).unwrap());
+            p = end;
+        }
+        for i in 0..50 {
+            assert!(
+                out.contains(&format!("\"text\":\"t{i}\"")),
+                "frame t{i} must survive chunk-boundary reassembly; got {out}"
+            );
+        }
     }
 
     /// Multiple `data:` lines in one SSE frame must be concatenated with `\n` (SSE spec §9.2.6),
@@ -5017,6 +5344,130 @@ mod stream_translate_tests {
             anthropic_json.get("stop_reason").and_then(|v| v.as_str()),
             Some("tool_use")
         );
+    }
+
+    // ── §Finding-2: cross-protocol tool-id native remap at the seam ──────────────────────────────
+
+    #[test]
+    fn test_tool_id_remap_reshapes_to_ingress_native_prefix() {
+        // An OpenAI backend's `call_…` reshaped for an Anthropic client must carry the native
+        // `toolu_` prefix and the busbar marker — never the foreign `call_` shape.
+        let mut remap = ToolIdRemap::default();
+        let native = remap.native_for("anthropic", "call_abc123");
+        assert!(
+            native.starts_with("toolu_"),
+            "anthropic-ingress id must carry the native `toolu_` prefix, got {native}"
+        );
+        assert!(
+            !native.contains("call_"),
+            "the foreign `call_` shape must NOT survive into the client id, got {native}"
+        );
+        // Bedrock `tooluse_` and OpenAI `call_` prefixes for the other ingress shapes.
+        assert!(ToolIdRemap::default()
+            .native_for("bedrock", "call_x")
+            .starts_with("tooluse_"));
+        assert!(ToolIdRemap::default()
+            .native_for("openai", "toolu_y")
+            .starts_with("call_"));
+        // Gemini carries no tool id on the wire → remap is a no-op (id returned unchanged).
+        assert_eq!(
+            ToolIdRemap::default().native_for("gemini", "call_z"),
+            "call_z"
+        );
+    }
+
+    #[test]
+    fn test_tool_id_remap_is_a_stable_reversible_bijection() {
+        // Forward: the SAME egress id maps to the SAME native id within a request (stable map), and
+        // decoding the native id recovers the ORIGINAL egress id (so a later `tool_result` reference
+        // stays consistent across rounds).
+        let mut remap = ToolIdRemap::default();
+        let a1 = remap.native_for("anthropic", "call_one");
+        let a2 = remap.native_for("anthropic", "call_one");
+        let b = remap.native_for("anthropic", "call_two");
+        assert_eq!(a1, a2, "a repeated egress id must map stably");
+        assert_ne!(a1, b, "distinct egress ids must map to distinct native ids");
+        assert_eq!(decode_native_tool_id(&a1).as_deref(), Some("call_one"));
+        assert_eq!(decode_native_tool_id(&b).as_deref(), Some("call_two"));
+
+        // A client-authored id (no busbar marker) is NOT a busbar id → decode returns None so the
+        // request path passes it through verbatim (must not mangle a genuine native tool id).
+        assert_eq!(decode_native_tool_id("toolu_01RealClientId"), None);
+        assert_eq!(decode_native_tool_id("call_genuine"), None);
+    }
+
+    #[test]
+    fn test_tool_id_remap_response_round_trip_through_seam() {
+        // Response seam (egress → ingress): an OpenAI `tool_use` reshaped to the Anthropic-native shape.
+        let mut ir = OpenAiReader
+            .read_response(&serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_seam",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{\"x\":1}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+            }))
+            .expect("OpenAI read");
+        ToolIdRemap::default().remap_response("anthropic", &mut ir);
+        let client_id = match &ir.content[0] {
+            crate::ir::IrBlock::ToolUse { id, .. } => id.clone(),
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert!(
+            client_id.starts_with("toolu_") && !client_id.contains("call_seam"),
+            "client must see a native id, not the foreign `call_seam`, got {client_id}"
+        );
+
+        // Request seam (ingress → egress): the Anthropic client echoes that native id back inside a
+        // `tool_result`; the request path must decode it to the ORIGINAL `call_seam` for the backend.
+        let mut messages = vec![crate::ir::IrMessage {
+            role: crate::ir::IrRole::Tool,
+            content: vec![crate::ir::IrBlock::ToolResult {
+                tool_use_id: client_id,
+                content: vec![],
+                is_error: false,
+            }],
+        }];
+        decode_request_tool_ids(&mut messages);
+        match &messages[0].content[0] {
+            crate::ir::IrBlock::ToolResult { tool_use_id, .. } => {
+                assert_eq!(
+                    tool_use_id, "call_seam",
+                    "the egress backend must see the id it originally issued"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tool_id_remap_event_reshapes_block_start() {
+        // Streaming seam: a `BlockStart{ToolUse}` id is reshaped to the ingress-native form in place.
+        let mut ev = IrStreamEvent::BlockStart {
+            index: 0,
+            block: IrBlockMeta::ToolUse {
+                id: "call_stream".to_string(),
+                name: "f".to_string(),
+            },
+        };
+        ToolIdRemap::default().remap_event("anthropic", &mut ev);
+        match ev {
+            IrStreamEvent::BlockStart {
+                block: IrBlockMeta::ToolUse { id, .. },
+                ..
+            } => {
+                assert!(id.starts_with("toolu_") && id != "call_stream");
+                assert_eq!(decode_native_tool_id(&id).as_deref(), Some("call_stream"));
+            }
+            other => panic!("expected BlockStart ToolUse, got {other:?}"),
+        }
     }
 
     #[test]

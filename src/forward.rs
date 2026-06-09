@@ -312,6 +312,14 @@ pub(crate) fn translate_request_cross_protocol(
         match ingress_proto.reader().read_request(&body) {
             Ok(mut ir) => {
                 apply_required_max_tokens(&mut ir, &app.lanes[i]);
+                // CROSS-PROTOCOL tool-id reverse remap (the request half of the §Finding-2 class fix).
+                // On the prior cross-protocol RESPONSE we reshaped each egress `tool_use` id to the
+                // ingress client's native shape (e.g. OpenAI `call_…` → Anthropic `toolu_bb1<hex>`). The
+                // client now echoes that native id back inside a `tool_result`; decode it to the ORIGINAL
+                // egress id here so the backend sees the id it actually issued and the tool-call
+                // correlation survives the round trip. Client-authored ids (no busbar marker) pass
+                // through untouched. Same-protocol passthrough never enters this branch.
+                crate::proto::decode_request_tool_ids(&mut ir.messages);
                 // CROSS-PROTOCOL extra-key leak guard (the structural class fix). Every reader sweeps
                 // unmodeled top-level request keys into `ir.extra`; on a SAME-protocol round-trip the
                 // egress writer re-emits them verbatim (lossless passthrough, the intended behavior).
@@ -1608,6 +1616,19 @@ pub(crate) fn host_from_base(base: &str) -> String {
     format!("{host_authority}{rest}")
 }
 
+/// Produce the path that is BOTH signed (as the SigV4 canonical URI) and sent on the wire, so the
+/// two can never diverge. Only the path component (before any `?`) is URI-encoded — reserved chars
+/// in a Bedrock modelId such as `:` become `%3A`; the query string (if any) is preserved verbatim
+/// (encoding `?`/`=`/`&` would corrupt it). The percent-encoded `%XX` sequences pass through the
+/// `url` crate's path parser unchanged, so the transmitted request path equals the signed canonical
+/// path byte-for-byte and AWS cannot reject with SignatureDoesNotMatch over a path-encoding mismatch.
+pub(crate) fn sign_and_wire_path(url_path: &str) -> String {
+    match url_path.split_once('?') {
+        Some((path, query)) => format!("{}?{}", crate::sigv4::uri_encode_path(path), query),
+        None => crate::sigv4::uri_encode_path(url_path),
+    }
+}
+
 /// Build outbound auth headers for a lane. Defaults to the protocol's native auth via
 /// `sign_request` (bearer for openai/anthropic/responses, `x-goog-api-key` for gemini, per-request
 /// SigV4 for bedrock). When the provider declares `auth: api-key` (Azure OpenAI), send an
@@ -1903,11 +1924,19 @@ pub(crate) async fn forward_with_pool(
             Some(p) => p.clone(),
             None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
         };
+        // SigV4 signs over the URI-encoded canonical path, so the wire request MUST be sent over the
+        // SAME encoding or AWS rejects with SignatureDoesNotMatch (e.g. a Bedrock modelId carrying
+        // reserved chars like `:` signs `%3A` but a raw send transmits `:`). Encode the path ONCE and
+        // use it for both signing and the wire URL — the percent-encoded `%XX` sequences pass through
+        // the `url` crate's path parser unchanged, so transmitted path == signed canonical path.
+        let wire_path = sign_and_wire_path(&url_path);
         let signing_ctx = crate::proto::SigningContext {
             host: host_from_base(base),
-            canonical_uri: crate::sigv4::uri_encode_path(
-                url_path.split('?').next().unwrap_or(&url_path),
-            ),
+            canonical_uri: wire_path
+                .split('?')
+                .next()
+                .unwrap_or(&wire_path)
+                .to_string(),
             body: &payload,
             timestamp_epoch: now(),
         };
@@ -1915,7 +1944,7 @@ pub(crate) async fn forward_with_pool(
 
         let mut req = app
             .client
-            .post(format!("{base}{url_path}"))
+            .post(format!("{base}{wire_path}"))
             .headers(convert_headers(auth))
             .header(CONTENT_TYPE, "application/json")
             // Native-SDK User-Agent for the egress protocol. The shared client sets none, so without
@@ -2434,6 +2463,17 @@ pub(crate) async fn forward_with_pool(
                                 if ir.created.is_none() {
                                     ir.created = Some(unix_now_secs());
                                 }
+                                // CROSS-PROTOCOL tool-id native remap (the response half of the
+                                // §Finding-2 class fix). The egress backend's tool-call ids are in its
+                                // OWN protocol's shape (OpenAI `call_…`, Bedrock `tooluse_…`, …); emitted
+                                // verbatim they leak a foreign id to a different-protocol client (a proxy
+                                // tell, and an id the client's SDK may reject as malformed). Reshape each
+                                // to the INGRESS client's native form here, at the seam — same-protocol
+                                // passthrough never reaches this block, so native ids stay verbatim there.
+                                // The transform is a deterministic reversible bijection, so the matching
+                                // `tool_result` the client sends back next round decodes to this id.
+                                crate::proto::ToolIdRemap::default()
+                                    .remap_response(ingress_protocol, &mut ir);
                                 // Bedrock ingress that requested ConverseStream (`wants_stream`) but
                                 // got a BUFFERED (non-SSE) 2xx upstream: a native AWS SDK
                                 // ConverseStream decoder expects binary `eventstream` frames, NOT an
@@ -2778,11 +2818,15 @@ async fn forward_once(
         Some(p) => p.clone(),
         None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
     };
+    // Sign and send the SAME path encoding — see `sign_and_wire_path` (mirrors the main forward path).
+    let wire_path = sign_and_wire_path(&url_path);
     let signing_ctx = crate::proto::SigningContext {
         host: host_from_base(base),
-        canonical_uri: crate::sigv4::uri_encode_path(
-            url_path.split('?').next().unwrap_or(&url_path),
-        ),
+        canonical_uri: wire_path
+            .split('?')
+            .next()
+            .unwrap_or(&wire_path)
+            .to_string(),
         body: &payload,
         timestamp_epoch: now(),
     };
@@ -2790,7 +2834,7 @@ async fn forward_once(
 
     let mut req = app
         .client
-        .post(format!("{base}{url_path}"))
+        .post(format!("{base}{wire_path}"))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, "application/json")
         // Native-SDK User-Agent for the egress protocol (mirrors the main forward path).
@@ -3651,6 +3695,43 @@ mod auth_style_tests {
         assert_eq!(
             host_from_base("https://host.example.com/x@y"),
             "host.example.com/x@y"
+        );
+    }
+
+    #[test]
+    fn test_sign_and_wire_path_signed_equals_sent_for_reserved_chars() {
+        use super::sign_and_wire_path;
+        // A Bedrock modelId carrying reserved chars (`:` for a cross-region inference profile /
+        // provisioned-throughput ARN, `.` already unreserved). The path must be encoded ONCE and used
+        // for BOTH the SigV4 canonical URI and the wire URL, or AWS rejects with SignatureDoesNotMatch.
+        let model = "us.anthropic.claude-3-5-sonnet-20240620-v1:0";
+        // Raw, un-encoded path as built by the Bedrock writer's `upstream_path_for_stream`.
+        let url_path = format!("/model/{model}/converse");
+        let wire_path = sign_and_wire_path(&url_path);
+        // `:` encoded to %3A; `/` and `.` preserved.
+        assert_eq!(
+            wire_path,
+            "/model/us.anthropic.claude-3-5-sonnet-20240620-v1%3A0/converse"
+        );
+
+        // The path actually SIGNED (the canonical_uri the forward path passes to SigningContext).
+        let signed_canonical = wire_path
+            .split('?')
+            .next()
+            .unwrap_or(&wire_path)
+            .to_string();
+
+        // The path actually SENT: reqwest parses `{base}{wire_path}` into a `url::Url`. Its parser
+        // must preserve the existing `%3A` (not double-encode the `%`), so the transmitted path is
+        // byte-identical to the signed canonical path.
+        let url = reqwest::Url::parse(&format!(
+            "https://bedrock-runtime.us-east-1.amazonaws.com{wire_path}"
+        ))
+        .expect("url parses");
+        assert_eq!(
+            url.path(),
+            signed_canonical,
+            "transmitted path must equal the signed canonical path"
         );
     }
 }
