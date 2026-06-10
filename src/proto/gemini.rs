@@ -827,6 +827,12 @@ const RESPONSE_ID_ALPHABET: &[u8; 62] =
 /// fingerprint it as non-native.
 const RESPONSE_ID_TOKEN_LEN: usize = 16;
 
+/// Rejection-sampling threshold for the base62 reduction in `synth_response_id`: the largest multiple
+/// of 62 that fits in a `u8` is `4 * 62 = 248`. Any random byte `>= 248` is in the partial final
+/// block (`248..=255` → residues `0..=7`) that would otherwise be over-represented by a bare
+/// `byte % 62`, so we reject and resample those to keep the symbol distribution uniform.
+const RESPONSE_ID_REJECT_THRESHOLD: u8 = 248;
+
 /// Mint a Gemini-shaped `responseId` for the cross-protocol path where the backend supplied none.
 ///
 /// A native Gemini `responseId` is an opaque, mixed-case alphanumeric base64url-style token with NO
@@ -842,12 +848,40 @@ const RESPONSE_ID_TOKEN_LEN: usize = 16;
 /// stream, so no counter backstop is needed and every position stays fully random like a native id.
 /// No embedded clock, no separator, no new dependency. Never panics on the request path: on entropy
 /// failure the buffer stays the base62 zero char.
+///
+/// The byte→base62 reduction uses REJECTION SAMPLING, not a bare `byte % 62`. `256 % 62 != 0`, so a
+/// plain modulo over a uniform `u8` is biased: residues `0..=8` (the values `<256-194=62`… i.e. the
+/// low residues reachable by the extra high byte values `248..=255`) occur slightly more often than
+/// `9..=61`. We instead reject any byte `>= RESPONSE_ID_REJECT_THRESHOLD` (the largest multiple of 62
+/// at or below 256, i.e. `4*62 = 248`) and resample, so every surviving byte maps uniformly across
+/// the 62 symbols. Rejected bytes are simply skipped and more random bytes are drawn as needed.
 fn synth_response_id() -> String {
-    let mut rand_bytes = [0u8; RESPONSE_ID_TOKEN_LEN];
-    let _ = getrandom::getrandom(&mut rand_bytes);
     let mut token = [b'0'; RESPONSE_ID_TOKEN_LEN];
-    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
-        *slot = RESPONSE_ID_ALPHABET[(byte % 62) as usize];
+    let mut filled = 0usize;
+    // Bound the number of refill rounds so a stuck/zero entropy source can never spin forever on the
+    // request path; ~4/256 of bytes are rejected, so a handful of rounds covers the token with margin
+    // and the `'0'`-prefilled buffer is the panic-free fallback if entropy never arrives.
+    let mut rounds = 0u32;
+    const MAX_ROUNDS: u32 = 8;
+    while filled < RESPONSE_ID_TOKEN_LEN && rounds < MAX_ROUNDS {
+        rounds += 1;
+        // Draw a generous batch so a single getrandom call typically fills the whole token even after
+        // rejections (RESPONSE_ID_TOKEN_LEN*2 bytes leave ample headroom for the ~1.6% reject rate).
+        let mut batch = [0u8; RESPONSE_ID_TOKEN_LEN * 2];
+        if getrandom::getrandom(&mut batch).is_err() {
+            break;
+        }
+        for &byte in batch.iter() {
+            if filled >= RESPONSE_ID_TOKEN_LEN {
+                break;
+            }
+            if byte >= RESPONSE_ID_REJECT_THRESHOLD {
+                // Biased residue region — reject and resample rather than fold it in.
+                continue;
+            }
+            token[filled] = RESPONSE_ID_ALPHABET[(byte % 62) as usize];
+            filled += 1;
+        }
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards an
@@ -863,8 +897,11 @@ fn synth_response_id() -> String {
 /// `tool_result`/`tool` message. With an empty id, two tool calls sharing a function name could not
 /// be told apart and `tool_result` routing broke.
 ///
-/// We derive a deterministic id from `(call_index, function_name)` via the FNV-1a hash of the
-/// stdlib (no new dependency). The id only needs to be stable WITHIN a single request so the
+/// We derive a deterministic id from `(call_index, function_name)` via the stdlib
+/// `std::collections::hash_map::DefaultHasher` (SipHash-1-3; no new dependency). Determinism within a
+/// run is all we need here — `DefaultHasher::new()` seeds from fixed constants (it is NOT the
+/// per-process randomized `RandomState` used by `HashMap`), so the same `(index, name)` always hashes
+/// to the same id. The id only needs to be stable WITHIN a single request so the
 /// synthesized `tool_result` (which the reader keys by function name — Gemini's only correlation
 /// handle) and the `tool_use` agree; including the call index disambiguates repeated function
 /// names. The `call_` prefix keeps it visibly synthetic and matches no native id shape we must
@@ -1431,15 +1468,18 @@ impl ProtocolWriter for GeminiWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            // MessageStart → a leading identity-only chunk WHEN identity is known. Native Gemini SSE
-            // chunks carry top-level `responseId`/`modelVersion`; the official `google-genai` SDK
-            // reads `chunk.response_id`/`chunk.model_version` off the stream. We emit one leading
-            // frame carrying whatever identity the egress captured (so a Gemini→Gemini stream is
-            // indistinguishable on those fields, and a cross-protocol stream that carries an id/model
-            // surfaces them). When NEITHER an id NOR a model is present (`None`/`None`), we emit no
-            // frame at all — mirroring `write_response`'s omit-on-`None` fidelity rule, so a native
-            // stream that carried no identity is not made distinguishable by an injected empty chunk.
-            // `created` has no Gemini stream analogue and is never emitted.
+            // MessageStart → a leading identity-bearing chunk, ALWAYS emitted (this arm never returns
+            // `None`). Native Gemini SSE chunks carry top-level `responseId`/`modelVersion`; the
+            // official `google-genai` SDK reads `chunk.response_id`/`chunk.model_version` off the
+            // stream. A native Gemini stream ALWAYS carries `responseId` on its first chunk, so we
+            // always emit a leading frame that carries one: when the egress captured an `id` we pass it
+            // through (a Gemini→Gemini stream is indistinguishable on that field); when `id` is `None`
+            // (the post-strip state on a cross-protocol stream — `StreamTranslate` zeroes the foreign
+            // id) we SYNTHESIZE a native-shaped `responseId` via `synth_response_id()` rather than
+            // omitting it, matching the non-stream `write_response` synth-on-strip behavior. `model`,
+            // when present, is added as `modelVersion`; when `None` it is simply omitted, so a `(None,
+            // None)` MessageStart still emits a frame carrying a synthesized `responseId` and no
+            // `modelVersion`. `created` has no Gemini stream analogue and is never emitted.
             IrStreamEvent::MessageStart { id, model, .. } => {
                 let mut frame = serde_json::Map::new();
                 match (id, model) {
@@ -3925,14 +3965,82 @@ mod tests {
         }
     }
 
-    /// Two consecutive synthesized ids differ because the monotonic counter is overlaid onto the
-    /// token's leading characters — guards the collision-free per-process uniqueness property
-    /// regardless of the RNG.
+    /// Two consecutive synthesized ids differ because the whole 16-char base62 token is drawn from
+    /// `getrandom` (~95 bits of entropy) — guards the collision-free per-process uniqueness property.
     #[test]
     fn test_synth_response_id_distinct_consecutive() {
         let a = synth_response_id();
         let b = synth_response_id();
         assert_ne!(a, b, "consecutive synthesized ids must differ: {a} vs {b}");
+    }
+
+    /// Regression (LOW/quality, R18): the base62 reduction must be UNBIASED. The old body mapped each
+    /// random byte with a bare `byte % 62`; because `256 % 62 != 0`, the 8 symbols reachable from the
+    /// partial final block (bytes `248..=255` → residues `0..=7`) were drawn at 5/256 while the other
+    /// 54 symbols were drawn at 4/256 — a ~25% over-representation of those 8 symbols. Rejection
+    /// sampling (reject bytes `>= 248`) flattens that. Draw a large burst, tally per-symbol frequency,
+    /// and assert the over-represented class is NOT systematically inflated: the mean frequency of the
+    /// 8 formerly-hot symbols must stay close to the mean of the other 54. Under the OLD biased code
+    /// the hot/cold ratio is ~1.25 and this assertion fails; under rejection sampling it is ~1.0.
+    #[test]
+    fn test_synth_response_id_base62_is_unbiased() {
+        use std::collections::HashMap;
+        // Symbols reachable from residues 0..=7 (the formerly over-represented class).
+        let hot: Vec<char> = RESPONSE_ID_ALPHABET[..8]
+            .iter()
+            .map(|&b| b as char)
+            .collect();
+
+        let mut counts: HashMap<char, u64> = HashMap::new();
+        let mut total: u64 = 0;
+        for _ in 0..40_000 {
+            for c in synth_response_id().chars() {
+                *counts.entry(c).or_insert(0) += 1;
+                total += 1;
+            }
+        }
+        assert!(total > 0, "burst produced no symbols");
+
+        let hot_sum: u64 = hot.iter().map(|c| *counts.get(c).unwrap_or(&0)).sum();
+        let cold_sum: u64 = counts
+            .iter()
+            .filter(|(c, _)| !hot.contains(c))
+            .map(|(_, n)| *n)
+            .sum();
+        // Per-symbol means: 8 hot symbols vs 54 cold symbols.
+        let hot_mean = hot_sum as f64 / hot.len() as f64;
+        let cold_count = 62 - hot.len();
+        let cold_mean = cold_sum as f64 / cold_count as f64;
+        assert!(cold_mean > 0.0, "no cold-symbol samples observed");
+        let ratio = hot_mean / cold_mean;
+        // Unbiased ≈ 1.0; old biased code ≈ 1.25. A generous window catches the bias while tolerating
+        // ordinary sampling noise over ~640k symbols.
+        assert!(
+            (0.90..=1.10).contains(&ratio),
+            "base62 reduction is biased: hot/cold per-symbol frequency ratio {ratio:.4} \
+             (hot_mean {hot_mean:.1}, cold_mean {cold_mean:.1}) — expected ~1.0 from unbiased \
+             rejection sampling, ~1.25 indicates the old `byte % 62` bias regressed"
+        );
+    }
+
+    /// Uniqueness burst (R18): a large run of synthesized ids must be collision-free in practice (each
+    /// is ~95 bits). Mint a burst and assert every id is distinct and native-shaped.
+    #[test]
+    fn test_synth_response_id_uniqueness_burst() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..50_000 {
+            let id = synth_response_id();
+            assert_eq!(id.len(), RESPONSE_ID_TOKEN_LEN, "non-native length: {id}");
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric()),
+                "non-base62 char in id: {id}"
+            );
+            assert!(
+                seen.insert(id.clone()),
+                "synthesized responseId collided: {id}"
+            );
+        }
     }
 
     /// Regression (HIGH/performance): `state.open_tools` is only drained on a `finishReason` chunk,

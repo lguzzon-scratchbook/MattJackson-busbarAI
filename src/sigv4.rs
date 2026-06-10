@@ -98,6 +98,31 @@ pub(crate) fn format_amz_time(epoch_secs: u64) -> (String, String) {
     )
 }
 
+/// Canonicalize a (non-quoted) signed-header value per AWS SigV4: trim leading/trailing ASCII
+/// spaces (0x20) and collapse each run of sequential ASCII spaces to a single space. ONLY the ASCII
+/// space character is treated as whitespace — tabs, NBSP (U+00A0), newlines, and every other Unicode
+/// whitespace codepoint are preserved verbatim, because AWS does the same. (This is intentionally
+/// NOT `split_whitespace`, which would also fold tabs/NBSP/newlines and break the signature.)
+fn canonicalize_header_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut prev_space = false;
+    for ch in v.chars() {
+        if ch == ' ' {
+            // Defer emitting until we know it is not a trailing run; mark that a space is pending.
+            prev_space = true;
+        } else {
+            // Emit a single collapsed space before this non-space char, but only if we have already
+            // emitted at least one char (i.e. drop any leading run).
+            if prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Compute the SigV4 signature hex + the `SignedHeaders` string for a request. `headers` is the
 /// full set of headers to sign (names case-insensitive); they are lowercased + sorted internally.
 /// `canonical_uri` must already be URI-encoded; `canonical_querystring` sorted + encoded (or empty).
@@ -116,17 +141,14 @@ pub(crate) fn sign_v4(
 ) -> (String, String) {
     let mut h: Vec<(String, String)> = headers
         .iter()
-        // AWS SigV4 canonicalization of a (non-quoted) header value: trim leading/trailing
-        // whitespace AND collapse runs of internal whitespace to a single space. `split_whitespace`
-        // splits on any ASCII/Unicode whitespace run and drops empties, so joining with one space
-        // does both at once. Omitting the internal collapse risks a SignatureDoesNotMatch (403) if a
-        // signed header value ever carries doubled spaces.
-        .map(|(k, v)| {
-            (
-                k.to_lowercase(),
-                v.split_whitespace().collect::<Vec<_>>().join(" "),
-            )
-        })
+        // AWS SigV4 canonicalization of a (non-quoted) header value: trim leading/trailing ASCII
+        // spaces (0x20) AND collapse runs of sequential ASCII spaces to a single space. AWS operates
+        // on ASCII space ONLY — NBSP (U+00A0), tabs, and other Unicode whitespace are NOT treated as
+        // whitespace and must pass through verbatim, byte-for-byte, into the signed value. Using
+        // `split_whitespace` here would (wrongly) split on tabs/NBSP/newlines and rewrite them to
+        // 0x20, producing a canonical value that differs from what AWS computes → SignatureDoesNotMatch
+        // (403). `canonicalize_header_value` collapses 0x20 runs only.
+        .map(|(k, v)| (k.to_lowercase(), canonicalize_header_value(v)))
         .collect();
     h.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -185,10 +207,31 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_v4_collapses_internal_whitespace_in_header_value() {
-        // Two requests whose only difference is collapsible internal whitespace in a signed header
-        // value must produce the SAME signature, because SigV4 canonicalization collapses runs of
-        // internal whitespace to a single space. (Regression for v.trim()-only canonicalization.)
+    fn test_canonicalize_header_value_ascii_space_only() {
+        // Runs of ASCII space (0x20) collapse to one; leading/trailing ASCII space is trimmed.
+        assert_eq!(canonicalize_header_value("a   b    c"), "a b c");
+        assert_eq!(canonicalize_header_value("  a b c  "), "a b c");
+        assert_eq!(canonicalize_header_value(""), "");
+        assert_eq!(canonicalize_header_value("   "), "");
+        assert_eq!(canonicalize_header_value("single"), "single");
+
+        // ASCII space ONLY. Tab (0x09), NBSP (U+00A0), and newline are NOT whitespace to SigV4 —
+        // they must pass through verbatim and must NOT be folded into / collapsed with 0x20 runs.
+        // (This is what `split_whitespace` got wrong.)
+        assert_eq!(canonicalize_header_value("a\tb"), "a\tb"); // tab preserved
+        assert_eq!(canonicalize_header_value("a\u{00a0}b"), "a\u{00a0}b"); // NBSP preserved
+        assert_eq!(canonicalize_header_value("a\nb"), "a\nb"); // newline preserved
+                                                               // A tab surrounded by ASCII spaces: the spaces collapse, the tab stays put.
+        assert_eq!(canonicalize_header_value("a  \t  b"), "a \t b");
+        // Leading NBSP is NOT trimmed (only ASCII space is).
+        assert_eq!(canonicalize_header_value("\u{00a0}a"), "\u{00a0}a");
+    }
+
+    #[test]
+    fn test_sign_v4_collapses_ascii_space_in_header_value() {
+        // Two requests whose only difference is collapsible runs of ASCII space in a signed header
+        // value must produce the SAME signature, because SigV4 collapses 0x20 runs to one space and
+        // trims leading/trailing 0x20. (Regression for v.trim()-only canonicalization.)
         let payload_hash = sha256_hex(b"");
         let mk = |v: &str| {
             sign_v4(
@@ -209,14 +252,56 @@ mod tests {
             )
         };
         let (sig_single, _) = mk("a b c");
-        let (sig_double, _) = mk("a   b\t c"); // doubled spaces + tab collapse to single spaces
+        let (sig_double, _) = mk("a   b  c"); // doubled ASCII spaces collapse to single spaces
         assert_eq!(
             sig_single, sig_double,
-            "internal whitespace must be collapsed before signing"
+            "runs of ASCII space must be collapsed before signing"
         );
-        // Leading/trailing whitespace must still be trimmed (the original behavior).
+        // Leading/trailing ASCII space must still be trimmed (the original behavior).
         let (sig_padded, _) = mk("  a b c  ");
         assert_eq!(sig_single, sig_padded);
+    }
+
+    #[test]
+    fn test_sign_v4_does_not_fold_nbsp_or_tab_in_header_value() {
+        // AWS canonicalizes ASCII space ONLY. A header value containing NBSP (U+00A0) or a tab must
+        // be signed with those bytes intact — they must NOT be rewritten to a 0x20 space. This is the
+        // bug in `split_whitespace().join(" ")`, which folds NBSP/tab into spaces and yields a
+        // canonical string that differs from AWS's → SignatureDoesNotMatch (403).
+        //
+        // Proof: a value with a literal NBSP/tab must sign DIFFERENTLY from the same value with an
+        // ASCII space in that position. Under the old (split_whitespace) code these collapsed to the
+        // same signature; under the corrected code they diverge.
+        let payload_hash = sha256_hex(b"");
+        let mk = |v: &str| {
+            sign_v4(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "us-east-1",
+                "iam",
+                "GET",
+                "/",
+                "",
+                &[
+                    ("host".to_string(), "iam.amazonaws.com".to_string()),
+                    ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+                    ("x-custom".to_string(), v.to_string()),
+                ],
+                &payload_hash,
+                "20150830T123600Z",
+                "20150830",
+            )
+        };
+        let (sig_space, _) = mk("a b");
+        let (sig_nbsp, _) = mk("a\u{00a0}b");
+        let (sig_tab, _) = mk("a\tb");
+        assert_ne!(
+            sig_space, sig_nbsp,
+            "NBSP must be preserved verbatim, not folded to an ASCII space"
+        );
+        assert_ne!(
+            sig_space, sig_tab,
+            "tab must be preserved verbatim, not folded to an ASCII space"
+        );
     }
 
     /// AWS published worked example — GET iam ListUsers, 2015-08-30. If our canonical-request →

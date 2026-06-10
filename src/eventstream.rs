@@ -234,16 +234,29 @@ fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) -> bool {
 /// path: all arithmetic is `u64`-widened and the result is bounded by `MAX_FRAME_BYTES`, so no cast
 /// can wrap (frame lengths are bounded and this never panics on the request path).
 pub(crate) fn encode_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
-    let mut headers = Vec::new();
+    // Build the header block DIRECTLY into the frame buffer (after a 12-byte prelude placeholder)
+    // rather than into a throwaway `headers` Vec that `encode_with_headers` would then copy — that
+    // copy was a second heap allocation per frame on the Bedrock streaming hot path. `frame_open`
+    // returns the single buffer with the prelude reserved; we append headers, then `frame_close`
+    // backfills the prelude + CRCs. Byte output is identical to the prior two-buffer path.
+    let mut frame = frame_open();
     // Drop the frame if any header is oversized rather than emit a corrupt/truncated header (see
     // push_string_header). `:event-type` is the only caller-supplied value; the others are literals.
-    if !push_string_header(&mut headers, ":event-type", event_type)
-        || !push_string_header(&mut headers, ":content-type", "application/json")
-        || !push_string_header(&mut headers, ":message-type", "event")
+    if !push_string_header(&mut frame, ":event-type", event_type)
+        || !push_string_header(&mut frame, ":content-type", "application/json")
+        || !push_string_header(&mut frame, ":message-type", "event")
     {
+        // An oversized header dropped the frame. This is unreachable for any real Bedrock event name
+        // but must be OBSERVABLE rather than a silent empty-Vec: log it so a dropped streaming frame
+        // is diagnosable. `:event-type` is the only caller-supplied (and thus possibly oversized)
+        // value, so name it; the other two are fixed literals well under the cap.
+        tracing::warn!(
+            event_type_len = event_type.len(),
+            "event-stream :event-type header exceeds the type-7 string cap; dropping frame"
+        );
         return Vec::new();
     }
-    encode_with_headers(headers, payload)
+    frame_close(frame, payload)
 }
 
 /// Encode a modeled-exception event-stream message for a native AWS SDK Bedrock client. AWS signals
@@ -260,31 +273,53 @@ pub(crate) fn encode_exception_frame(exception_type: &str, message: &str) -> Vec
     // for the Gemini truncation path in proto/mod.rs::GeminiJsonArrayFramer::finish_with_error).
     let payload = serde_json::to_vec(&serde_json::json!({ "message": message }))
         .unwrap_or_else(|_| b"{\"message\":\"An internal server error occurred.\"}".to_vec());
-    let mut headers = Vec::new();
-    if !push_string_header(&mut headers, ":exception-type", exception_type)
-        || !push_string_header(&mut headers, ":content-type", "application/json")
-        || !push_string_header(&mut headers, ":message-type", "exception")
+    // Build headers straight into the single frame buffer (see `encode_frame`) — one allocation.
+    let mut frame = frame_open();
+    if !push_string_header(&mut frame, ":exception-type", exception_type)
+        || !push_string_header(&mut frame, ":content-type", "application/json")
+        || !push_string_header(&mut frame, ":message-type", "exception")
     {
+        // `:exception-type` is the caller-supplied value; an oversized one drops the frame. Log so a
+        // dropped exception frame (a swallowed mid-stream error signal) is observable, not silent.
+        tracing::warn!(
+            exception_type_len = exception_type.len(),
+            "event-stream :exception-type header exceeds the type-7 string cap; dropping frame"
+        );
         return Vec::new();
     }
-    encode_with_headers(headers, &payload)
+    frame_close(frame, &payload)
 }
 
-/// Frame a pre-built header block + payload into a complete event-stream message with real CRC32s.
-/// Shared by [`encode_frame`] and [`encode_exception_frame`].
+/// Length of the fixed event-stream prelude: `total_len:u32 + headers_len:u32 + prelude_crc:u32`.
+const PRELUDE_LEN: usize = 12;
+
+/// Open a single frame buffer with the 12-byte prelude (`total_len`, `headers_len`, `prelude_crc`)
+/// reserved as a zeroed placeholder. Callers append their header block directly after it, then hand
+/// the buffer to [`frame_close`], which backfills the prelude. This keeps the WHOLE frame — prelude,
+/// headers, payload and both CRCs — in ONE allocation (the prior `encode_with_headers` built headers
+/// in a separate Vec and copied them in, a second per-frame allocation on the streaming hot path).
+fn frame_open() -> Vec<u8> {
+    vec![0u8; PRELUDE_LEN]
+}
+
+/// Close a frame opened by [`frame_open`] whose header block has been appended: backfill the prelude
+/// (`total_len`, `headers_len`, real `prelude_crc`), append `payload`, then the real `message_crc`.
+/// Shared by [`encode_frame`] and [`encode_exception_frame`]. The produced bytes are identical to the
+/// prior two-buffer `encode_with_headers` path.
 ///
 /// A frame this encoder builds is always well under `MAX_FRAME_BYTES` (small JSON bodies). If the
 /// header+payload would exceed the cap, the frame is DROPPED (empty `Vec` returned) rather than
 /// byte-truncating the payload: a truncated JSON payload is syntactically invalid and a CRC-valid
 /// frame carrying unparseable JSON is worse for a native SDK than no frame at all. The caller appends
 /// the result to its output buffer, so an empty return simply emits nothing for this event.
-fn encode_with_headers(headers: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+fn frame_close(mut frame: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+    // At entry `frame` is [12-byte prelude placeholder][headers]; everything past the prelude is the
+    // header block.
+    let headers_len = (frame.len() - PRELUDE_LEN) as u64;
     // total_len = prelude(12) + headers + payload + message_crc(4). Widen to u64 so the sum cannot
     // overflow `usize` arithmetic, then bound it against MAX_FRAME_BYTES.
-    let prelude = 12u64;
     let trailer = 4u64;
-    let headers_len = headers.len() as u64;
-    let total_len = prelude + headers_len + payload.len() as u64 + trailer;
+    let total_len = PRELUDE_LEN as u64 + headers_len + payload.len() as u64 + trailer;
     if total_len > MAX_FRAME_BYTES as u64 {
         // Oversized: drop the frame rather than emit corrupt (truncated) JSON. Unreachable for any
         // real Bedrock ConverseStream delta; this only guards a pathological multi-MiB single event.
@@ -298,24 +333,24 @@ fn encode_with_headers(headers: Vec<u8>, payload: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
 
-    let mut frame = Vec::with_capacity(total_len as usize);
-    // Prelude: total_len + headers_len (both u32 BE). Bounded above, so the casts are exact.
-    frame.extend_from_slice(&(total_len as u32).to_be_bytes());
-    frame.extend_from_slice(&(headers_len as u32).to_be_bytes());
+    // Reserve the payload + trailer up front so appending them does not reallocate.
+    frame.reserve(payload.len() + 4);
+
+    // Backfill the prelude in place: total_len + headers_len (both u32 BE). Bounded above, so the
+    // casts are exact.
+    frame[0..4].copy_from_slice(&(total_len as u32).to_be_bytes());
+    frame[4..8].copy_from_slice(&(headers_len as u32).to_be_bytes());
 
     // prelude_crc = CRC32 of the first 8 bytes (the two length fields).
-    let mut prelude_hasher = crc32fast::Hasher::new();
-    prelude_hasher.update(&frame[..8]);
-    frame.extend_from_slice(&prelude_hasher.finalize().to_be_bytes());
+    let prelude_crc = crc32fast::hash(&frame[..8]);
+    frame[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
 
-    frame.extend_from_slice(&headers);
     frame.extend_from_slice(payload);
 
     // message_crc = CRC32 of everything from byte 0 through the end of the payload (i.e. the whole
     // frame written so far, which is prelude + prelude_crc + headers + payload).
-    let mut message_hasher = crc32fast::Hasher::new();
-    message_hasher.update(&frame);
-    frame.extend_from_slice(&message_hasher.finalize().to_be_bytes());
+    let message_crc = crc32fast::hash(&frame);
+    frame.extend_from_slice(&message_crc.to_be_bytes());
 
     frame
 }
@@ -733,6 +768,130 @@ mod tests {
         assert_eq!(frames[0].0, "", "no :event-type header → empty event type");
         assert!(frames[0].1.is_empty(), "empty payload round-trips");
         assert!(buf.is_empty(), "minimum frame is fully consumed");
+    }
+
+    /// REGRESSION (LOW/perf, eventstream.rs:236-247 / frame_open+frame_close): the single-buffer
+    /// encoder must be BYTE-FOR-BYTE identical to the prior two-Vec (`headers` + `frame`) encoding.
+    /// We independently rebuild the exact wire bytes from the documented layout — placeholder-free,
+    /// in one pass — and assert equality, so a future refactor of the buffer plumbing that perturbs
+    /// even one byte (a wrong CRC range, a misplaced length, a dropped/extra header byte) is caught.
+    #[test]
+    fn test_encode_frame_byte_for_byte_matches_reference() {
+        // A representative Bedrock ConverseStream delta frame.
+        let event_type = "contentBlockDelta";
+        let payload = br#"{"delta":{"text":"hi"}}"#;
+        let got = encode_frame(event_type, payload);
+
+        // Reference encoding, built straight from the documented wire layout (NOT via encode_frame):
+        //   header block = the three Bedrock string headers in order.
+        let mut headers = Vec::new();
+        headers.extend_from_slice(&string_header(":event-type", event_type));
+        headers.extend_from_slice(&string_header(":content-type", "application/json"));
+        headers.extend_from_slice(&string_header(":message-type", "event"));
+
+        let headers_len = headers.len();
+        let total_len = 12 + headers_len + payload.len() + 4;
+
+        let mut want = Vec::new();
+        want.extend_from_slice(&(total_len as u32).to_be_bytes()); // total_len
+        want.extend_from_slice(&(headers_len as u32).to_be_bytes()); // headers_len
+        let prelude_crc = crc32fast::hash(&want[..8]); // prelude CRC over the two length fields
+        want.extend_from_slice(&prelude_crc.to_be_bytes());
+        want.extend_from_slice(&headers);
+        want.extend_from_slice(payload);
+        let message_crc = crc32fast::hash(&want); // message CRC over everything written so far
+        want.extend_from_slice(&message_crc.to_be_bytes());
+
+        assert_eq!(
+            got, want,
+            "single-buffer encode_frame must be byte-for-byte identical to the reference encoding"
+        );
+    }
+
+    /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
+    /// assert a particular `tracing::warn!` fired.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Vis(String);
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut vis = Vis(String::new());
+            event.record(&mut vis);
+            if let Ok(mut msgs) = self.0.lock() {
+                msgs.push(vis.0);
+            }
+        }
+    }
+
+    /// REGRESSION (LOW/quality, eventstream.rs:240-245): when an oversized `:event-type` makes
+    /// `push_string_header` reject the header, `encode_frame` drops the frame — but that drop MUST be
+    /// observable via a `tracing::warn!`, not a silent empty `Vec`. This test captures WARN events:
+    /// against the old (silent) code it FAILS (no warning), and passes once the warn! is emitted.
+    #[test]
+    fn test_encode_frame_oversized_event_type_warns() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let huge_event_type = "e".repeat(u16::MAX as usize + 1);
+        let frame = tracing::subscriber::with_default(subscriber, || {
+            encode_frame(&huge_event_type, br#"{"x":1}"#)
+        });
+
+        assert!(
+            frame.is_empty(),
+            "oversized :event-type still drops the frame"
+        );
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains(":event-type")),
+            "dropping an oversized :event-type frame must emit an observable warn!, got: {msgs:?}"
+        );
+    }
+
+    /// REGRESSION (LOW/quality, eventstream.rs:263-270): the same observability guarantee for
+    /// `encode_exception_frame` — an oversized `:exception-type` drops the frame but must warn, so a
+    /// swallowed mid-stream error-signal frame is not silent.
+    #[test]
+    fn test_encode_exception_frame_oversized_type_warns() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let huge = "x".repeat(u16::MAX as usize + 1);
+        let frame =
+            tracing::subscriber::with_default(subscriber, || encode_exception_frame(&huge, "msg"));
+
+        assert!(
+            frame.is_empty(),
+            "oversized :exception-type still drops the frame"
+        );
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains(":exception-type")),
+            "dropping an oversized :exception-type frame must emit an observable warn!, got: {msgs:?}"
+        );
     }
 
     /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:48): the smallest frame with a NON-empty

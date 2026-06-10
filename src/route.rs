@@ -105,8 +105,12 @@ async fn budget_check(
 }
 
 /// Run the three governance guards (pool-allowed / over-budget / rate-limited) for a request that
-/// is about to be forwarded. Returns the protocol-native rejection response (403/402/429) already
-/// passed through `finish` — so a governance-rejected request still emits `REQUESTS_TOTAL`, the
+/// is about to be forwarded. Returns the protocol-native rejection response already passed through
+/// `finish`. The statuses are deliberately vendor-faithful and never 402: pool-not-allowed maps to
+/// 403, over-budget maps to 429 (Bedrock's quota shape is a 400-class error — see `budget_check`),
+/// and rate-limited maps to 429 + `Retry-After`. busbar never emits 402 here — a blanket 402 was a
+/// vendor-agnostic tell, since no real provider returns 402 for these conditions. Routing through
+/// `finish` means a governance-rejected request still emits `REQUESTS_TOTAL`, the
 /// `REQUEST_DURATION_SECONDS` histogram, and the request-log webhook (no flat-fee charge: `finish`
 /// only bills 2xx). Returns `None` when every guard passes and the caller should proceed to
 /// resolve+forward. Without this, the early returns from `forward_resolved`/`named`/`adhoc` made
@@ -4034,6 +4038,114 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A NATIVE OpenAI streamed chat-completion the mock backend emits, carrying the full identity
+    /// vocabulary a real OpenAI stream uses — `object: "chat.completion.chunk"`, an `id`, `created`,
+    /// `model`, a role/content delta walk, and a `finish_reason: "stop"` terminator. Distinct from
+    /// `openai_stream_events` (which omits `object`/identity to exercise the cross-protocol WRITER):
+    /// these realistic chunks let the openai→openai SAME-protocol passthrough below assert that the
+    /// native frame vocabulary survives the proxy intact.
+    fn openai_native_stream_events() -> Vec<String> {
+        vec![
+            r#"{"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#.to_string(),
+            r#"{"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#.to_string(),
+            r#"{"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#.to_string(),
+        ]
+    }
+
+    /// An OpenAI `/v1/chat/completions` request with `"stream": true` must return `Content-Type:
+    /// text/event-stream` AND a body whose JSON `data:` frames carry the NATIVE OpenAI
+    /// chat-completion frame vocabulary — every chunk's `object` is `chat.completion.chunk`, no typed
+    /// `event:` line (that would be an Anthropic/Responses SSE tell, not chat-completion shape), and
+    /// the stream closes on the `[DONE]` sentinel. This is the OpenAI happy-path counterpart to
+    /// `test_cohere_ingress_stream_emits_native_cohere_frames`: it pins the OpenAI egress frame
+    /// vocabulary on the same-protocol passthrough so a regression that mangled the
+    /// `chat.completion.chunk` object tag, dropped the `[DONE]` terminator, or injected a foreign
+    /// typed-`event:` frame is caught.
+    #[tokio::test]
+    async fn test_openai_ingress_stream_emits_native_openai_frames() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_native_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "gpt-4o",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("openai"),
+            )
+            .pool("gpt-4o", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "model": "gpt-4o",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "openai stream ⇒ 200");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "openai streaming ingress is SSE; got {ct}"
+        );
+        let text = resp.text().await.unwrap();
+
+        // Native OpenAI chunks are bare `data:` frames — no typed `event:` line (a typed event would
+        // be an Anthropic/Responses SSE tell, not chat-completion vocabulary).
+        assert!(
+            !text.contains("event:"),
+            "openai chat-completion stream frames must be bare data: (no event: line); got:\n{text}"
+        );
+
+        // The stream must terminate with the native `[DONE]` sentinel.
+        assert!(
+            text.contains("[DONE]"),
+            "openai stream must terminate with the native [DONE] sentinel; got:\n{text}"
+        );
+
+        // Every JSON data frame must carry the native `chat.completion.chunk` object tag, and there
+        // must be at least one such chunk (content actually flowed).
+        let objects: Vec<String> = sse_frames(&text)
+            .into_iter()
+            .filter_map(|(_, d)| serde_json::from_str::<serde_json::Value>(&d).ok())
+            .filter_map(|v| {
+                v.get("object")
+                    .and_then(|o| o.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert!(
+            !objects.is_empty(),
+            "openai stream must carry at least one JSON data chunk; got:\n{text}"
+        );
+        assert!(
+            objects.iter().all(|o| o == "chat.completion.chunk"),
+            "every openai stream data chunk must be a chat.completion.chunk; got objects {objects:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
     }
 
     /// A Cohere `/v2/chat` request with `"stream": true` must return `Content-Type:

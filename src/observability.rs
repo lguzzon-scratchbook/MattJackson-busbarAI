@@ -46,17 +46,39 @@ impl Drop for InflightGuard {
     }
 }
 
+/// True when `url`'s scheme equals `scheme` (an all-lowercase ASCII scheme word like `https`),
+/// compared CASE-INSENSITIVELY per RFC 3986 §3.1. Matches `<scheme>://...`; the `://` is required so
+/// `httpsx://` does not match `https`. Avoids the case-sensitivity bug in a raw
+/// `starts_with("https://")`, which rejects the valid uppercase spelling `HTTPS://host/` that
+/// reqwest's `Url::parse` would happily lowercase and accept.
+fn scheme_is(url: &str, scheme: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case(scheme))
+}
+
 /// Validate the configured webhook URL. Two guarantees, both enforced (not just documented):
-///   1. The scheme MUST be `https://` — a plaintext `http://` endpoint would expose per-request
-///      metadata on the wire.
+///   1. The scheme MUST be `https` (compared case-insensitively, so `HTTPS://` is accepted) — a
+///      plaintext `http://` endpoint would expose per-request metadata on the wire.
 ///   2. The host MUST NOT be an internal target — loopback / link-local / private (RFC1918) / RFC6598
-///      CGNAT / unspecified, whether written as a canonical IP literal, an IPv4-mapped IPv6 literal,
-///      or an alternate IPv4 encoding (decimal/hex/octal/short-dotted) the resolver still expands;
-///      nor a loopback (`localhost`) or cloud-metadata (`metadata.google.internal`) DNS name. The URL
-///      may not point at `169.254.169.254` cloud-metadata, `127.0.0.1`, `10.x`/`192.168.x`/`172.16.x`
-///      internal services, etc. The earlier scheme-only check did nothing for an `https://` SSRF
-///      target (`https://169.254.169.254/...` passed unchanged); this closes that gap so the
-///      enforcement matches the documented protection (parity with `config_validate::ssrf_blocked_host`).
+///      CGNAT / unspecified / broadcast, whether written as a canonical IP literal, an IPv4-mapped
+///      IPv6 literal, or an alternate IPv4 encoding (decimal/hex/octal/short-dotted) the resolver
+///      still expands; nor a loopback (`localhost`) or cloud-metadata (`metadata.google.internal`)
+///      DNS name. The URL may not point at `169.254.169.254` cloud-metadata, `127.0.0.1`,
+///      `10.x`/`192.168.x`/`172.16.x` internal services, etc.
+///
+/// This guard is a SIBLING of `config_validate::ssrf_blocked_host`, not an exact mirror of it — the
+/// two cover the same threat (operator-supplied URL pointed at an internal target) but DIVERGE in
+/// these respects, so do NOT assume bit-for-bit parity:
+///   - HOST PARSING: this validator runs the already-`reqwest::Url::parse`d URL and reads
+///     `host_str()` (the URL crate has already percent-decoded and normalized the authority);
+///     `ssrf_blocked_host` instead parses the raw config string by hand and percent-decodes the host
+///     itself (`percent_decode_host`) to neutralize spellings like `169%2E254%2E169%2E254`.
+///   - BROADCAST: this guard ALSO blocks `255.255.255.255` (`is_broadcast()`); `ssrf_blocked_host`
+///     does not — so this validator is strictly more conservative on that one literal.
+///   - LIST SHAPE: here `localhost`/`*.localhost` are handled in the DNS arm of `host_is_internal`
+///     and `METADATA_HOSTS` holds only the two metadata names, whereas `ssrf_blocked_host` keeps
+///     `localhost`/`localhost.` inside its own `METADATA_HOSTS`. The blocked SET is equivalent for
+///     the localhost family; only the code structure differs.
 ///
 /// `None` (webhook disabled) is always valid. Pure, so it is unit-testable without touching the
 /// process-wide `OnceLock`s.
@@ -64,7 +86,11 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
     let Some(u) = url else {
         return Ok(None);
     };
-    if !u.starts_with("https://") {
+    // Case-INSENSITIVE scheme check: per RFC 3986 the scheme is case-insensitive, and reqwest's
+    // `Url::parse` lowercases it — so a valid `HTTPS://host/` (or mixed-case `Https://`) would be
+    // wrongly rejected by a literal `starts_with("https://")` on the raw string. Compare the scheme
+    // (everything up to and including `://`) without allocating by lowercasing only that prefix.
+    if !scheme_is(&u, "https") {
         return Err(format!(
             "observability.request_log_webhook_url must be an https:// URL (got '{u}')"
         ));
@@ -81,9 +107,11 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
 }
 
 /// Well-known cloud-metadata / internal DNS names that must be blocked even though they are not IP
-/// literals (they resolve, at connect time, to the loopback/IMDS family). Kept in lock-step with the
-/// `METADATA_HOSTS` list in `config_validate::ssrf_blocked_host` so the parity the doc-comment on
-/// `host_is_internal` claims is real, not aspirational.
+/// literals (they resolve, at connect time, to the IMDS family). This holds ONLY the two metadata
+/// names; the `localhost` / `*.localhost` family is blocked separately in the `Err(_)` DNS arm of
+/// `host_is_internal`. `config_validate::ssrf_blocked_host` folds `localhost`/`localhost.` into its
+/// own `METADATA_HOSTS` instead — so this const is a SUBSET of that list, not an exact copy, even
+/// though the two guards block the same set of names overall.
 const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.internal"];
 
 /// RFC 6598 Shared Address Space `100.64.0.0/10` (a.k.a. CGNAT). NOT covered by
@@ -166,16 +194,23 @@ fn is_alternate_ipv4_encoding(host: &str) -> bool {
 
 /// True if the URL's host is an address busbar must not POST telemetry to: a literal loopback,
 /// link-local (incl. `169.254.169.254` cloud-metadata), private (RFC1918 / unique-local), RFC6598
-/// CGNAT, or unspecified IP — whether written as a canonical IP literal, an IPv4-mapped IPv6 literal,
-/// or one of the alternate IPv4 encodings the OS resolver still expands to an internal address
-/// (decimal `2130706433`, hex `0x7f000001`, octal, short-dotted `127.1`). A hostname that does not
-/// parse as an IP literal is allowed (operators may name an external collector) EXCEPT the
+/// CGNAT, unspecified, or broadcast IP — whether written as a canonical IP literal, an IPv4-mapped
+/// IPv6 literal, or one of the alternate IPv4 encodings the OS resolver still expands to an internal
+/// address (decimal `2130706433`, hex `0x7f000001`, octal, short-dotted `127.1`). A hostname that
+/// does not parse as an IP literal is allowed (operators may name an external collector) EXCEPT the
 /// well-known loopback DNS name `localhost` (and its dotted subdomains) and the cloud-metadata DNS
 /// names in `METADATA_HOSTS`, which are blocked case-insensitively so an `https://localhost:<port>/`
 /// or `https://metadata.google.internal/` URL can't be used to POST request logs to a co-located /
-/// metadata process — matching `config_validate::ssrf_blocked_host`. Full DNS-rebinding is out of
-/// scope for a startup-validated, operator-supplied URL. Returns `true` (reject) when the host is
-/// missing entirely.
+/// metadata process.
+///
+/// This shares its threat model with `config_validate::ssrf_blocked_host` but is NOT a bit-for-bit
+/// mirror — the divergences are (1) host parsing: this guard reads the host from an already
+/// `reqwest::Url::parse`d URL, while `ssrf_blocked_host` hand-parses and percent-decodes the raw
+/// config string; (2) broadcast: this guard ALSO blocks `255.255.255.255`, which `ssrf_blocked_host`
+/// does not; (3) code shape: `localhost`/`*.localhost` are matched in the `Err(_)` DNS arm below
+/// rather than via the `METADATA_HOSTS` list. The blocked localhost/metadata/IP SET is equivalent
+/// apart from the broadcast literal. Full DNS-rebinding is out of scope for a startup-validated,
+/// operator-supplied URL. Returns `true` (reject) when the host is missing entirely.
 fn host_is_internal(url: &reqwest::Url) -> bool {
     use std::net::IpAddr;
     match url.host_str() {
@@ -435,7 +470,9 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
     let Some(e) = endpoint else {
         return Ok(None);
     };
-    if !(e.starts_with("https://") || e.starts_with("http://")) {
+    // Case-INSENSITIVE scheme check (see `scheme_is`): `HTTP://localhost:4318` / `HTTPS://...` are
+    // valid per RFC 3986 and would be wrongly rejected by a literal lowercase `starts_with`.
+    if !(scheme_is(e, "https") || scheme_is(e, "http")) {
         return Err(format!(
             "observability.otlp_endpoint must be an http:// or https:// URL (got '{e}')"
         ));
@@ -620,6 +657,52 @@ mod tests {
             validate_webhook_url(Some("https://hook.example.com/log".to_string())),
             Ok(Some("https://hook.example.com/log".to_string()))
         );
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_uppercase_https_scheme() {
+        // Regression: the scheme is case-insensitive per RFC 3986, and reqwest's `Url::parse`
+        // lowercases it — so an uppercase/mixed-case `HTTPS://` to a public host is a valid webhook
+        // and must NOT be rejected. The old literal `starts_with("https://")` check failed these.
+        for ok in [
+            "HTTPS://hook.example.com/log",
+            "Https://hook.example.com/log",
+            "hTTpS://collector.example.org/v1/logs",
+        ] {
+            assert_eq!(
+                validate_webhook_url(Some(ok.to_string())),
+                Ok(Some(ok.to_string())),
+                "uppercase/mixed-case https scheme '{ok}' must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_uppercase_scheme_still_guards_ssrf() {
+        // The case-insensitive scheme acceptance must not bypass the host guard: an uppercase-scheme
+        // URL pointed at an internal target is still rejected (by the SSRF host check, not the scheme
+        // check). Also confirms `HTTP://` (any case) is still refused as plaintext.
+        for bad in [
+            "HTTPS://169.254.169.254/latest/meta-data/", // uppercase scheme, internal host
+            "HTTPS://127.0.0.1/log",
+            "HTTP://hook.example.com/log", // plaintext, uppercase scheme
+            "Http://hook.example.com/log", // plaintext, mixed case
+        ] {
+            assert!(
+                validate_webhook_url(Some(bad.to_string())).is_err(),
+                "'{bad}' must be rejected (SSRF host guard or plaintext scheme)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scheme_is_case_insensitive() {
+        assert!(scheme_is("HTTPS://host/", "https"));
+        assert!(scheme_is("https://host/", "https"));
+        assert!(scheme_is("HtTp://host/", "http"));
+        assert!(!scheme_is("http://host/", "https"));
+        assert!(!scheme_is("httpsx://host/", "https")); // require the `://` boundary
+        assert!(!scheme_is("not-a-url", "https"));
     }
 
     #[test]
@@ -964,6 +1047,28 @@ mod tests {
                 "loopback alternate encoding '{ok}' must be accepted (localhost collector); got {res:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_accepts_uppercase_scheme() {
+        // Regression (sibling of the webhook scheme bug): the OTLP scheme check is also
+        // case-insensitive, so `HTTP://localhost:4318` / `HTTPS://collector...` are valid and must
+        // be accepted. The old literal lowercase `starts_with` rejected them.
+        for ok in [
+            "HTTP://localhost:4318/v1/traces",
+            "HTTPS://collector.example.com:4318/v1/traces",
+            "Http://127.0.0.1:4318",
+        ] {
+            assert!(
+                validate_otlp_endpoint(Some(ok)).is_ok(),
+                "uppercase/mixed-case scheme OTLP endpoint '{ok}' must be accepted"
+            );
+        }
+        // ...but an uppercase scheme still does not bypass the SSRF host guard.
+        assert!(
+            validate_otlp_endpoint(Some("HTTPS://169.254.169.254/v1/traces")).is_err(),
+            "uppercase scheme must not bypass the OTLP SSRF guard"
+        );
     }
 
     #[test]

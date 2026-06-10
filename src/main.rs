@@ -259,6 +259,11 @@ async fn main() {
     }
 
     let mut lanes_data = Vec::new();
+    // Validated provider handle for each lane, captured in lockstep with `lanes_data` below. The
+    // first loop already resolves `cfg.providers.get(&mc.provider)` (failing loud via `die` on a
+    // missing provider), so the lane-build loop reuses that handle instead of re-looking it up —
+    // there is no second lookup and no `expect` on the startup path.
+    let mut lane_provider_cfgs: Vec<&config::ProviderCfg> = Vec::new();
     let mut by_model = HashMap::new();
     // Per-model configured default_max_tokens (injected at the translation seam for protocols that
     // require max_tokens). Captured here because `cfg.models` is consumed by this loop.
@@ -288,6 +293,7 @@ async fn main() {
         }
         let limited = mc.max_requests >= 0;
         by_model.insert(model.clone(), lanes_data.len());
+        lane_provider_cfgs.push(provider_cfg);
         lanes_data.push(LaneData {
             model: model.clone(),
             provider: mc.provider.clone(),
@@ -328,11 +334,10 @@ async fn main() {
     };
 
     let mut lanes = Vec::new();
-    for ld in &lanes_data {
-        let provider_cfg = cfg
-            .providers
-            .get(&ld.provider)
-            .expect("lane provider exists in resolved config (validated above)");
+    for (idx, ld) in lanes_data.iter().enumerate() {
+        // Reuse the provider handle resolved (and validated via `die`) in the lanes_data loop above,
+        // captured in lockstep into `lane_provider_cfgs`. No redundant re-lookup / `expect` here.
+        let provider_cfg = lane_provider_cfgs[idx];
         let protocol = registry.get(&provider_cfg.protocol).unwrap_or_else(|| {
             die(format!(
                 "provider '{}' uses unknown protocol '{}' (supported: anthropic, openai, gemini, bedrock, responses, cohere)",

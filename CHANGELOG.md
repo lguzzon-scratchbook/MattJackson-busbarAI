@@ -187,6 +187,12 @@ source for correctness, robustness, and security.
   parsing has no caller-triggered panics; ad-hoc routes only reach configured
   (provider, model) pairs (no SSRF). `/healthz` and `/metrics` are intentionally open
   (protect `/metrics` at the network layer).
+  - **Correction (superseded):** the claim that `/metrics` is intentionally open no
+    longer holds. `/metrics` now goes through the same auth check as any other route
+    — only `/healthz` stays unauthenticated for liveness probes — though under
+    `none`/`passthrough` mode the check still admits unconditionally. See the
+    Unreleased *Security* entry above and `src/auth.rs` (`auth_middleware`). The
+    original line is kept as-written to preserve the historical record.
 
 ## [0.16.1] — 2026-05-31
 

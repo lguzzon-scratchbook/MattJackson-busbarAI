@@ -63,7 +63,26 @@ const RESPONSE_ID_TOKEN_LEN: usize = 48;
 /// collision-free in practice for a per-process id stream and needs no monotonic-counter backstop.
 /// On entropy failure the buffer stays zeroed (all '0'), so this never panics on the request path.
 /// Returns an owned `String` of exactly `N` base62 characters.
+///
+/// `N` MUST be >= 11. A token narrower than that carries too little base62 entropy to stay
+/// collision-free across a per-process id stream and falls below the opaque-suffix width a native
+/// vendor id never goes under — making a short synthesized id a distinguishability tell. The bound
+/// is enforced at COMPILE TIME by the `const _` assertion below: instantiating `synth_token` with a
+/// `const N < 11` fails to build (a monomorphization-time `assert!`), so a too-small width can never
+/// reach the wire. Both live callers use 48 (`ITEM_ID_TOKEN_LEN`/`RESPONSE_ID_TOKEN_LEN`), far above
+/// the floor.
 fn synth_token<const N: usize>() -> String {
+    // Compile-time guard: a too-small `N` fails to build rather than emitting a short, low-entropy,
+    // fingerprintable id at runtime. An inline `const` item cannot reference the outer fn's const
+    // generic (E0401), so the assertion lives on an associated const of a zero-sized generic carrier
+    // type; referencing `MinWidth::<N>::OK` below forces its evaluation per monomorphization, turning
+    // any `N < 11` instantiation into a build error.
+    struct MinWidth<const M: usize>;
+    impl<const M: usize> MinWidth<M> {
+        const OK: () = assert!(M >= 11, "synth_token<N>: N must be >= 11 base62 chars");
+    }
+    let () = MinWidth::<N>::OK;
+
     let mut rand_bytes = [0u8; N];
     let _ = getrandom::getrandom(&mut rand_bytes);
     let mut token = [b'0'; N];
@@ -3888,6 +3907,92 @@ mod tests {
             "all synthesized ids in a burst must be unique"
         );
         assert!(ids.iter().all(|id| id.starts_with("resp_")));
+    }
+
+    /// Regression (LOW/correctness, Round 18): `synth_token<const N>` documents and now ENFORCES a
+    /// `N >= 11` floor via a compile-time `const _: () = assert!(N >= 11, ...)` evaluated per
+    /// monomorphization. The guard cannot be exercised from a passing runtime test (a too-small `N`
+    /// fails to BUILD, which a `cargo test` body can't observe without a trybuild harness), so this
+    /// test instead locks the observable contract the guard protects: every synthesized id the live
+    /// callers mint carries an opaque suffix at least the documented floor wide. Both call sites use
+    /// 48 (`ITEM_ID_TOKEN_LEN`/`RESPONSE_ID_TOKEN_LEN`); if a future edit narrowed a width below the
+    /// floor (or someone instantiated `synth_token` with `N < 11`), the build would break before this
+    /// assertion could even run.
+    #[test]
+    fn test_synth_token_meets_minimum_width() {
+        const MIN_TOKEN_LEN: usize = 11;
+
+        // The compile-time guard is the real enforcement; this also pins that the live callers stay
+        // comfortably above the floor so a regression in the width constants surfaces here too.
+        const { assert!(ITEM_ID_TOKEN_LEN >= MIN_TOKEN_LEN) };
+        const { assert!(RESPONSE_ID_TOKEN_LEN >= MIN_TOKEN_LEN) };
+
+        let resp_id = synthesize_response_id();
+        let resp_suffix = resp_id
+            .strip_prefix("resp_")
+            .expect("synthesized response id uses resp_ prefix");
+        assert!(
+            resp_suffix.len() >= MIN_TOKEN_LEN,
+            "synthesized resp_ suffix must be >= {MIN_TOKEN_LEN} base62 chars, got {} ({resp_id})",
+            resp_suffix.len()
+        );
+
+        let item_id = synthesize_item_id("msg");
+        let item_suffix = item_id
+            .strip_prefix("msg_")
+            .expect("synthesized item id uses the given prefix");
+        assert!(
+            item_suffix.len() >= MIN_TOKEN_LEN,
+            "synthesized item suffix must be >= {MIN_TOKEN_LEN} base62 chars, got {} ({item_id})",
+            item_suffix.len()
+        );
+    }
+
+    /// Regression (LOW/conformance, Round 18 verify): the streaming `response.failed` terminal event
+    /// (emitted from an IR `Error`) must carry the native non-error skeleton — specifically a
+    /// present-but-empty `output` array (REQUIRED by the SDK's typed `Response`), never omitting it.
+    /// A failed response produced no assistant items, so `output` is `[]`. (The `output: []` emission
+    /// already lived in the Error arm before Round 18; this test locks it against future regression.)
+    #[test]
+    fn test_response_failed_carries_empty_output_skeleton() {
+        let writer = ResponsesWriter;
+        let (etype, failed) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            }))
+            .expect("Error emits response.failed");
+        assert_eq!(etype, "response.failed");
+        let resp = failed
+            .get("response")
+            .expect("response.failed wraps an inner response object");
+        let output = resp
+            .get("output")
+            .expect("response.failed inner response must carry output, not omit it");
+        assert!(
+            output.as_array().is_some_and(|a| a.is_empty()),
+            "response.failed output must be a present-but-empty array, got {output}"
+        );
+        // The native failed skeleton also carries the other non-error required fields.
+        assert_eq!(
+            resp.get("status").and_then(|s| s.as_str()),
+            Some("failed"),
+            "response.failed inner status must be \"failed\""
+        );
+        assert_eq!(
+            resp.get("object").and_then(|o| o.as_str()),
+            Some("response"),
+            "response.failed inner object must be \"response\""
+        );
+        assert!(
+            resp.get("id").and_then(|i| i.as_str()).is_some(),
+            "response.failed inner response must carry an id"
+        );
+        assert!(
+            resp.get("error").and_then(|e| e.as_object()).is_some(),
+            "response.failed inner response must carry the error object"
+        );
     }
 
     /// Regression (MEDIUM/correctness): a top-level `metadata` object must NOT be in the modeled-key

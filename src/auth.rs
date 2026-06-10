@@ -1874,6 +1874,125 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Regression (LOW/test-coverage): `auth.mode=passthrough` + governance enabled is a documented
+    /// UNSUPPORTED deployment. Passthrough's contract is "accept any caller credential and forward it
+    /// upstream", but governance supersedes it: every request must resolve to a valid ENABLED virtual
+    /// key. The middleware emits a one-shot operator warning (`WARN_ONCE` at the top of the governance
+    /// branch) and then enforces the governance lookup. Following the project precedent
+    /// (`test_auth_mode_none_with_client_tokens_is_inert_open_relay` and
+    /// `test_none_mode_with_governance_still_requires_virtual_key`), the warn line itself is NOT
+    /// asserted — it is a one-shot, process-global side effect emitted on a worker thread, so its
+    /// documented BEHAVIOURAL consequence is the contract: passthrough's accept-and-forward semantics
+    /// are NOT honoured. This pins it end-to-end through the real router so a future refactor can't
+    /// accidentally let passthrough short-circuit the governance lookup and silently forward an
+    /// unauthenticated caller upstream:
+    ///   - NO token under passthrough+governance → 401 (passthrough would otherwise admit-and-forward)
+    ///   - a non-virtual-key bearer (the kind passthrough would forward verbatim) → 401
+    ///   - a valid enabled virtual key → admitted past auth (governance is what is honoured)
+    #[tokio::test]
+    async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: axum::http::StatusCode::OK,
+            body: json!({
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }),
+        });
+        let server = MockServer::new(state).await;
+
+        let secret = "sk-vk-pt-ok";
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "k".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "k".to_string(),
+                allowed_pools: vec!["pa".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth_mode(AuthMode::Passthrough)
+            .governance(gov)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/pa/v1/messages");
+        let req =
+            json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+                .to_string();
+
+        // No token at all → 401, even though auth.mode=passthrough would normally admit-and-forward.
+        let r_none = client.post(&url).body(req.clone()).send().await.unwrap();
+        assert_eq!(
+            r_none.status().as_u16(),
+            401,
+            "passthrough must NOT accept-and-forward an unauthenticated caller when governance is enabled"
+        );
+
+        // A non-virtual-key bearer — exactly the kind of caller credential passthrough would forward
+        // verbatim upstream — is rejected, because governance requires a known enabled key.
+        let r_unknown = client
+            .post(&url)
+            .bearer_auth("sk-caller-upstream-cred")
+            .body(req.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r_unknown.status().as_u16(),
+            401,
+            "passthrough must NOT forward an arbitrary caller credential when governance is enabled"
+        );
+
+        // A valid enabled virtual key still passes auth (governance is what is honoured).
+        let r_ok = client
+            .post(&url)
+            .bearer_auth(secret)
+            .body(req)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_ok.status().as_u16(),
+            401,
+            "a valid enabled key must pass auth under governance+passthrough (got {})",
+            r_ok.status()
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// Regression for the admin-token carrier-level timing oracle (MEDIUM/security): the two admin
     /// carriers (Authorization: Bearer and x-admin-token) are combined with a bitwise-OR fold, NOT a
     /// short-circuiting `||`. Behaviorally this means EITHER carrier alone authorizes, AND a request

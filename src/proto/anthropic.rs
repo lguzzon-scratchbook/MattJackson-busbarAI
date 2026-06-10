@@ -960,6 +960,24 @@ impl AnthropicWriter {
             AnthropicCredScheme::Ambiguous
         }
     }
+
+    /// Build the native Anthropic error envelope for a resolved `error.type`.
+    ///
+    /// Current Anthropic API error bodies carry a top-level `request_id` (`req_...`) alongside the
+    /// `error` object. busbar synthesizes this envelope itself (no upstream request to forward), so
+    /// we mint one to match the native shape — the SDK doesn't require it to decode the typed
+    /// exception, but its absence is a distinguishability tell. Shared by every `write_error` exit
+    /// so the status-driven and kind-driven paths emit byte-identical envelopes.
+    fn error_envelope(error_type: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message,
+            },
+            "request_id": synth_request_id(),
+        })
+    }
 }
 
 impl ProtocolWriter for AnthropicWriter {
@@ -1047,7 +1065,7 @@ impl ProtocolWriter for AnthropicWriter {
         true
     }
 
-    fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
+    fn write_error(&self, status: u16, kind: &str, message: &str) -> serde_json::Value {
         // Native Anthropic error envelope: `{"type":"error","error":{"type":<kind>,"message":<msg>}}`
         // (see the Anthropic SDK / API error shape — the `anthropic.APIStatusError` family decodes
         // `error.type` into the typed exception, e.g. `RateLimitError`, and surfaces `error.message`).
@@ -1056,6 +1074,17 @@ impl ProtocolWriter for AnthropicWriter {
         // vocabulary so a native SDK gets the exception it expects; an unrecognized `kind` is passed
         // through verbatim (it is already an Anthropic-style type, or a value we don't want to
         // silently rewrite — no `_ =>` swallow).
+        //
+        // Status-driven override first: native Anthropic represents upstream overload as the 529
+        // `overloaded_error`, never a generic `api_error`. When a cross-protocol upstream relays a
+        // 503 (or 529) to an Anthropic-ingress client, the router hands us the generic `api_error`
+        // kind — but the native type for that status family is `overloaded_error`. Map by status so
+        // a native SDK raises the right exception (and the body matches what real Anthropic returns
+        // under load) rather than a generic server error. Status takes precedence over `kind` here
+        // because the wire status is the authoritative signal of the overload condition.
+        if status == 503 || status == 529 {
+            return Self::error_envelope("overloaded_error", message);
+        }
         let anthropic_type = match kind {
             // Generic router/auth/forward `kind`s → Anthropic's typed error vocabulary.
             "invalid_request" | "bad_request" => "invalid_request_error",
@@ -1078,18 +1107,7 @@ impl ProtocolWriter for AnthropicWriter {
             | "timeout_error" => kind,
             other => other,
         };
-        // Current Anthropic API error bodies carry a top-level `request_id` (`req_...`) alongside
-        // the `error` object. busbar synthesizes this envelope itself (no upstream request to
-        // forward), so mint one to match the native shape — the SDK doesn't require it to decode
-        // the typed exception, but its absence is a distinguishability tell.
-        serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": anthropic_type,
-                "message": message,
-            },
-            "request_id": synth_request_id(),
-        })
+        Self::error_envelope(anthropic_type, message)
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
@@ -1709,6 +1727,50 @@ mod anthropic_hardening_tests {
         assert_eq!(
             map_of("some_custom_kind").as_deref(),
             Some("some_custom_kind")
+        );
+    }
+
+    /// A cross-protocol upstream 503 relayed to an Anthropic-ingress client arrives with the
+    /// generic router kind `api_error`. Native Anthropic represents upstream overload as the 529
+    /// `overloaded_error`, NOT a generic `api_error`, so `write_error` must map by status: a 503
+    /// (and the 529 it canonically maps to) yields `error.type == "overloaded_error"`. Regression
+    /// guard for the conformance finding — fails against the old `_status`-ignoring code, which
+    /// emitted `api_error`.
+    #[test]
+    fn write_error_503_maps_to_overloaded_error_not_api_error() {
+        let type_for = |status: u16| {
+            AnthropicWriter
+                .write_error(status, "api_error", "upstream is overloaded")
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        };
+        // The finding's exact scenario: cross-protocol 503 + generic `api_error` kind.
+        assert_eq!(
+            type_for(503).as_deref(),
+            Some("overloaded_error"),
+            "a 503 must surface as Anthropic's overloaded_error, not a generic api_error"
+        );
+        // The native 529 overload status maps the same way regardless of incoming kind.
+        assert_eq!(type_for(529).as_deref(), Some("overloaded_error"));
+        // A genuine 500-class server error (not the overload family) still maps to api_error —
+        // the status override is scoped to 503/529 and does not swallow other server errors.
+        assert_eq!(type_for(500).as_deref(), Some("api_error"));
+        // The envelope is still well-formed and request_id is minted on the status-override path.
+        let v = AnthropicWriter.write_error(503, "api_error", "upstream is overloaded");
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("error"));
+        assert!(
+            v.get("request_id")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.starts_with("req_")),
+            "the status-override path must still mint a native request_id"
+        );
+        assert_eq!(
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str()),
+            Some("upstream is overloaded")
         );
     }
 

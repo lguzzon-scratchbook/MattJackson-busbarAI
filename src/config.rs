@@ -294,17 +294,22 @@ pub(crate) struct BreakerCfg {
 
 impl Default for BreakerCfg {
     fn default() -> Self {
+        // Delegate to the serde-default fns so the `breaker:`-omitted path (this `Default`) and the
+        // per-field-omitted path (`#[serde(default = ...)]`) share a single source of truth for the
+        // cooldown literals and cannot drift. See `breaker_cfg_default_matches_serde_default_fns`.
         Self {
-            base_cooldown_secs: 15,
-            max_cooldown_secs: 120,
+            base_cooldown_secs: default_cooldown(),
+            max_cooldown_secs: default_max_cooldown(),
             trip: Some(BreakerTripConfig::default()),
         }
     }
 }
 
 fn default_cooldown() -> u64 {
-    // Matches `store::BreakerCfg::default()` (used when a pool omits the `breaker:` block), so the
-    // base cooldown is a consistent 15s whether or not the block is present.
+    // Single source of truth for the base cooldown: both `BreakerCfg::default()` (used when a pool
+    // omits the `breaker:` block) and `#[serde(default = "default_cooldown")]` (used when the block
+    // is present but omits `base_cooldown_secs`) route through here, so the value is a consistent
+    // 15s on every path.
     15
 }
 
@@ -1292,5 +1297,25 @@ models: {}
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
         assert!(err_msg.contains("fallback_pool requires a non-empty pool name"));
+    }
+
+    #[test]
+    fn breaker_cfg_default_matches_serde_default_fns() {
+        // `BreakerCfg::default()` (used when a pool omits the whole `breaker:` block) and the
+        // `#[serde(default = ...)]` fns (used when individual fields are omitted) must agree on the
+        // cooldown literals; otherwise the same pool would get different cooldowns depending on
+        // whether the block is present. `Default` now delegates to these fns, so this guards against
+        // the two ever drifting again.
+        let d = BreakerCfg::default();
+        assert_eq!(
+            d.base_cooldown_secs,
+            default_cooldown(),
+            "base_cooldown_secs default diverged from default_cooldown()"
+        );
+        assert_eq!(
+            d.max_cooldown_secs,
+            default_max_cooldown(),
+            "max_cooldown_secs default diverged from default_max_cooldown()"
+        );
     }
 }

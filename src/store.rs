@@ -93,10 +93,13 @@ pub(crate) fn set_now_for_test(t: u64) {
 
 #[cfg(test)]
 pub(crate) fn now_for_test() -> u64 {
-    let val = TEST_NOW.with(|c| c.get());
-    // If test time is set on this thread, use it; otherwise fall back to real time.
-    if IN_TEST.with(|c| c.get()) && val != 0 {
-        val
+    // "Unset" is signalled SOLELY by the `IN_TEST` flag (set true by `set_now_for_test`), NOT by the
+    // stored value. The old guard (`val != 0`) conflated a legitimately-injected instant of 0 with
+    // "never set" and silently fell back to the wall clock — so `set_now_for_test(0)` (epoch / a
+    // deliberately-pinned zero instant) was unmockable and any cooldown math anchored at 0 ran
+    // against real time, a latent flake. With the flag as the sole gate, 0 is a legal mock instant.
+    if IN_TEST.with(|c| c.get()) {
+        TEST_NOW.with(|c| c.get())
     } else {
         now()
     }
@@ -468,6 +471,21 @@ impl BreakerCellAccess for LaneState {
 /// on the hot path (the lane index is `Copy`; the pool name is compared by `&str`).
 type PoolCellMap = std::collections::HashMap<usize, Vec<(Box<str>, Arc<BreakerCell>)>>;
 
+/// FNV-1a over a pool name → SWRR shard index. Pure (no `self`) so it can be unit-tested and reused
+/// by the per-pool shard memo without duplicating the constants. Distribution, not cryptographic
+/// strength, is all that matters: it only picks which lock shard a pool's selections serialize on.
+/// `SWRR_SHARDS` is a power of two, so the reduction is a cheap mask.
+fn swrr_shard_index(pool: &str) -> usize {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &byte in pool.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash as usize) & (SWRR_SHARDS - 1)
+}
+
 /// Number of SWRR lock shards. The SWRR weight read-modify-write only needs to be serialized
 /// PER POOL (the `Σ current_weight == 0` invariant is pool-local — two disjoint pools share no
 /// `current_weight` cells), so a single global lock needlessly serialized every pool's selection.
@@ -491,6 +509,14 @@ pub(crate) struct InMemoryStore {
     /// whose pool hashes to the same shard, so concurrent selections for disjoint pools run in
     /// parallel. Boxed slice so the struct stays movable without a const-generic array literal.
     swrr_shards: Box<[std::sync::Mutex<()>]>,
+    /// Memoized pool-name → shard-index map. `swrr_shard` ran FNV-1a over the pool NAME on EVERY
+    /// selection (the hot dispatch path); the index is a pure function of the (small, stable) set of
+    /// pool names, so cache it on first touch and reuse thereafter. An append-only `Vec` scanned by
+    /// byte-compare (the same idiom as `cell()`) — NOT a `HashMap`, whose SipHash lookup would cost
+    /// more than the FNV it replaces. The cached value is identical to recomputing `swrr_shard_index`,
+    /// so selection semantics are unchanged. `RwLock`: the common case is a shared-read hit; only a
+    /// genuine first-touch miss takes the exclusive write lock to insert.
+    pool_shards: std::sync::RwLock<Vec<(Box<str>, usize)>>,
 }
 
 struct LaneState {
@@ -558,6 +584,7 @@ impl InMemoryStore {
             swrr_shards: (0..SWRR_SHARDS)
                 .map(|_| std::sync::Mutex::new(()))
                 .collect(),
+            pool_shards: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -570,17 +597,24 @@ impl InMemoryStore {
     /// `Σ current_weight == 0` invariant), while selections for pools hashing to other shards run in
     /// parallel. `SWRR_SHARDS` is a power of two, so the index is a cheap mask.
     fn swrr_shard(&self, pool: &str) -> &std::sync::Mutex<()> {
-        // FNV-1a over the pool name — a cheap, stable, well-distributed shard index. (Distribution,
-        // not cryptographic strength, is all that matters here: it only picks which lock shard a
-        // pool's selections serialize on.)
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut hash = FNV_OFFSET;
-        for &byte in pool.as_bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
+        // Fast path: the pool's shard index was computed once on its first selection and memoized,
+        // so subsequent selections reuse it WITHOUT re-running FNV-1a over the name on every call.
+        // Shared read lock — concurrent selections for already-seen pools don't block each other.
+        {
+            let cache = read_recover(&self.pool_shards);
+            if let Some((_, idx)) = cache.iter().find(|(p, _)| p.as_ref() == pool) {
+                return &self.swrr_shards[*idx];
+            }
         }
-        let idx = (hash as usize) & (SWRR_SHARDS - 1);
+        // First-touch miss: compute and insert under the exclusive write lock. Re-check first — a
+        // racing selection for the same pool may have inserted between the read miss and this acquire.
+        let idx = swrr_shard_index(pool);
+        let mut cache = write_recover(&self.pool_shards);
+        if !cache.iter().any(|(p, _)| p.as_ref() == pool) {
+            cache.push((Box::from(pool), idx));
+        }
+        // The cached value equals `idx` regardless of which writer won, so index by the just-computed
+        // value (identical shard selection to the old direct-FNV path).
         &self.swrr_shards[idx]
     }
 
@@ -699,7 +733,13 @@ impl InMemoryStore {
 
         // Add bounded jitter ±10% only if streak > 0
         if streak > 0 {
-            let jitter_range = duration / 10;
+            // Floor the band at >=1s. On tight cooldowns (`duration < 10`) the ±10% range
+            // `duration / 10` truncates to 0 → `span == 1` → jitter always 0 → EVERY lane that trips
+            // on a small `base_cooldown_secs` gets the identical cooldown, defeating the
+            // anti-thundering-herd desync exactly when the herd is densest (many lanes, short retry
+            // loop). A 1s band restores a real spread for small bases; for `duration >= 10` this is a
+            // no-op (`duration / 10 >= 1`), so larger cooldowns keep the documented ±10%.
+            let jitter_range = (duration / 10).max(1);
             #[cfg(test)]
             let time_seed = crate::store::now_for_test() as u128;
             #[cfg(not(test))]
@@ -1899,6 +1939,107 @@ mod tests {
             saw_below_base,
             "jitter must sometimes shorten the cooldown below the base (symmetric distribution)"
         );
+    }
+
+    /// Round-18 LOW/correctness: a small `base_cooldown_secs` must still get a real jitter spread.
+    /// When `duration < 10` the old `jitter_range = duration / 10` truncated to 0, so `span == 1` and
+    /// EVERY trip on a tight cooldown produced the identical value — no anti-thundering-herd desync
+    /// exactly when the herd is densest. With the band floored at >=1s, distinct time-seeds must yield
+    /// MORE THAN ONE distinct cooldown. This test FAILS on the old code (single value) and passes now.
+    #[test]
+    fn test_small_base_cooldown_still_jitters() {
+        // base 4, default error-rate trip (min_requests 5) so a single error does NOT trip — it stays
+        // Closed and arms a streak-1 cooldown: duration = 4 << 1 = 8 (< 10 → old jitter_range == 0).
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 4,
+            max_cooldown_secs: 120,
+            honor_retry_after: false,
+            trip: TripConfig::default(),
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..200u64 {
+            set_now_for_test(1_000_000 + seed * 13);
+            let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+            store.record_transient(0, "5xx", &cfg, None); // streak 1, no trip
+            let now = crate::store::now_for_test();
+            seen.insert(store.cooldown_remaining(0, now));
+        }
+        assert!(
+            seen.len() > 1,
+            "a small base_cooldown must still jitter across seeds (got single value {seen:?}); \
+             old code collapsed jitter_range to 0 for duration < 10"
+        );
+        // Sanity: the spread stays in a sane band around the base (8), never absurd.
+        let &min = seen.iter().next().expect("non-empty");
+        let &max = seen.iter().next_back().expect("non-empty");
+        assert!(
+            (4..=12).contains(&min) && (4..=12).contains(&max),
+            "jittered small cooldowns must stay near the base 8 (saw {min}..={max})"
+        );
+    }
+
+    /// Round-18 LOW/perf: memoizing the per-pool shard MUST NOT change selection semantics. The
+    /// memoized `swrr_shard` returns the SAME shard index as a fresh FNV-1a of the pool name, so a
+    /// selection sequence over the same pools/weights is identical before and after. Assert the
+    /// memoized lookup agrees with the pure recompute for every pool, and that repeated selections
+    /// produce a stable, reproducible sequence (the SWRR distribution the shard lock guards).
+    #[test]
+    fn test_swrr_shard_memo_preserves_selection() {
+        set_now_for_test(1000);
+        let store = Arc::new(InMemoryStore::new(vec![
+            make_lane_data(0, 10),
+            make_lane_data(1, 10),
+        ]));
+        // The memoized shard must equal the direct FNV recompute for assorted pool names (including
+        // empty and repeats) — first touch and cached hit alike.
+        for pool in ["", "alpha", "beta", "alpha", "gamma-pool", "", "beta"] {
+            let memo = store.swrr_shard(pool) as *const _;
+            let direct = &store.swrr_shards[swrr_shard_index(pool)] as *const _;
+            assert_eq!(
+                memo, direct,
+                "memoized shard for {pool:?} must be the same lock as a fresh FNV recompute"
+            );
+        }
+        // Selection sequence is deterministic and unchanged by memoization: same pool/weights/now
+        // give the identical lane order on repeat (the shard lock only serializes; it never alters
+        // which lane SWRR picks).
+        let candidates = [0usize, 1];
+        let weights = [3u32, 1];
+        let mut seq_a = Vec::new();
+        for _ in 0..8 {
+            seq_a.push(store.select_weighted_in("alpha", &candidates, &weights, 1000));
+        }
+        // Fresh store, identical inputs → identical sequence (SWRR is deterministic from zeroed
+        // current_weight). Proves memoization left selection bit-for-bit unchanged.
+        let store2 = Arc::new(InMemoryStore::new(vec![
+            make_lane_data(0, 10),
+            make_lane_data(1, 10),
+        ]));
+        let mut seq_b = Vec::new();
+        for _ in 0..8 {
+            seq_b.push(store2.select_weighted_in("alpha", &candidates, &weights, 1000));
+        }
+        assert_eq!(
+            seq_a, seq_b,
+            "memoized shard must not change the SWRR selection sequence"
+        );
+    }
+
+    /// Round-18 LOW/test-coverage: pin `now_for_test`'s documented behavior. "Unset" is signalled by
+    /// the `IN_TEST` flag alone — so `set_now_for_test(0)` is a LEGAL mock instant (epoch 0), not a
+    /// silent wall-clock fallback. This FAILS on the old code (the `val != 0` guard fell back to real
+    /// time for an injected 0) and passes now.
+    #[test]
+    fn test_set_now_for_test_zero_is_a_legal_mock_instant() {
+        set_now_for_test(0);
+        assert_eq!(
+            crate::store::now_for_test(),
+            0,
+            "set_now_for_test(0) must pin the clock to 0, not fall back to wall-clock time"
+        );
+        // And a normal nonzero injection still works (no regression to the common path).
+        set_now_for_test(4242);
+        assert_eq!(crate::store::now_for_test(), 4242);
     }
 
     #[test]

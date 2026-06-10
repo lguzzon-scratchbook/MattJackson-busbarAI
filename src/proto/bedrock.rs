@@ -312,6 +312,47 @@ fn stop_reason_reverse(canonical: &str) -> String {
     }
 }
 
+/// Read the prompt-cache token fields off a Bedrock Converse `usage` object into the IR's
+/// `(cache_creation_input_tokens, cache_read_input_tokens)` pair. AWS names the write side
+/// `cacheWriteInputTokens` (tokens written to the cache this turn = a cache *creation* in
+/// Anthropic terminology) and the read side `cacheReadInputTokens` (per the Bedrock
+/// `TokenUsage` shape). Both are OPTIONAL on the wire — a model/region without prompt caching,
+/// or a request that neither created nor read a cache entry, simply omits them — so each maps
+/// to `None` when absent (distinct from `Some(0)`, which a backend may legitimately send when
+/// caching was active but contributed zero tokens). The old code hardcoded both to `None`,
+/// silently dropping real cache accounting on every read; this plumbs the actual values so a
+/// Bedrock→Bedrock (and Bedrock→Anthropic) round-trip preserves cache usage.
+fn read_cache_usage(
+    usage_obj: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> (Option<u64>, Option<u64>) {
+    let cache_creation_input_tokens = usage_obj
+        .and_then(|u| u.get("cacheWriteInputTokens"))
+        .and_then(|v| v.as_u64());
+    let cache_read_input_tokens = usage_obj
+        .and_then(|u| u.get("cacheReadInputTokens"))
+        .and_then(|v| v.as_u64());
+    (cache_creation_input_tokens, cache_read_input_tokens)
+}
+
+/// Write the IR's prompt-cache token fields back onto a Bedrock Converse `usage` object, the
+/// inverse of `read_cache_usage`. Emits `cacheWriteInputTokens` from `cache_creation_input_tokens`
+/// and `cacheReadInputTokens` from `cache_read_input_tokens`, and ONLY when the IR carries a value
+/// (`Some`) — a `None` field is omitted rather than serialized as `0`, so a Bedrock→Bedrock
+/// round-trip of a no-cache response stays byte-identical to native AWS (which omits the fields
+/// when caching was inactive) and never fabricates a cache-accounting tell. The old writer dropped
+/// these fields entirely.
+fn write_cache_usage(
+    usage_obj: &mut serde_json::Map<String, serde_json::Value>,
+    usage: &crate::ir::IrUsage,
+) {
+    if let Some(ccit) = usage.cache_creation_input_tokens {
+        usage_obj.insert("cacheWriteInputTokens".to_string(), ccit.into());
+    }
+    if let Some(crit) = usage.cache_read_input_tokens {
+        usage_obj.insert("cacheReadInputTokens".to_string(), crit.into());
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BedrockReader;
 
@@ -863,6 +904,8 @@ impl ProtocolReader for BedrockReader {
                 // `metadata` with neither usage nor a buffered stop_reason yields a zero-usage,
                 // stop_reason-less delta, which is benign.
                 let usage_obj = data.get("usage").and_then(|u| u.as_object());
+                let (cache_creation_input_tokens, cache_read_input_tokens) =
+                    read_cache_usage(usage_obj);
                 let usage = crate::ir::IrUsage {
                     input_tokens: usage_obj
                         .and_then(|u| u.get("inputTokens"))
@@ -872,8 +915,8 @@ impl ProtocolReader for BedrockReader {
                         .and_then(|u| u.get("outputTokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
                 };
 
                 out.push(IrStreamEvent::MessageDelta {
@@ -1012,6 +1055,8 @@ impl ProtocolReader for BedrockReader {
         // response-format quirk (mock/staging backend, or a future model variant), not a client
         // error, so a spurious `ClientError` here would mislabel the cause and confuse retry logic.
         let usage_obj = obj.get("usage");
+        let (cache_creation_input_tokens, cache_read_input_tokens) =
+            read_cache_usage(usage_obj.and_then(|u| u.as_object()));
         let usage = crate::ir::IrUsage {
             input_tokens: usage_obj
                 .and_then(|u| u.get("inputTokens"))
@@ -1021,8 +1066,8 @@ impl ProtocolReader for BedrockReader {
                 .and_then(|u| u.get("outputTokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
         };
 
         Ok(crate::ir::IrResponse {
@@ -1513,22 +1558,29 @@ impl ProtocolWriter for BedrockWriter {
                     "messageStop".to_string(),
                     serde_json::json!({ "stopReason": stop_reason_reverse(reason) }),
                 )),
-                None => Some((
-                    "metadata".to_string(),
-                    serde_json::json!({
-                        "usage": {
-                            "inputTokens": usage.input_tokens,
-                            "outputTokens": usage.output_tokens,
-                            // Saturating add: token counts arrive from an untrusted upstream
-                            // (`as_u64().unwrap_or(0)` in the reader); a pathological/hostile pair
-                            // near `u64::MAX` would panic this request-path code under
-                            // overflow-checks (all debug builds, opt-in release) or silently wrap to
-                            // a nonsense `totalTokens` in plain release. Mirror the Gemini writer's
-                            // explicit `saturating_add` so the total clamps at `u64::MAX` instead.
-                            "totalTokens": usage.input_tokens.saturating_add(usage.output_tokens)
-                        }
-                    }),
-                )),
+                None => {
+                    let mut usage_obj = serde_json::Map::new();
+                    usage_obj.insert("inputTokens".to_string(), usage.input_tokens.into());
+                    usage_obj.insert("outputTokens".to_string(), usage.output_tokens.into());
+                    // Saturating add: token counts arrive from an untrusted upstream
+                    // (`as_u64().unwrap_or(0)` in the reader); a pathological/hostile pair
+                    // near `u64::MAX` would panic this request-path code under
+                    // overflow-checks (all debug builds, opt-in release) or silently wrap to
+                    // a nonsense `totalTokens` in plain release. Mirror the Gemini writer's
+                    // explicit `saturating_add` so the total clamps at `u64::MAX` instead.
+                    usage_obj.insert(
+                        "totalTokens".to_string(),
+                        usage
+                            .input_tokens
+                            .saturating_add(usage.output_tokens)
+                            .into(),
+                    );
+                    write_cache_usage(&mut usage_obj, usage);
+                    Some((
+                        "metadata".to_string(),
+                        serde_json::json!({ "usage": usage_obj }),
+                    ))
+                }
             },
 
             IrStreamEvent::MessageStop => None,
@@ -1607,6 +1659,21 @@ impl ProtocolWriter for BedrockWriter {
         // production path, so none is shipped.) `stopReason` and `usage` (the only identity-bearing
         // fields Bedrock emits) are reproduced exactly from the captured IR below, so a
         // same-protocol round-trip is byte-identical.
+        let mut usage_obj = serde_json::Map::new();
+        usage_obj.insert("inputTokens".to_string(), resp.usage.input_tokens.into());
+        usage_obj.insert("outputTokens".to_string(), resp.usage.output_tokens.into());
+        // Saturating add, same rationale as the streaming `metadata` frame: token counts are
+        // upstream-derived and unbounded, so a bare `u64 + u64` here is an overflow-panic
+        // (overflow-checks) / silent-wrap (release) hazard on the buffered Converse body.
+        usage_obj.insert(
+            "totalTokens".to_string(),
+            resp.usage
+                .input_tokens
+                .saturating_add(resp.usage.output_tokens)
+                .into(),
+        );
+        write_cache_usage(&mut usage_obj, &resp.usage);
+
         serde_json::json!({
             "output": {
                 "message": {
@@ -1615,14 +1682,7 @@ impl ProtocolWriter for BedrockWriter {
                 }
             },
             "stopReason": reverse_reason,
-            "usage": {
-                "inputTokens": resp.usage.input_tokens,
-                "outputTokens": resp.usage.output_tokens,
-                // Saturating add, same rationale as the streaming `metadata` frame: token counts are
-                // upstream-derived and unbounded, so a bare `u64 + u64` here is an overflow-panic
-                // (overflow-checks) / silent-wrap (release) hazard on the buffered Converse body.
-                "totalTokens": resp.usage.input_tokens.saturating_add(resp.usage.output_tokens)
-            }
+            "usage": usage_obj
         })
     }
 
@@ -4363,6 +4423,207 @@ mod tests {
         assert!(
             bedrock_image_block(IMAGE_S3_SENTINEL, "[1,2,3]").is_none(),
             "a non-object s3 stash must be dropped"
+        );
+    }
+
+    // --- Round 18 regression tests: prompt-cache token plumbing -------------------------------
+
+    /// Regression (reader, non-streaming): a Converse response `usage` carrying
+    /// `cacheReadInputTokens` / `cacheWriteInputTokens` must surface them on the IR usage as
+    /// `cache_read_input_tokens` / `cache_creation_input_tokens`. The old reader hardcoded both
+    /// to `None`, silently dropping real prompt-cache accounting — this asserts the real values
+    /// round-trip out of the read path.
+    #[test]
+    fn test_read_response_plumbs_cache_tokens() {
+        let reader = BedrockReader;
+        let j = serde_json::json!({
+            "output": { "message": { "role": "assistant", "content": [{"text": "hi"}] } },
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "cacheReadInputTokens": 64,
+                "cacheWriteInputTokens": 128
+            }
+        });
+        let resp = reader.read_response(&j).expect("read_response");
+        assert_eq!(
+            resp.usage.cache_read_input_tokens,
+            Some(64),
+            "cacheReadInputTokens must map to cache_read_input_tokens (was hardcoded None)"
+        );
+        assert_eq!(
+            resp.usage.cache_creation_input_tokens,
+            Some(128),
+            "cacheWriteInputTokens must map to cache_creation_input_tokens (was hardcoded None)"
+        );
+    }
+
+    /// Regression (reader): an absent cache field stays `None` (not `Some(0)`), so a no-cache
+    /// response is distinguishable from a zero-token cache hit.
+    #[test]
+    fn test_read_response_absent_cache_tokens_are_none() {
+        let reader = BedrockReader;
+        let j = serde_json::json!({
+            "output": { "message": { "role": "assistant", "content": [{"text": "hi"}] } },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+        });
+        let resp = reader.read_response(&j).expect("read_response");
+        assert_eq!(resp.usage.cache_read_input_tokens, None);
+        assert_eq!(resp.usage.cache_creation_input_tokens, None);
+    }
+
+    /// Regression (reader, streaming): the `metadata` event's `usage` cache fields must surface on
+    /// the combined MessageDelta's IR usage (old code hardcoded both to `None`).
+    #[test]
+    fn test_read_stream_metadata_plumbs_cache_tokens() {
+        use crate::ir::IrStreamEvent;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+        let events: Vec<IrStreamEvent> = [
+            serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+            serde_json::json!({
+                "type": "metadata",
+                "usage": {
+                    "inputTokens": 3,
+                    "outputTokens": 1,
+                    "cacheReadInputTokens": 9,
+                    "cacheWriteInputTokens": 17
+                }
+            }),
+        ]
+        .into_iter()
+        .flat_map(|data| reader.read_response_events("", &data, &mut state))
+        .collect();
+
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::MessageDelta { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .expect("a combined MessageDelta must be emitted");
+        assert_eq!(usage.cache_read_input_tokens, Some(9));
+        assert_eq!(usage.cache_creation_input_tokens, Some(17));
+    }
+
+    /// Regression (writer, non-streaming): IR usage cache fields must be emitted as
+    /// `cacheReadInputTokens` / `cacheWriteInputTokens` on the native body (old writer omitted
+    /// them entirely), and a full read→write round-trip of a cache-bearing usage is byte-identical.
+    #[test]
+    fn test_write_response_emits_cache_tokens_roundtrip() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let j = serde_json::json!({
+            "output": { "message": { "role": "assistant", "content": [{"text": "hi"}] } },
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "cacheReadInputTokens": 64,
+                "cacheWriteInputTokens": 128
+            }
+        });
+        let resp = reader.read_response(&j).expect("read_response");
+        let written = writer.write_response(&resp);
+        assert_eq!(
+            written
+                .pointer("/usage/cacheReadInputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(64),
+            "writer must emit cacheReadInputTokens (was omitted)"
+        );
+        assert_eq!(
+            written
+                .pointer("/usage/cacheWriteInputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(128),
+            "writer must emit cacheWriteInputTokens (was omitted)"
+        );
+        assert_eq!(
+            written, j,
+            "cache-bearing round-trip must be byte-identical"
+        );
+    }
+
+    /// Regression (writer): a `None` cache field is OMITTED, not serialized as `0` — so a no-cache
+    /// response stays byte-identical to native AWS (which omits the fields when caching was idle).
+    #[test]
+    fn test_write_response_omits_absent_cache_tokens() {
+        let writer = BedrockWriter;
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let written = writer.write_response(&resp);
+        assert!(
+            written.pointer("/usage/cacheReadInputTokens").is_none(),
+            "absent cache_read must not be emitted as 0"
+        );
+        assert!(
+            written.pointer("/usage/cacheWriteInputTokens").is_none(),
+            "absent cache_creation must not be emitted as 0"
+        );
+    }
+
+    /// Regression (writer, streaming): a usage-only MessageDelta carrying cache fields must emit
+    /// them on the `metadata` frame's `usage` (old writer dropped them).
+    #[test]
+    fn test_write_stream_metadata_emits_cache_tokens() {
+        let writer = BedrockWriter;
+        let usage_only = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: Some(20),
+            },
+        };
+        let (et, payload) = writer
+            .write_response_event(&usage_only)
+            .expect("usage-only delta must emit a frame");
+        assert_eq!(et, "metadata");
+        assert_eq!(
+            payload
+                .pointer("/usage/cacheReadInputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(20)
+        );
+        assert_eq!(
+            payload
+                .pointer("/usage/cacheWriteInputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(40)
+        );
+        // The pre-existing token fields are unaffected.
+        assert_eq!(
+            payload
+                .pointer("/usage/inputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(11)
+        );
+        assert_eq!(
+            payload
+                .pointer("/usage/totalTokens")
+                .and_then(|v| v.as_u64()),
+            Some(18)
         );
     }
 }

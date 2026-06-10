@@ -420,7 +420,16 @@ enum ReadEnd {
 }
 
 async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, ReadEnd) {
-    let mut buf: Vec<u8> = Vec::new();
+    // Pre-reserve a BOUNDED initial capacity so the per-chunk `extend_from_slice` below does not
+    // reallocate-and-copy the buffer through a geometric growth series as it climbs toward `cap`.
+    // Bounded two ways so this never becomes an allocation-amplification lever: (a) capped at `cap`
+    // itself (the 256 KiB upstream-buffer cap, or 32 MiB translate cap — never larger), and (b)
+    // ceilinged at `READ_CAPPED_RESERVE_CEILING` so a 32 MiB-cap read does not eagerly commit 32 MiB
+    // for a response that is, in practice, a few KiB. The cap ENFORCEMENT is unchanged — `cap` still
+    // bounds every write below and an over-cap body is still rejected/Truncated; this only changes the
+    // starting allocation, never how many bytes are admitted.
+    const READ_CAPPED_RESERVE_CEILING: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(READ_CAPPED_RESERVE_CEILING));
     let mut r = r;
     let mut end = ReadEnd::Complete;
     loop {
@@ -4669,7 +4678,8 @@ mod mid_stream_error_tests {
 mod ingress_indistinguishability_tests {
     use super::{
         cross_protocol_error_kind, egress_accept, egress_user_agent, forward_with_pool,
-        ingress_error, ingress_stream_content_type, shape_cross_protocol_error,
+        ingress_error, ingress_stream_content_type, read_capped, shape_cross_protocol_error,
+        ReadEnd,
     };
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
@@ -5890,5 +5900,99 @@ data: {"type":"message_stop"}"#
             "an over-cap cross-protocol non-stream body must return 500, not a charged 2xx"
         );
         server.shutdown().await;
+    }
+
+    /// REGRESSION (R18 LOW, perf): `read_capped` now pre-reserves a bounded initial buffer capacity
+    /// to cut the per-chunk reallocation churn as the buffer grows toward `cap`. The pre-reserve must
+    /// NOT change cap ENFORCEMENT: a body that exceeds `cap` is still rejected — the returned buffer
+    /// holds exactly `cap` bytes (the admitted prefix) and the end reason is `ReadEnd::Truncated`,
+    /// never `Complete`. This test serves a body well over a small cap and asserts the cap is enforced
+    /// to the byte. (Guards against a future pre-reserve regression that mistakenly admitted up to the
+    /// reserved capacity rather than `cap`.)
+    #[tokio::test]
+    async fn test_read_capped_enforces_cap_exactly_and_reports_truncated() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // A 64 KiB raw JSON-string body — far larger than the 1 KiB cap used below.
+        let big = "y".repeat(64 * 1024);
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!(big),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/v1/messages", server.base_url()))
+            .send()
+            .await
+            .expect("mock GET must succeed");
+
+        const CAP: usize = 1024;
+        let (bytes, end) = read_capped(resp, CAP).await;
+        assert_eq!(
+            bytes.len(),
+            CAP,
+            "read_capped must admit EXACTLY cap bytes for an over-cap body, never more"
+        );
+        assert_eq!(
+            end,
+            ReadEnd::Truncated,
+            "an over-cap body must report Truncated, not Complete"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (R18 LOW, public-scrub): the client-facing 400 body for an unparseable JSON request
+    /// must carry ONLY the generic, vendor-plausible message — never serde_json's Display detail
+    /// (line/column/expectation), which is a busbar-internal tell and can echo fragments of the
+    /// malformed body. Sends a body that is valid UTF-8 but invalid JSON containing a recognizable
+    /// sentinel, and asserts neither the serde phrasing nor the sentinel appears on the wire. Fails
+    /// against any version that interpolates `{e}` into the response body.
+    #[tokio::test]
+    async fn test_unparseable_json_400_carries_no_serde_internals() {
+        crate::metrics::init();
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1", // never reached: parse fails before any egress
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        // Valid UTF-8, invalid JSON. The sentinel would surface in serde_json's Display
+        // ("expected value at line 1 column N", echoing nearby bytes) if it were interpolated.
+        let bad = br#"{ "model": "p", BUSBAR_SENTINEL_LEAK }"#.to_vec();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            bad.into(),
+            None,
+            "p",
+            None,
+            "openai",
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "unparseable JSON must be a 400"
+        );
+        use http_body_util::BodyExt as _;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("We could not parse the JSON body of your request."),
+            "400 body must carry the generic message; got {text}"
+        );
+        assert!(
+            !text.contains("BUSBAR_SENTINEL_LEAK"),
+            "400 body must NOT echo bytes from the malformed request; got {text}"
+        );
+        for needle in ["line 1", "column", "expected", "at line"] {
+            assert!(
+                !text.contains(needle),
+                "400 body must NOT leak serde_json Display internals ({needle:?}); got {text}"
+            );
+        }
     }
 }

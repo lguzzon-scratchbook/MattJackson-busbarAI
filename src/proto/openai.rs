@@ -72,14 +72,39 @@ const BASE62: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP
 /// which is fully random across all positions — never carries. Native vendor ids ARE fully random,
 /// so we are too. Never panics on the request path: on the near-impossible `getrandom` failure the
 /// buffer stays the base62 zero char rather than `?`-ing out.
+///
+/// Mapping CSPRNG bytes into base62 uses REJECTION SAMPLING, not `byte % 62`. A raw modulo is biased
+/// because 256 is not a multiple of 62 (256 = 4*62 + 8): the eight residues 0..=7 each receive one
+/// extra source byte (5/256 probability vs 4/256 for residues 8..=61), so the first eight alphabet
+/// characters ('0'..='7') would appear ~25% more often than the rest. A native vendor id is uniform
+/// over the alphabet, so a skewed character histogram is itself a statistical fingerprint. We accept
+/// only bytes below 248 (= 4*62, the largest multiple of 62 that fits in a byte) and discard the rest,
+/// which yields an exactly-uniform draw over 0..62. Discards are rare (8/256 ≈ 3.1%), so we refill the
+/// entropy buffer on demand rather than over-allocating up front; on a `getrandom` failure the loop
+/// stops and the remaining slots keep their '0' fill, preserving the panic-free contract.
 fn synth_completion_id() -> String {
-    // Fill the entire suffix with CSPRNG bytes mapped into base62. On entropy failure we leave the
-    // buffer zeroed (all '0') rather than panic; there is no counter overlay.
-    let mut rand_bytes = [0u8; COMPLETION_ID_TOKEN_LEN];
-    let _ = getrandom::getrandom(&mut rand_bytes);
+    // Largest multiple of 62 that fits in a u8; bytes >= this are rejected to keep the draw uniform.
+    const BASE62_REJECT_FLOOR: u8 = 248; // 4 * 62
     let mut token = [b'0'; COMPLETION_ID_TOKEN_LEN];
-    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
-        *slot = BASE62[(byte % 62) as usize];
+    let mut filled = 0usize;
+    // Pull entropy in batches and consume only the in-range bytes. If a batch yields too few usable
+    // bytes we draw another; on an entropy failure (getrandom errors) we stop and leave '0' fill.
+    'outer: while filled < COMPLETION_ID_TOKEN_LEN {
+        let mut batch = [0u8; COMPLETION_ID_TOKEN_LEN];
+        if getrandom::getrandom(&mut batch).is_err() {
+            // Near-impossible entropy failure: keep the remaining '0' fill rather than panic.
+            break 'outer;
+        }
+        for &byte in batch.iter() {
+            if byte >= BASE62_REJECT_FLOOR {
+                continue; // biased residue — discard to keep the distribution uniform
+            }
+            token[filled] = BASE62[(byte % 62) as usize];
+            filled += 1;
+            if filled == COMPLETION_ID_TOKEN_LEN {
+                break 'outer;
+            }
+        }
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards
@@ -2774,6 +2799,57 @@ mod tests {
         assert!(
             suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
             "suffix is base62: {id}"
+        );
+    }
+
+    #[test]
+    fn synth_completion_id_burst_is_unique_and_unbiased() {
+        // Round 18 LOW: the base62 fill must use rejection sampling, not `byte % 62`. The old modulo
+        // map gave residues 0..=7 (alphabet chars '0'..='7') 5/256 mass vs 4/256 for the other 54, a
+        // ~25% over-representation that a uniform native vendor id never shows. This test mints a large
+        // burst and asserts (a) every id is unique and (b) the leading-eight chars are NOT systematically
+        // over-represented in the suffix histogram. Against the biased code the over-represented bucket
+        // share would land far above the uniform expectation and trip the bound; the unbiased fill stays
+        // within it.
+        use std::collections::HashSet;
+        const N: usize = 20_000;
+        let mut seen = HashSet::with_capacity(N);
+        // Count, over all suffix characters, how many fall in the formerly-over-represented set 0..=7.
+        let mut low_bucket: u64 = 0;
+        let mut total_chars: u64 = 0;
+        for _ in 0..N {
+            let id = synth_completion_id();
+            assert_eq!(
+                id.len(),
+                "chatcmpl-".len() + COMPLETION_ID_TOKEN_LEN,
+                "{id}"
+            );
+            let suffix = id
+                .strip_prefix("chatcmpl-")
+                .expect("synthesized id carries the chatcmpl- prefix");
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "suffix is base62: {id}"
+            );
+            for b in suffix.bytes() {
+                total_chars += 1;
+                // '0'..='7' are the eight chars residues 0..=7 map to under the alphabet.
+                if (b'0'..=b'7').contains(&b) {
+                    low_bucket += 1;
+                }
+            }
+            assert!(seen.insert(id.clone()), "duplicate synthesized id: {id}");
+        }
+        assert_eq!(seen.len(), N, "all {N} synthesized ids are unique");
+        // Uniform expectation: 8 of 62 alphabet chars => 8/62 ≈ 12.90% of characters.
+        // Biased (old) expectation: 8 * (5/256) ≈ 15.63%. We assert the observed share stays below a
+        // 14% threshold — comfortably above the uniform mean (sampling noise over ~480k chars is tiny)
+        // and comfortably below the biased mean, so the test fails on the old code and passes on the new.
+        let share = low_bucket as f64 / total_chars as f64;
+        assert!(
+            share < 0.14,
+            "char share for residues 0..=7 was {share:.4}; uniform≈0.1290, biased≈0.1563 — \
+             a value at/above 0.14 indicates `byte % 62` bias regressed"
         );
     }
 

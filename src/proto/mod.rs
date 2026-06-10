@@ -1272,14 +1272,22 @@ pub(crate) fn find_frame_terminator(buf: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < buf.len() {
         if buf[i] == b'\n' {
-            // LF-LF: `\n\n`.
+            // LF-LF: `\n\n` — the blank-line terminator begins at this `\n` and is 2 bytes long.
             if buf.get(i + 1) == Some(&b'\n') {
                 return Some((i, 2));
             }
-            // CRLF-CRLF: a `\n` followed by `\r\n` (the leading `\r` of this line was already
-            // consumed by the previous line's CRLF), i.e. `\n\r\n`.
-            if buf.get(i + 1) == Some(&b'\r') && buf.get(i + 2) == Some(&b'\n') {
-                return Some((i, 3));
+            // CRLF-CRLF: `\r\n\r\n` — the full spec-legal terminator is 4 bytes. We anchor the scan
+            // on the `\n` that ENDS the preceding line's CRLF, then confirm the blank line's own
+            // `\r\n` follows (`...\n` + `\r\n`). The terminator proper begins at the trailing `\r`
+            // of the preceding line (one byte BEFORE this `\n`), so report `offset = i - 1` and
+            // `len = 4`. (`i >= 1` is guaranteed here: a leading `\n` at index 0 cannot match this
+            // arm, since the preceding `\r` it requires would have to sit at index -1.)
+            if i >= 1
+                && buf[i - 1] == b'\r'
+                && buf.get(i + 1) == Some(&b'\r')
+                && buf.get(i + 2) == Some(&b'\n')
+            {
+                return Some((i - 1, 4));
             }
         }
         i += 1;
@@ -1547,6 +1555,62 @@ pub(crate) fn convert_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the conformance bug where `find_frame_terminator` reported `term_len = 3`
+    /// for the spec-legal CRLF blank-line terminator (`\r\n\r\n`, 4 bytes), contradicting its own
+    /// documented contract (`offset` = index of the FIRST terminator byte, `len` = terminator
+    /// length). The slice `end = offset + len` happened to land correctly only because the old
+    /// off-by-one offset compensated the short length; this pins the documented `(offset, len)`
+    /// directly so the contract is honored, not just the derived `end`.
+    #[test]
+    fn test_find_frame_terminator_crlf_reports_four_bytes() {
+        // A frame ending in CRLF followed by a CRLF blank line: `data: x\r\n\r\n`.
+        let buf = b"data: x\r\n\r\n";
+        let (offset, len) = find_frame_terminator(buf).expect("CRLF terminator must be found");
+        // First terminator byte is the trailing `\r` of the data line's CRLF (index 7), and the
+        // full `\r\n\r\n` terminator is 4 bytes long.
+        assert_eq!(
+            offset, 7,
+            "offset must index the first terminator byte (\\r)"
+        );
+        assert_eq!(
+            len, 4,
+            "CRLF terminator length must be 4 (\\r\\n\\r\\n), not 3"
+        );
+        assert_eq!(&buf[offset..], b"\r\n\r\n");
+        // The derived frame boundary must still cover the whole input.
+        assert_eq!(offset + len, buf.len());
+    }
+
+    /// The LF-only blank-line terminator (`\n\n`) must stay 2 bytes, anchored at the first `\n`.
+    #[test]
+    fn test_find_frame_terminator_lf_reports_two_bytes() {
+        let buf = b"data: x\n\n";
+        let (offset, len) = find_frame_terminator(buf).expect("LF terminator must be found");
+        assert_eq!(offset, 7, "offset must index the first `\\n`");
+        assert_eq!(len, 2, "LF terminator length must be 2 (\\n\\n)");
+        assert_eq!(&buf[offset..], b"\n\n");
+        assert_eq!(offset + len, buf.len());
+    }
+
+    /// Two adjacent CRLF frames must split at exactly the documented boundary, so the second
+    /// frame begins cleanly (no stray leading `\r` and no missing byte).
+    #[test]
+    fn test_find_frame_terminator_crlf_frame_split_is_clean() {
+        let buf = b"data: x\r\n\r\ndata: y\r\n\r\n";
+        let (offset, len) = find_frame_terminator(buf).expect("first CRLF terminator");
+        let end = offset + len;
+        assert_eq!(
+            &buf[..end],
+            b"data: x\r\n\r\n",
+            "first frame incl. terminator"
+        );
+        assert_eq!(
+            &buf[end..],
+            b"data: y\r\n\r\n",
+            "remainder is the next frame verbatim"
+        );
+    }
 
     /// The default `ProtocolWriter::write_error` (the only impl in this wave — no per-protocol
     /// overrides yet) must produce valid JSON carrying the message and the `kind` as `error.type`,
