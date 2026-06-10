@@ -535,18 +535,24 @@ impl ProtocolReader for GeminiReader {
                         // per-chunk local, so indices stay stable across the multiple SSE chunks of
                         // a single response.
                         for part in parts_arr {
-                            // Text block
+                            // Text block. The text block claims the next free IR index BY ORDER OF
+                            // FIRST APPEARANCE (the count of tool blocks already opened), NOT a
+                            // hardcoded 0. A tool that arrives before the first text part takes 0 and
+                            // text takes the next slot, so the two never collide on an index regardless
+                            // of Gemini's part ordering; the index is then stable for the whole stream.
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
+                                    let ti = state.text_index.unwrap_or(state.open_tools.len());
                                     if !state.text_block_open {
                                         state.text_block_open = true;
+                                        state.text_index = Some(ti);
                                         out.push(IrStreamEvent::BlockStart {
-                                            index: 0,
+                                            index: ti,
                                             block: crate::ir::IrBlockMeta::Text,
                                         });
                                     }
                                     out.push(IrStreamEvent::BlockDelta {
-                                        index: 0,
+                                        index: ti,
                                         delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                     });
                                 }
@@ -572,15 +578,18 @@ impl ProtocolReader for GeminiReader {
                                 if !name_val.is_empty()
                                     && state.open_tools.len() < MAX_GEMINI_TOOL_FRAMES
                                 {
-                                    // Tool blocks follow any text block. Reserve index 0 for a
-                                    // text block ONLY when one actually opened this stream;
-                                    // otherwise a tool-only response would leave index 0
-                                    // permanently empty and make content indices non-contiguous.
-                                    // Base the first tool index on whether text opened, then add
-                                    // however many tool blocks are already open. Recorded in
+                                    // A tool block claims the next free IR index by order of first
+                                    // appearance: the count of tool blocks already opened, plus 1 iff
+                                    // the text block has ALREADY claimed a slot this stream
+                                    // (`text_index.is_some()`, a PERSISTENT marker — not the live
+                                    // `text_block_open` flag). Keying on the persistent marker keeps a
+                                    // tool-only stream contiguous from 0 while guaranteeing text and
+                                    // tools never collide on an index regardless of arrival order:
+                                    // tool-before-text → tool takes 0, text takes the next slot;
+                                    // text-before-tool → text takes 0, tools take 1.. . Recorded in
                                     // `open_tools` so the finishReason handler emits a matching
-                                    // BlockStop for every tool block. Mirrors the Cohere reader.
-                                    let text_base = usize::from(state.text_block_open);
+                                    // BlockStop for every tool block.
+                                    let text_base = usize::from(state.text_index.is_some());
                                     let ir_idx = text_base + state.open_tools.len();
                                     state.open_tools.insert(ir_idx);
 
@@ -627,10 +636,12 @@ impl ProtocolReader for GeminiReader {
                     other => other.to_lowercase(),
                 };
 
-                // Close text block first if open
+                // Close text block first if open, at the index it actually claimed (not a hardcoded
+                // 0 — a tool may have taken 0 ahead of it).
                 if state.text_block_open {
                     state.text_block_open = false;
-                    out.push(IrStreamEvent::BlockStop { index: 0 });
+                    let ti = state.text_index.take().unwrap_or(0);
+                    out.push(IrStreamEvent::BlockStop { index: ti });
                 }
 
                 // Close tools in ascending order (track via open_tools)
@@ -2035,6 +2046,78 @@ mod tests {
                 .any(|e| matches!(e, IrStreamEvent::BlockStop { index: 1 })),
             "tool block (1) must be closed"
         );
+    }
+
+    /// Regression (verification of the R20 #6 fix): a functionCall part BEFORE the first text part
+    /// must NOT collide on IR index 0. The fix keyed the tool base on the live `text_block_open` flag,
+    /// which is false at tool time in this ordering, so the tool took 0 AND text later took 0 — two
+    /// BlockStart frames at index 0 (a protocol violation a strict Anthropic SDK rejects). Index-by-
+    /// first-appearance: the tool takes 0, text takes the next free slot (1); each index opened and
+    /// closed exactly once.
+    #[test]
+    fn test_stream_tool_before_text_no_index_collision() {
+        // Both intra-chunk (functionCall before text in the same parts array) AND inter-chunk.
+        for chunks in [
+            vec![serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"functionCall": {"name": "f", "args": {}}},
+                        {"text": "hello"}
+                    ]},
+                    "finishReason": "STOP"
+                }]
+            })],
+            vec![
+                serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"f","args":{}}}]}}]}),
+                serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}),
+            ],
+        ] {
+            let events = collect_stream(&chunks);
+            // Exactly one BlockStart per index; no two BlockStarts share an index.
+            let mut start_indices: Vec<usize> = events
+                .iter()
+                .filter_map(|e| match e {
+                    IrStreamEvent::BlockStart { index, .. } => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            let n = start_indices.len();
+            start_indices.sort_unstable();
+            start_indices.dedup();
+            assert_eq!(
+                start_indices.len(),
+                n,
+                "no two BlockStart frames may share an index; got duplicate in {events:?}"
+            );
+            // Tool took index 0 (it appeared first); text took index 1.
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    IrStreamEvent::BlockStart {
+                        index: 0,
+                        block: IrBlockMeta::ToolUse { .. }
+                    }
+                )),
+                "tool (first to appear) must take index 0: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    IrStreamEvent::BlockStart {
+                        index: 1,
+                        block: IrBlockMeta::Text
+                    }
+                )),
+                "text (after the tool) must take index 1: {events:?}"
+            );
+            // Both blocks are closed at their own index.
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStop { index: 0 })));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStop { index: 1 })));
+        }
     }
 
     /// Regression: tool block indices stay stable when the functionCall arrives in a different

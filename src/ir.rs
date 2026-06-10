@@ -238,6 +238,13 @@ pub(crate) enum IrDelta {
 pub(crate) struct StreamDecodeState {
     pub started: bool,
     pub text_block_open: bool,
+    /// The IR block index the Gemini reader assigned to the text block, by order of FIRST appearance
+    /// (not hardcoded 0). Gemini emits text and `functionCall` parts in any order across chunks; a
+    /// block claims the next free index when it first opens, so text and tools never collide on an
+    /// index regardless of arrival order (tool-only streams stay contiguous from 0; a tool that opens
+    /// before text takes 0 and text takes the next slot). `None` until the text block opens. Gemini
+    /// reader only; other readers leave it `None`.
+    pub text_index: Option<usize>,
     pub open_tools: std::collections::BTreeSet<usize>,
     /// Set once a reasoning (chain-of-thought) delta is seen on the OpenAI stream. When true, the
     /// thinking block occupies IR index 0 and the text/tool block indices shift up by one so the
@@ -281,6 +288,7 @@ mod tests {
         let st = StreamDecodeState::default();
         assert!(!st.started);
         assert!(!st.text_block_open);
+        assert!(st.text_index.is_none());
         assert!(st.open_tools.is_empty());
         assert!(!st.reasoning_seen);
         assert!(!st.thinking_block_open);
