@@ -179,6 +179,73 @@ pub(crate) async fn create_key(
     }
 }
 
+/// Partial update to an existing key. Every field is optional; only the present ones change. The
+/// secret, name, allowed-pools, and budget period are immutable here (rotate/recreate for those).
+#[derive(Deserialize)]
+pub(crate) struct UpdateKeyReq {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    rpm_limit: Option<u32>,
+    #[serde(default)]
+    tpm_limit: Option<u32>,
+    #[serde(default)]
+    max_budget_cents: Option<i64>,
+}
+
+/// PATCH /admin/keys/:id — enable/disable a key or adjust its rate/budget caps. The `enabled` field
+/// is the primary use (disabling a key WITHOUT destroying its usage history, which `DELETE` would).
+/// Admin-gated by the auth middleware (every `/admin/*` path requires the admin token). Validation
+/// is kept at create-parity: a negative budget or a zero rate cap is a 400, exactly as `create_key`
+/// rejects them — otherwise PATCH would be a back door around those guards. 404 if the key is absent.
+pub(crate) async fn update_key(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateKeyReq>,
+) -> Response {
+    let Some(gov) = &app.governance else {
+        return disabled();
+    };
+    // Create-parity validation (see create_key for the rationale on each): a negative budget is a
+    // silent over-budget DoS; a zero rate cap is a permanently-unusable key. Reject both here so PATCH
+    // cannot install a value create() forbids.
+    if let Some(budget) = req.max_budget_cents {
+        if budget < 0 {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "max_budget_cents must be >= 0"}),
+            );
+        }
+    }
+    if req.rpm_limit == Some(0) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "rpm_limit must be >= 1 (omit the field to leave unchanged)"}),
+        );
+    }
+    if req.tpm_limit == Some(0) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "tpm_limit must be >= 1 (omit the field to leave unchanged)"}),
+        );
+    }
+    let gov = gov.clone();
+    let (enabled, rpm, tpm, budget) = (
+        req.enabled,
+        req.rpm_limit,
+        req.tpm_limit,
+        req.max_budget_cents,
+    );
+    let res =
+        tokio::task::spawn_blocking(move || gov.update_key(&id, enabled, rpm, tpm, budget)).await;
+    match res {
+        Ok(Ok(Some(key))) => json_response(StatusCode::OK, key_meta(&key)),
+        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
+        Ok(Err(e)) => internal_error("update_key", &e),
+        Err(e) => join_error("update_key", &e),
+    }
+}
+
 /// GET /admin/keys — list key metadata (no secrets/hashes).
 pub(crate) async fn list_keys(State(app): State<Arc<App>>) -> Response {
     let Some(gov) = &app.governance else {
@@ -481,6 +548,81 @@ mod tests {
             body["max_budget_cents"].is_null(),
             "omitted budget is unlimited (null)"
         );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_patch_key_enables_disables_and_validates_at_create_parity() {
+        // #28: PATCH /admin/keys/:id can disable a key (without DELETE destroying its history) and
+        // adjust caps; it is admin-gated and rejects the same invalid values create() does.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}/admin/keys");
+
+        // Create a key to operate on.
+        let created: serde_json::Value = client
+            .post(&base)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "k"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        let key_url = format!("{base}/{id}");
+
+        // Admin gate: PATCH without the admin token is rejected by the middleware (not 200).
+        let no_tok = client
+            .patch(&key_url)
+            .json(&serde_json::json!({"enabled": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(no_tok.status().as_u16(), 200, "PATCH must be admin-gated");
+
+        // Disable the key → 200, enabled=false.
+        let disabled = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"enabled": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled.status().as_u16(), 200);
+        let body: serde_json::Value = disabled.json().await.unwrap();
+        assert_eq!(body["enabled"], false, "key is disabled: {body}");
+
+        // Create-parity validation: negative budget and zero rate caps are 400 via PATCH too.
+        for bad in [
+            serde_json::json!({"max_budget_cents": -1}),
+            serde_json::json!({"rpm_limit": 0}),
+            serde_json::json!({"tpm_limit": 0}),
+        ] {
+            let r = client
+                .patch(&key_url)
+                .header("x-admin-token", "admintok")
+                .json(&bad)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 400, "PATCH must reject {bad} with 400");
+        }
+
+        // PATCH a non-existent key → 404.
+        let missing = client
+            .patch(format!("{base}/vk_nope"))
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"enabled": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
 
         handle.abort();
     }

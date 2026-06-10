@@ -227,6 +227,42 @@ impl GovState {
         self.refresh()
     }
 
+    /// Apply a partial update to an existing key: enable/disable it, or adjust its rate/budget caps.
+    /// Only the `Some(_)` fields change; `key_hash`/`name`/`allowed_pools`/`budget_period`/`created_at`
+    /// are preserved (the secret is never re-minted). Returns `Ok(None)` when the key does not exist
+    /// (so the caller can 404), `Ok(Some(updated_metadata))` otherwise. Validation (non-negative
+    /// budget, non-zero rate caps) is the caller's responsibility, mirroring `create_key`'s ingress.
+    pub(crate) fn update_key(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+        rpm_limit: Option<u32>,
+        tpm_limit: Option<u32>,
+        max_budget_cents: Option<i64>,
+    ) -> StoreResult<Option<VirtualKey>> {
+        let Some(mut key) = self.store.get_key(id)? else {
+            return Ok(None);
+        };
+        if let Some(e) = enabled {
+            key.enabled = e;
+        }
+        if let Some(r) = rpm_limit {
+            key.rpm_limit = Some(r);
+        }
+        if let Some(t) = tpm_limit {
+            key.tpm_limit = Some(t);
+        }
+        if let Some(b) = max_budget_cents {
+            key.max_budget_cents = Some(b);
+        }
+        // `put_key` UPSERTs on the PRIMARY KEY `id` with identical `key_hash`, so this is an in-place
+        // update of the existing row (no secret rotation). Refresh the in-memory cache so the change
+        // takes effect on the next request.
+        self.store.put_key(&key)?;
+        self.refresh()?;
+        Ok(Some(key))
+    }
+
     /// current-window usage for a key (None if the key doesn't exist).
     pub(crate) fn usage_for(&self, id: &str, now: u64) -> StoreResult<Option<Usage>> {
         match self.store.get_key(id)? {
@@ -1406,6 +1442,55 @@ mod tests {
         assert!(key.id.starts_with("vk_"));
         // The minted key resolves by its own secret.
         assert_eq!(gov.lookup(&secret).unwrap().id, key.id);
+    }
+
+    #[test]
+    fn test_update_key_toggles_enabled_and_limits_in_place() {
+        // PATCH /admin/keys/:id (#28): a key can be disabled WITHOUT destroying it, and its caps
+        // adjusted, with the secret/hash preserved. A missing field leaves its value unchanged.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
+        let (key, secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: Some(10),
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        assert!(key.enabled, "new key starts enabled");
+        let hash = key.key_hash.clone();
+
+        // Disable it; leave the limits untouched (None).
+        let updated = gov
+            .update_key(&key.id, Some(false), None, None, None)
+            .unwrap()
+            .expect("key exists");
+        assert!(!updated.enabled, "key is now disabled");
+        assert_eq!(updated.rpm_limit, Some(10), "untouched field preserved");
+        assert_eq!(updated.key_hash, hash, "secret hash is not rotated");
+        // The disabled state is enforced on the next lookup (the cache was refreshed).
+        let looked = gov.lookup(&secret).unwrap();
+        assert!(!looked.enabled, "lookup reflects the disabled key");
+
+        // Re-enable and bump the rate cap in one call.
+        let re = gov
+            .update_key(&key.id, Some(true), Some(50), None, None)
+            .unwrap()
+            .expect("key exists");
+        assert!(re.enabled);
+        assert_eq!(re.rpm_limit, Some(50));
+
+        // Updating a non-existent key returns Ok(None) (the handler maps this to 404).
+        assert!(gov
+            .update_key("vk_does_not_exist", Some(false), None, None, None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

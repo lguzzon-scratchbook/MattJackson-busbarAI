@@ -725,7 +725,10 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         .route("/metrics", get(metrics::handler))
         // virtual-key management API (admin-token guarded in auth_middleware).
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
-        .route("/admin/keys/:id", axum::routing::delete(admin::delete_key))
+        .route(
+            "/admin/keys/:id",
+            axum::routing::delete(admin::delete_key).patch(admin::update_key),
+        )
         .route("/admin/keys/:id/usage", get(admin::key_usage))
         .route("/v1/chat/completions", post(route::openai_ingress))
         // Cohere v2 + OpenAI Responses ingress: model+stream in the body (body-model protocols).
