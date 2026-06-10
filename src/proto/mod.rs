@@ -4086,6 +4086,179 @@ mod stream_fanout_tests {
 mod stream_translate_tests {
     use super::*;
 
+    /// STRUCTURAL ROUND-TRIP MATRIX (the test class that would have caught the cohere object-shape
+    /// and openai usage bugs): for EVERY protocol, writing a canonical IR stream through that
+    /// protocol's WRITER and reading the frames back through its OWN READER must preserve the streamed
+    /// text and a terminal signal. A writer that emits a shape its own reader can't decode (the exact
+    /// cohere content-delta defect: text round-tripped to ZERO events) fails here.
+    #[test]
+    fn test_all_protocols_stream_write_read_roundtrip_preserves_text_and_terminal() {
+        let text = "Hello, world";
+        // Canonical IR stream: start → open text block → text delta → close → terminal delta → stop.
+        let events = [
+            crate::ir::IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: Some("test-model".to_string()),
+            },
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text,
+            },
+            crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta(text.to_string()),
+            },
+            crate::ir::IrStreamEvent::BlockStop { index: 0 },
+            crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: crate::ir::IrUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+            crate::ir::IrStreamEvent::MessageStop,
+        ];
+
+        for proto in [
+            Protocol::anthropic(),
+            Protocol::openai(),
+            Protocol::gemini(),
+            Protocol::bedrock(),
+            Protocol::responses(),
+            Protocol::cohere(),
+        ] {
+            let name = proto.name().to_string();
+            // WRITE: each IR event → its native (event_type, json) frame (skip events a protocol
+            // intentionally has no frame for).
+            let frames: Vec<(String, serde_json::Value)> = events
+                .iter()
+                .filter_map(|ev| proto.writer().write_response_event(ev))
+                .collect();
+            assert!(
+                !frames.is_empty(),
+                "{name}: writer produced no frames for a normal text stream"
+            );
+            // READ BACK through the SAME protocol's reader over one decode state. Bedrock's reader
+            // keys on `data["type"]`, which on the real wire the binary eventstream DECODER injects
+            // from each frame's `:event-type` header (the writer emits the type in the tuple position,
+            // not the JSON). Simulate that injection so the round-trip crosses the same boundary the
+            // production pipeline does. No-op for the SSE protocols (their frames already carry `type`
+            // or their readers ignore it); only fires when a non-empty event-type isn't already in the
+            // payload.
+            let mut state = crate::ir::StreamDecodeState::default();
+            let mut decoded: Vec<crate::ir::IrStreamEvent> = Vec::new();
+            for (et, data) in &frames {
+                let mut data = data.clone();
+                if !et.is_empty() {
+                    if let Some(obj) = data.as_object_mut() {
+                        obj.entry("type")
+                            .or_insert_with(|| serde_json::Value::String(et.clone()));
+                    }
+                }
+                decoded.extend(proto.reader().read_response_events(et, &data, &mut state));
+            }
+            // Streamed text must survive (concatenation of all decoded TextDeltas).
+            let got: String = decoded
+                .iter()
+                .filter_map(|e| match e {
+                    crate::ir::IrStreamEvent::BlockDelta {
+                        delta: crate::ir::IrDelta::TextDelta(t),
+                        ..
+                    } => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                got, text,
+                "{name}: streamed text must round-trip writer→reader; got {got:?} from {decoded:?}"
+            );
+            // A terminal signal must survive — for the 5 SSE protocols. Bedrock is EXCLUDED here:
+            // its native terminal is a TWO-frame `messageStop` (stop reason) + `metadata` (usage)
+            // split that the reader pairs into one combined MessageDelta, and the writer side of that
+            // split is driven by `StreamTranslate`'s eventstream fan-out (the `ingress_eventstream`
+            // branch), not a raw per-event `write_response_event`. That two-frame terminal round-trip
+            // is covered by the dedicated `*_egress_to_bedrock_ingress_*metadata*` tests; asserting it
+            // here would test a path the production pipeline doesn't use for bedrock.
+            if name != "bedrock" {
+                let has_terminal = decoded.iter().any(|e| {
+                    matches!(e, crate::ir::IrStreamEvent::MessageStop)
+                        || matches!(
+                            e,
+                            crate::ir::IrStreamEvent::MessageDelta {
+                                stop_reason: Some(_),
+                                ..
+                            }
+                        )
+                });
+                assert!(
+                    has_terminal,
+                    "{name}: a terminal (MessageStop / stop_reason MessageDelta) must round-trip; got {decoded:?}"
+                );
+            }
+        }
+    }
+
+    /// NON-STREAMING round-trip matrix (the class the responses `write_response` bug fell in): for
+    /// every protocol, an assistant text response written by `write_response` and read back by
+    /// `read_response` must preserve the text. A writer that emits a non-conformant body its own
+    /// reader can't decode is caught here.
+    #[test]
+    fn test_all_protocols_nonstream_write_read_roundtrip_preserves_text() {
+        let text = "Hello, world";
+        for proto in [
+            Protocol::anthropic(),
+            Protocol::openai(),
+            Protocol::gemini(),
+            Protocol::bedrock(),
+            Protocol::responses(),
+            Protocol::cohere(),
+        ] {
+            let name = proto.name().to_string();
+            let resp = crate::ir::IrResponse {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: text.to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: crate::ir::IrUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+                model: Some("test-model".to_string()),
+                id: Some("resp_x".to_string()),
+                created: Some(1_700_000_000),
+                system_fingerprint: None,
+            };
+            let body = proto.writer().write_response(&resp);
+            let back = proto.reader().read_response(&body).unwrap_or_else(|e| {
+                panic!("{name}: write_response output must read back: {e:?}\nbody: {body}")
+            });
+            let got: String = back
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    crate::ir::IrBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                got, text,
+                "{name}: non-streaming text must round-trip write_response→read_response; got {got:?}"
+            );
+        }
+    }
+
     /// The gemini JSON-array framer turns gemini SSE `data:` frames into one streaming JSON array
     /// (`[obj,obj,...]`). The concatenated output must be a syntactically valid JSON array whose
     /// elements are the per-chunk payloads, in order.
