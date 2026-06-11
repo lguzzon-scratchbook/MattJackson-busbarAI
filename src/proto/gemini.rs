@@ -1023,13 +1023,24 @@ fn empty_object_if_absent(args: Option<&serde_json::Value>) -> serde_json::Value
     }
 }
 
-/// True when a Gemini response/stream chunk carries NO `candidates` array (absent or non-array).
-/// Used to distinguish a prompt-block / error-only envelope from a normal candidate-bearing chunk.
+/// True when a Gemini response/stream chunk carries NO usable `candidates` (absent, non-array, OR an
+/// EMPTY array). Used to distinguish a prompt-block / error-only envelope from a normal
+/// candidate-bearing chunk.
+///
+/// An EMPTY `candidates: []` is treated the SAME as a missing array: a native Gemini envelope that
+/// rejects the PROMPT (e.g. `{"candidates":[],"promptFeedback":{"blockReason":"SAFETY"}}`) carries an
+/// empty candidates array alongside the top-level `promptFeedback.blockReason`. Keying only on
+/// array-PRESENCE (the old behavior) let that empty-array shape slip past the prompt-block arm in both
+/// the streaming reader and `read_response`, so the streaming path emitted a bare un-terminated stream
+/// and the non-streaming path hard-failed `candidates.is_empty()` into a spurious `ir_parse` error —
+/// dropping a legitimate content-policy block. Broadening to treat `[]` as absent routes both into the
+/// existing prompt-block / terminal arms. A genuinely empty array with NO block reason still falls
+/// through to the existing handling below those arms (unchanged).
 fn candidates_absent(data: &serde_json::Value) -> bool {
-    !data
-        .get("candidates")
-        .map(|c| c.is_array())
-        .unwrap_or(false)
+    match data.get("candidates").and_then(|c| c.as_array()) {
+        Some(arr) => arr.is_empty(),
+        None => true,
+    }
 }
 
 /// Extract a top-level `promptFeedback.blockReason` (the PROMPT-level content block signal) if the
@@ -1303,6 +1314,34 @@ impl ProtocolWriter for GeminiWriter {
             }
         }
 
+        // Cross-protocol tool-id → function-name map for `functionResponse.name` correlation.
+        //
+        // Gemini correlates a `functionResponse` to its `functionCall` strictly BY NAME — the wire
+        // format carries no call ids. On a SAME-protocol (Gemini→Gemini) turn the reader already sets
+        // each ToolResult's `tool_use_id` to the function name (Gemini's only result-side handle), so
+        // round-tripping it straight into `functionResponse.name` is correct. But on a CROSS-protocol
+        // seam (Anthropic/OpenAI ingress → Gemini egress) the IR's ToolUse blocks carry a SYNTHETIC
+        // `call_<hash>` id and the matching ToolResult's `tool_use_id` carries that SAME synthetic id
+        // — NOT the real function name. Emitting that hash as `functionResponse.name` while
+        // `functionCall.name` stays the real `get_weather` left the backend unable to correlate, so
+        // every cross-protocol→Gemini multi-turn tool call broke.
+        //
+        // Build a `tool_use_id -> function_name` map from ALL ToolUse blocks across the whole request
+        // (a later turn's result references an earlier turn's call), then resolve the real name in the
+        // ToolResult arm below, FALLING BACK to the `tool_use_id` itself when it is not in the map —
+        // which preserves the same-protocol case where `tool_use_id` already IS the function name.
+        let mut tool_name_by_id: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for msg in &req.messages {
+            for block in &msg.content {
+                if let crate::ir::IrBlock::ToolUse { id, name, .. } = block {
+                    if !id.is_empty() {
+                        tool_name_by_id.insert(id.as_str(), name.as_str());
+                    }
+                }
+            }
+        }
+
         // messages → contents (Assistant→"model", User→"user")
         let mut contents_arr: Vec<serde_json::Value> = Vec::new();
         for msg in &req.messages {
@@ -1340,11 +1379,20 @@ impl ProtocolWriter for GeminiWriter {
                         }))
                     }
                     crate::ir::IrBlock::ToolResult {
-                        tool_use_id: name,
+                        tool_use_id,
                         content,
                         is_error: _,
                     } => {
-                        // ToolResult → functionResponse{name, response}
+                        // ToolResult → functionResponse{name, response}. Resolve the REAL function
+                        // name from the cross-protocol id→name map built above so the emitted
+                        // `functionResponse.name` matches the `functionCall.name` Gemini correlates
+                        // against. Fall back to the `tool_use_id` itself when it is not a synthetic
+                        // mapped id — that preserves the same-protocol Gemini→Gemini case where
+                        // `tool_use_id` already equals the function name.
+                        let name: &str = tool_name_by_id
+                            .get(tool_use_id.as_str())
+                            .copied()
+                            .unwrap_or(tool_use_id.as_str());
                         let response_text = content
                             .iter()
                             .filter_map(|b| match b {
@@ -4957,6 +5005,185 @@ mod tests {
         assert!(
             envelope.pointer("/error/details").is_none(),
             "a non-bad-key 400 must NOT carry API_KEY_INVALID details: {envelope}"
+        );
+    }
+
+    /// HIGH/correctness regression: on a CROSS-protocol multi-turn tool call (Anthropic/OpenAI
+    /// ingress → Gemini egress) the IR's ToolUse carries a SYNTHETIC `call_<hash>` id and the matching
+    /// ToolResult's `tool_use_id` carries that SAME synthetic id — NOT the real function name. Gemini
+    /// correlates a `functionResponse` to its `functionCall` strictly BY NAME (no ids), so the emitted
+    /// `functionResponse.name` MUST equal the `functionCall.name` (`get_weather`), NOT the hash.
+    /// Before the fix the writer emitted the hash verbatim, so the backend could not correlate and
+    /// every cross-protocol→Gemini multi-turn tool call broke. The writer resolves the real name from
+    /// an id→name map built across all request messages.
+    #[test]
+    fn test_write_request_cross_protocol_function_response_name_matches_call() {
+        let writer = GeminiWriter;
+        let synthetic_id = "call_00000000deadbeef".to_string();
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![
+                // Assistant turn: the tool CALL carries a synthetic id, real name `get_weather`.
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Assistant,
+                    content: vec![crate::ir::IrBlock::ToolUse {
+                        id: synthetic_id.clone(),
+                        name: "get_weather".to_string(),
+                        input: serde_json::json!({ "city": "SF" }),
+                    }],
+                },
+                // Tool turn: the RESULT references the call by the SAME synthetic id (cross-protocol
+                // seam keeps the id, not the name).
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Tool,
+                    content: vec![crate::ir::IrBlock::ToolResult {
+                        tool_use_id: synthetic_id.clone(),
+                        content: vec![crate::ir::IrBlock::Text {
+                            text: "{\"temp\":21}".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let wire = writer.write_request(&req);
+        let call_name = wire
+            .pointer("/contents/0/parts/0/functionCall/name")
+            .and_then(|n| n.as_str());
+        let resp_name = wire
+            .pointer("/contents/1/parts/0/functionResponse/name")
+            .and_then(|n| n.as_str());
+        assert_eq!(
+            call_name,
+            Some("get_weather"),
+            "functionCall.name must be the real tool name: {wire}"
+        );
+        assert_eq!(
+            resp_name,
+            Some("get_weather"),
+            "functionResponse.name must resolve to the real function name (matching \
+             functionCall.name), NOT the synthetic call_<hash> id: {wire}"
+        );
+        assert_eq!(
+            call_name, resp_name,
+            "Gemini correlates by name: functionResponse.name MUST equal functionCall.name: {wire}"
+        );
+    }
+
+    /// Same-protocol (Gemini→Gemini) regression guard for the fix above: when the ToolResult's
+    /// `tool_use_id` is ALREADY the function name (the reader's same-protocol behavior) and there is no
+    /// matching ToolUse id in the request, the writer must FALL BACK to that name verbatim — the
+    /// id→name map lookup must not blank it out.
+    #[test]
+    fn test_write_request_same_protocol_function_response_name_falls_back_to_id() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "get_weather".to_string(),
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "{\"temp\":21}".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/functionResponse/name")
+                .and_then(|n| n.as_str()),
+            Some("get_weather"),
+            "same-protocol functionResponse.name must fall back to the tool_use_id (the name): {wire}"
+        );
+    }
+
+    /// LOW/completeness regression: a STREAMING chunk with an EMPTY `candidates: []` array (rather than
+    /// an absent array) alongside a top-level `promptFeedback.blockReason` must still route into the
+    /// prompt-block terminal arm — MessageStart, then a `safety` MessageDelta + MessageStop. Before the
+    /// fix `candidates_absent` keyed only on array-PRESENCE, so `[]` slipped past the arm and the
+    /// stream emitted a bare un-terminated frame.
+    #[test]
+    fn test_stream_empty_candidates_array_prompt_block_terminates() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [],
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
+        })]);
+        let stop_reason = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            stop_reason.as_deref(),
+            Some("safety"),
+            "an empty candidates[] + blockReason stream must surface a `safety` stop: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(IrStreamEvent::MessageStop)),
+            "the empty-candidates prompt-block stream must terminate with MessageStop: {events:?}"
+        );
+    }
+
+    /// LOW/completeness regression: a NON-STREAMING body with an EMPTY `candidates: []` array plus a
+    /// top-level `promptFeedback.blockReason` must decode to an empty-content `safety` response, NOT
+    /// hard-fail `candidates.is_empty()` into a spurious `ir_parse` error (the old behavior, since
+    /// `candidates_absent` treated `[]` as present and skipped the prompt-block arm).
+    #[test]
+    fn test_read_response_empty_candidates_array_prompt_block_is_safety_stop() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [],
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+            "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}
+        });
+        let ir = reader
+            .read_response(&body)
+            .expect("empty-candidates prompt-blocked body must decode, not error");
+        assert!(
+            ir.content.is_empty(),
+            "a blocked prompt has no content blocks, got {:?}",
+            ir.content
+        );
+        assert_eq!(
+            ir.stop_reason.as_deref(),
+            Some("safety"),
+            "an empty candidates[] + blockReason body must surface a `safety` stop_reason"
+        );
+    }
+
+    /// Guard: an EMPTY `candidates: []` with NO block reason and NO error is still a malformed
+    /// envelope and MUST hard-fail (the broadened `candidates_absent` routes it into the prompt-block
+    /// arm, which finds no reason and falls through to the existing empty-array hard-fail below).
+    #[test]
+    fn test_read_response_empty_candidates_array_without_block_still_errors() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({"candidates": [], "usageMetadata": {"promptTokenCount": 1}});
+        assert!(
+            reader.read_response(&body).is_err(),
+            "an empty candidates[] body with no block reason must still error"
         );
     }
 }

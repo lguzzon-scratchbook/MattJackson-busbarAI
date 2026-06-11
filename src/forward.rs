@@ -1481,8 +1481,22 @@ where
                     // body — drain the translate buffer (so its decode side-effects run) but discard
                     // its SSE terminator bytes, then append the framer close.
                     let done = if let Some(framer) = this.json_array.as_mut() {
+                        // Capture the TRANSLATE-side abort flag BEFORE draining its terminator: a
+                        // cross-protocol StreamTranslate that overflowed `MAX_BUF` (or hit a malformed
+                        // egress prelude) stopped feeding this framer, and its SSE terminal-error frame
+                        // cannot ride inside a JSON-array body, so the framer's own `aborted` flag stays
+                        // clear. Route the close through `finish_for_translate(translate.aborted())` so
+                        // an aborted gemini-json-array stream surfaces a NATIVE error element + `]`
+                        // instead of a bare `]` (a silent truncation indistinguishable from a short
+                        // success). Drain the translate's SSE terminator for its decode side-effects but
+                        // discard those bytes — the JSON-array terminator is the framer close.
+                        let translate_aborted = this
+                            .translate
+                            .as_ref()
+                            .map(|t| t.aborted())
+                            .unwrap_or(false);
                         let _ = this.translate.as_mut().map(|t| t.finish());
-                        framer.finish()
+                        framer.finish_for_translate(translate_aborted)
                     } else {
                         this.translate
                             .as_mut()
@@ -1511,8 +1525,16 @@ where
                     // here: a failed stream is not token-billed.
                     if let Some(sink) = this.usage_sink.take() {
                         if this.tap.terminal_error.is_none() {
-                            let tokens = this.tap.input_tokens.unwrap_or(0)
-                                + this.tap.output_tokens.unwrap_or(0);
+                            // `saturating_add`: both operands are UPSTREAM-CONTROLLED token counts
+                            // (parsed from the provider's usage block), so an unchecked `+` could panic
+                            // on overflow in debug / silently wrap in release (#18). Saturate to
+                            // `u64::MAX` — matching `record_tokens` downstream, which is itself
+                            // saturating — rather than risk a request-path panic.
+                            let tokens = this
+                                .tap
+                                .input_tokens
+                                .unwrap_or(0)
+                                .saturating_add(this.tap.output_tokens.unwrap_or(0));
                             // Attribute the token fee to the SAME window the flat per-request fee was
                             // charged in (`sink.charged_at`, the header-arrival epoch), not the
                             // stream-end clock — otherwise a stream that completes in a later window
@@ -1940,7 +1962,13 @@ fn record_nonstream_usage(upstream_body: &[u8], usage_sink: &Option<UsageSink>) 
         // uncapped whole-body parse so usage in a >512 KiB completion is NOT silently dropped by the
         // streaming-only per-poll `MAX_SCAN_BYTES` guard (which exists solely to bound poll latency).
         tap.feed_whole(upstream_body);
-        let tokens = tap.input_tokens.unwrap_or(0) + tap.output_tokens.unwrap_or(0);
+        // `saturating_add`: both operands are UPSTREAM-CONTROLLED token counts, so an unchecked `+`
+        // could panic on overflow in debug / wrap in release (#18). Saturate to `u64::MAX`, matching
+        // the streaming path and the saturating `record_tokens` downstream.
+        let tokens = tap
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(tap.output_tokens.unwrap_or(0));
         if tokens > 0 {
             // Same window as the flat per-request fee (`sink.charged_at`, header-arrival epoch), so
             // the buffered-path token fee and the per-request fee never split across windows (#29).
@@ -2787,14 +2815,24 @@ pub(crate) async fn forward_with_pool(
                             GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
-                    // Token accounting: full body read successfully and about to be translated and
-                    // delivered. No FirstByteBody on this buffered path, so tap here.
-                    record_nonstream_usage(&bytes, &usage_sink);
+                    // Token accounting deferred to the delivery seam below (#2). A 2xx body whose
+                    // usage block parses but whose content shape is unmodeled (e.g. empty `choices`,
+                    // or an unknown ingress protocol that fails `protocol_for`) does NOT reach the
+                    // `if let Some(ingress_proto)` translate+return block: it falls through to the
+                    // ingress-native 500 below, delivering NO completion. Charging here — before
+                    // translation is proven to succeed — would bill the key's TPM/spend for a
+                    // completion the client never receives, exactly the inconsistency the Truncated
+                    // and TransportError branches above deliberately avoid. So tap usage ONLY once we
+                    // are inside the block that actually mints and returns a translated response.
                     if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                         if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
                             {
+                                // Token accounting: we are now committed to translating and
+                                // delivering this body (every exit from this block is a delivered
+                                // response). No FirstByteBody on this buffered path, so tap here.
+                                record_nonstream_usage(&bytes, &usage_sink);
                                 // Cross-protocol reframe: strip the backend's NATIVE-FORMAT identity
                                 // so the ingress writer mints values in the CLIENT's format. Without
                                 // this an OpenAI backend's `chatcmpl-...` id (or its opaque
@@ -3474,12 +3512,18 @@ async fn forward_once(
                         GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
-                // Token accounting: full body read successfully and about to be delivered. No
-                // FirstByteBody on this buffered path, so tap the usage here (mirrors the main path).
-                record_nonstream_usage(&bytes, &usage_sink);
+                // Token accounting deferred to the delivery seam below (#2), mirroring the main
+                // forward path: a 2xx whose usage parses but whose content shape is unmodeled (or
+                // whose ingress protocol fails `protocol_for`) falls through to the ingress-native
+                // 500 below with NO completion delivered, so charging before translation is proven
+                // would bill the key for a body the client never receives.
                 if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                     if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
+                            // Token accounting: committed to translating and delivering this body
+                            // (every exit below is a delivered response). No FirstByteBody on this
+                            // buffered path, so tap the usage here (mirrors the main path).
+                            record_nonstream_usage(&bytes, &usage_sink);
                             // Strip the backend's native-format identity so the ingress writer mints
                             // values in the CLIENT's format (see the main path for the rationale).
                             ir.id = None;
@@ -3886,6 +3930,47 @@ mod usage_tap_tests {
             in_today, 0,
             "token fee must NOT leak into the wall-clock 'now' window (the #29 split bug)"
         );
+    }
+
+    /// REGRESSION (LOW #18, forward.rs token-sum): the buffered token-fee sum must use
+    /// `saturating_add` over the UPSTREAM-CONTROLLED `input_tokens`/`output_tokens`. A hostile/buggy
+    /// upstream that reports counts summing past `u64::MAX` would, under the old unchecked `+`, PANIC
+    /// on the request path in debug (and silently WRAP in release). With `saturating_add` the sum
+    /// clamps to `u64::MAX` and `record_nonstream_usage` returns without panicking.
+    #[test]
+    fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        // 0c/request, 0c/1k tokens → the gov spend math can't overflow, isolating the SUM under test.
+        let gov = Arc::new(GovState::new(store, 0, 0, None).expect("gov"));
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .expect("create key");
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at: 1_700_000_000,
+        });
+
+        // input_tokens + output_tokens overflows u64: u64::MAX + 5 would panic under an unchecked `+`.
+        let body = format!(
+            r#"{{"usage":{{"input_tokens":{},"output_tokens":5}}}}"#,
+            u64::MAX
+        );
+        // Must NOT panic (the assertion is reaching this line at all under a debug-overflow build).
+        record_nonstream_usage(body.as_bytes(), &sink);
     }
 
     #[test]
@@ -5180,7 +5265,7 @@ mod ingress_indistinguishability_tests {
     use super::{
         cross_protocol_error_kind, egress_accept, egress_user_agent, forward_with_pool,
         ingress_error, ingress_stream_content_type, read_capped, shape_cross_protocol_error,
-        ReadEnd,
+        ReadEnd, UsageSink,
     };
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
@@ -5555,6 +5640,107 @@ mod ingress_indistinguishability_tests {
         assert!(
             !raw.contains("fp_backend"),
             "backend system_fingerprint must not leak across protocols: {raw}"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (MED #2, forward_with_pool): a cross-protocol non-stream 2xx whose `usage` block
+    /// PARSES but whose content shape is UNMODELED (here an empty `choices` array, on which the OpenAI
+    /// reader's `read_response` returns `Err`) must NOT charge the virtual key's token budget. The body
+    /// is untranslatable, so the client receives a 500 with NO completion; billing it (the old code
+    /// called `record_nonstream_usage` BEFORE proving translation succeeds) contradicts the
+    /// charge-only-on-delivery policy the Truncated/TransportError branches already honor. Asserts the
+    /// response is the ingress-native 500 AND that the gov budget recorded ZERO spend.
+    #[tokio::test]
+    async fn test_untranslatable_2xx_does_not_charge_tokens() {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // OpenAI-shaped 2xx: a real `usage` block (so the tap WOULD count 7+3=10 tokens) but an EMPTY
+        // `choices` array — the OpenAI reader rejects this in `read_response`, so it is untranslatable.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-EMPTY",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "glm-4.5",
+                "choices": [],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Gov + a virtual key: 0c/request, 100c/1k tokens, so 10 tokens would cost 1c if (wrongly)
+        // charged. A zero post-call spend proves no token billing happened.
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .expect("create key");
+        let charged_at: u64 = 1_700_000_000;
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at,
+        });
+
+        // Lane speaks OpenAI; ingress is Anthropic → cross-protocol translation hop.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .build();
+
+        let body = serde_json::to_vec(
+            &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
+        )
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pa",
+            None,
+            "anthropic",
+            sink,
+        )
+        .await;
+
+        // The untranslatable body yields an ingress-native 500 with NO completion delivered.
+        assert_eq!(
+            resp.status().as_u16(),
+            500,
+            "an untranslatable cross-protocol 2xx must surface an ingress-native 500"
+        );
+
+        // ...and the key's token budget must be UNTOUCHED (the bug charged 10 tokens here).
+        let spend = gov
+            .usage_for(&key.id, charged_at)
+            .expect("usage read")
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            spend, 0,
+            "an undelivered (untranslatable) completion must NOT charge the token budget"
         );
         server.shutdown().await;
     }

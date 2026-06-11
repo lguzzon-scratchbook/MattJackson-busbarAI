@@ -1152,7 +1152,15 @@ impl StreamTranslate {
             // egress is binary AWS event-stream framing (Bedrock ConverseStream). The event
             // name lives in the frame's `:event-type` header, not the JSON payload; the Bedrock
             // reader keys off a `type` field, so fold the header into the payload.
-            for (event_type, payload) in crate::eventstream::drain_frames(&mut self.buf) {
+            //
+            // Use `drain_frames_checked` (not the discarding `drain_frames` wrapper) so a MALFORMED
+            // EGRESS PRELUDE — an out-of-range `total_len` / oversized `headers_len` from a corrupt or
+            // adversarial Bedrock stream — surfaces as the EXPLICIT `DrainStatus::MalformedPrelude`
+            // abort signal rather than being silently swallowed (the decoder clears the buffer and
+            // stops, which a length-only check could not tell apart from a clean full drain, so the
+            // stream would otherwise continue as if healthy and close with NO terminal exception).
+            let (frames, status) = crate::eventstream::drain_frames_checked(&mut self.buf);
+            for (event_type, payload) in frames {
                 let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&payload) else {
                     continue; // non-JSON payload — skip the frame
                 };
@@ -1164,8 +1172,13 @@ impl StreamTranslate {
                 }
                 self.translate_event(&event_type, &data, &mut out);
             }
-            if self.buf.len() > Self::MAX_BUF {
-                self.abort_overflow();
+            // A malformed prelude is unrecoverable: abandon the stream exactly like the MAX_BUF
+            // overflow path so the terminal exception frame is emitted by `finish()` (the `aborted`
+            // flag drives that branch). Without this the stream would silently truncate.
+            if status == crate::eventstream::DrainStatus::MalformedPrelude
+                || self.buf.len() > Self::MAX_BUF
+            {
+                self.abort();
             }
             return out;
         }
@@ -1225,7 +1238,7 @@ impl StreamTranslate {
             self.scanned = self.buf.len();
         }
         if self.buf.len() > Self::MAX_BUF {
-            self.abort_overflow();
+            self.abort();
         }
         out
     }
@@ -1246,8 +1259,9 @@ impl StreamTranslate {
     }
 
     /// True once this translator abandoned its stream — the reassembly buffer grew past
-    /// [`Self::MAX_BUF`] without a frame terminator (`abort_overflow`), so the happy-path terminal
-    /// events were never produced and every subsequent `feed` is a no-op.
+    /// [`Self::MAX_BUF`] without a frame terminator, or a malformed egress event-stream prelude was
+    /// hit (`abort`), so the happy-path terminal events were never produced and every subsequent
+    /// `feed` is a no-op.
     ///
     /// On the SSE-ingress path `finish()` already surfaces this abort as the ingress protocol's
     /// native in-band error frame. But on the GEMINI JSON-ARRAY ingress path the caller discards the
@@ -1258,17 +1272,21 @@ impl StreamTranslate {
     /// accessor lets that close path observe the translate-side abort and emit the framer error-close
     /// instead, mirroring the SSE-ingress terminal-error behavior in `finish()`.
     ///
-    /// Production wiring lives in `forward.rs` (the JSON-array close arm must call
-    /// `framer.finish_for_translate(translate.aborted())`); until that one-line caller change lands
-    /// this accessor is exercised only by the in-file regression test, hence `allow(dead_code)`.
-    #[allow(dead_code)]
+    /// Production wiring lives in `forward.rs`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
+    /// close arm reads `translate.aborted()` and passes it to
+    /// `framer.finish_for_translate(translate_aborted)` so an aborted gemini-json-array stream
+    /// surfaces a native error element instead of a bare close.
     pub(crate) fn aborted(&self) -> bool {
         self.aborted
     }
 
-    /// Abandon a stream whose reassembly buffer grew past [`Self::MAX_BUF`] without a frame
-    /// terminator. The buffer is released and all subsequent `feed()` calls become no-ops.
-    fn abort_overflow(&mut self) {
+    /// Abandon the stream as unrecoverable: release the reassembly buffer, set `aborted` so every
+    /// subsequent `feed()` is a no-op, and let `finish()` emit the ingress-native terminal error
+    /// frame. The two abandonment triggers are a reassembly buffer that grew past [`Self::MAX_BUF`]
+    /// without a frame terminator, and a malformed egress event-stream prelude
+    /// ([`crate::eventstream::DrainStatus::MalformedPrelude`]); both must surface an error, never a
+    /// silent truncation.
+    fn abort(&mut self) {
         self.aborted = true;
         self.buf.clear();
         self.buf.shrink_to_fit();
@@ -1576,11 +1594,9 @@ impl GeminiJsonArrayFramer {
     ///
     /// [`finish`]: Self::finish
     ///
-    /// Production wiring lives in `forward.rs` (the `Poll::Ready(None)` JSON-array close arm must call
-    /// this with `translate.aborted()` instead of discarding `translate.finish()` then calling plain
-    /// `framer.finish()`); until that caller change lands this is exercised only by the in-file
-    /// regression test, hence `allow(dead_code)`.
-    #[allow(dead_code)]
+    /// Production wiring lives in `forward.rs`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
+    /// close arm calls this with `translate.aborted()` (captured before draining the translate's SSE
+    /// terminator) instead of discarding `translate.finish()` then calling plain `framer.finish()`.
     pub(crate) fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
         if self.finished {
             return Vec::new();
@@ -4477,6 +4493,49 @@ mod stream_translate_tests {
         );
     }
 
+    /// REGRESSION (MED #6, StreamTranslate::feed egress_eventstream): a MALFORMED Bedrock EGRESS
+    /// prelude (an out-of-range `total_len`) must ABORT the stream — surfacing the ingress protocol's
+    /// native terminal error from `finish()` — not be silently swallowed. Before the wiring `feed`
+    /// used the discarding `drain_frames` wrapper, which cleared the buffer on a malformed prelude with
+    /// no distinct signal, so the stream continued as if healthy and closed with NO terminal exception
+    /// (a silent truncation a native SDK reads as a clean short completion). The fix uses
+    /// `drain_frames_checked` and aborts on `DrainStatus::MalformedPrelude`.
+    #[test]
+    fn test_egress_eventstream_malformed_prelude_aborts_and_surfaces_error() {
+        // anthropic ingress, bedrock egress → `egress_eventstream` is engaged on the feed path.
+        let mut st = StreamTranslate::new("anthropic", "bedrock").expect("translator");
+        // A malformed prelude: 12 bytes is enough to read `total_len`/`headers_len`. Declare a
+        // `total_len` far above MAX_FRAME_BYTES (out of the 16..=MAX_FRAME_BYTES range) → the decoder
+        // treats it as an unrecoverable malformed prelude and clears the buffer.
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(&u32::MAX.to_be_bytes()); // total_len = ~4 GiB (out of range)
+        malformed.extend_from_slice(&0u32.to_be_bytes()); // headers_len = 0
+        malformed.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC (unchecked by the decoder)
+        let out = st.feed(&malformed);
+        assert!(
+            out.is_empty(),
+            "a malformed prelude yields no translated frames; got {} bytes",
+            out.len()
+        );
+        assert!(
+            st.aborted(),
+            "a malformed egress prelude must abort the stream, not silently continue"
+        );
+        // Every subsequent feed is a no-op (the stream is abandoned).
+        assert!(
+            st.feed(b"anything").is_empty(),
+            "an aborted translator must ignore all further input"
+        );
+        // `finish()` must surface the ingress-native (anthropic SSE) terminal error frame — the
+        // truncation is signaled in-band, not swallowed.
+        let term = st.finish();
+        let text = String::from_utf8_lossy(&term);
+        assert!(
+            text.contains("error"),
+            "an aborted stream's finish must emit a native error event, not a bare close; got: {text}"
+        );
+    }
+
     /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for tests.
     fn es_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         let name = b":event-type";
@@ -5635,7 +5694,7 @@ mod stream_translate_tests {
         );
     }
 
-    /// MEDIUM/conformance (StreamTranslate::abort_overflow / finish for bedrock ingress): when the SSE
+    /// MEDIUM/conformance (StreamTranslate::abort / finish for bedrock ingress): when the SSE
     /// reassembly buffer overflows MAX_BUF without a frame terminator on a BEDROCK-INGRESS stream, the
     /// stream must NOT end with a bare TCP close. A real ConverseStream ALWAYS terminates with
     /// messageStop+metadata or a modeled exception frame; a bare close with neither is structurally

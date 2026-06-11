@@ -173,6 +173,32 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|t| t.as_str())
             .map(String::from);
 
+        // Make the derivation MESSAGE-AWARE, mirroring responses.rs / anthropic.rs. OpenAI (and many
+        // OpenAI-compatible backends) signal a context-length overflow with a structured
+        // `code: "context_length_exceeded"`, which the parse above captures. But some upstreams send
+        // a null/absent `code` and carry the condition only in the prose `message` — e.g.
+        // `This model's maximum context length is 8192 tokens, however you requested 9000 tokens...`.
+        // Without a message scan that body would normalize to a generic client error and PENALIZE the
+        // lane instead of triggering oversized-request failover. When no canonical code was parsed,
+        // scan the lowercased message for the context-length signal (a token/context reference paired
+        // with a too-long/exceeds/maximum phrasing) and synthesize the canonical code.
+        let provider_code = provider_code.or_else(|| {
+            let message = error_obj
+                .and_then(|e_obj| e_obj.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let names_budget = message.contains("token") || message.contains("context");
+            let signals_overflow = message.contains("too long")
+                || message.contains("exceeds")
+                || message.contains("maximum");
+            if names_budget && signals_overflow {
+                Some("context_length_exceeded".to_string())
+            } else {
+                None
+            }
+        });
+
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
             provider_code,
@@ -1279,8 +1305,19 @@ impl ProtocolWriter for OpenAiWriter {
                 }
             }
 
-            // Handle tool results (ToolRole messages)
-            if msg.role == crate::ir::IrRole::Tool {
+            // Handle tool results. Emit a flat `{"role":"tool",...}` entry for ANY message whose
+            // content carries ToolResult blocks, REGARDLESS of the message role — not only
+            // IrRole::Tool. A Gemini `functionResponse` decodes to an IrRole::User message carrying a
+            // ToolResult block (and an Anthropic tool_result lives on a User-role message too); gating
+            // this on IrRole::Tool SILENTLY DROPPED that tool result on Gemini→OpenAI / Anthropic→OpenAI
+            // (the ToolResult arm in the content loop above is a no-op, and `tool_calls` only carries
+            // ToolUse). Keying on the presence of a ToolResult block — the writer-side, source-agnostic
+            // fix — surfaces it correctly for every source protocol.
+            let has_tool_result = msg
+                .content
+                .iter()
+                .any(|b| matches!(b, crate::ir::IrBlock::ToolResult { .. }));
+            if has_tool_result {
                 let mut emitted_tool_result = false;
                 for block in &msg.content {
                     if let crate::ir::IrBlock::ToolResult {
@@ -1321,24 +1358,24 @@ impl ProtocolWriter for OpenAiWriter {
                     }
                 }
 
-                // A well-formed Tool-role message carries ONLY ToolResult blocks, each emitted above
-                // as a standalone `{"role":"tool",...}` entry; `msg_obj` is intentionally NOT added
-                // for that case. But a malformed IR Tool-role message can also carry non-ToolResult
-                // content (Text/Image projected into `content_val`, or ToolUse projected into
-                // `msg_obj["tool_calls"]`). Previously that content was silently dropped because
-                // `msg_obj` was never pushed on the Tool-role path. Surface it instead: push `msg_obj`
-                // when it carries any non-ToolResult payload (non-null `content` or a `tool_calls`
-                // array), or when the message had NO ToolResult block at all (so an otherwise-empty
-                // Tool-role message is not lost). This never duplicates a ToolResult — those are the
-                // standalone entries above and never appear in `content_val`.
+                // A well-formed tool-result message carries ONLY ToolResult blocks, each emitted
+                // above as a standalone `{"role":"tool",...}` entry; `msg_obj` is intentionally NOT
+                // added for that case. But the message can ALSO carry non-ToolResult content (Text/
+                // Image projected into `content_val`, or ToolUse projected into `msg_obj["tool_calls"]`)
+                // — e.g. a Gemini turn that pairs a functionResponse with narration text. Previously
+                // that content was silently dropped because `msg_obj` was never pushed on this path.
+                // Surface it instead: push `msg_obj` when it carries any non-ToolResult payload
+                // (non-null `content` or a `tool_calls` array), or when the message had NO ToolResult
+                // block at all (so an otherwise-empty message is not lost). This never duplicates a
+                // ToolResult — those are the standalone entries above and never appear in `content_val`.
                 let msg_has_payload = msg_obj.get("content").is_some_and(|c| !c.is_null())
                     || msg_obj.get("tool_calls").is_some();
                 if msg_has_payload || !emitted_tool_result {
                     messages_array.push(msg_obj);
                 }
             } else {
-                // Only add non-tool messages to the array directly (tool results are handled above).
-                // This is the `msg.role != Tool` branch by construction — the guard is implicit.
+                // No ToolResult content: add the message to the array directly (tool results are
+                // handled in the branch above, keyed on the presence of a ToolResult block).
                 messages_array.push(msg_obj);
             }
         }
@@ -2291,6 +2328,51 @@ mod tests {
         );
     }
 
+    /// Regression (MED #7): a Gemini `functionResponse` decodes to an IrRole::User message carrying
+    /// a ToolResult block (Anthropic tool_results live on a User-role message too). The OpenAI writer
+    /// must emit a flat `{"role":"tool",...}` entry for it — keyed on the ToolResult block, NOT on the
+    /// message role. Previously the emission was gated on IrRole::Tool, so the result was SILENTLY
+    /// DROPPED on Gemini→OpenAI / Anthropic→OpenAI. Fails against the old code (no tool message), passes
+    /// after.
+    #[test]
+    fn write_request_tool_result_on_user_message_emits_tool_message() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::ToolResult {
+                    tool_use_id: "call_42".to_string(),
+                    content: vec![text_block("the answer is 42")],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let msgs = out["messages"].as_array().expect("messages array");
+        // Exactly one flat tool-result entry; the now-empty User msg_obj (content null, no tool_calls)
+        // is NOT re-pushed, so the ToolResult is neither dropped nor duplicated.
+        assert_eq!(
+            msgs.len(),
+            1,
+            "exactly the flat tool-result entry, got {msgs:?}"
+        );
+        let tool_msg = &msgs[0];
+        assert_eq!(
+            tool_msg["role"], "tool",
+            "a ToolResult on a User-role message must become an OpenAI tool message, got {tool_msg:?}"
+        );
+        assert_eq!(tool_msg["tool_call_id"], serde_json::json!("call_42"));
+        assert_eq!(tool_msg["content"], serde_json::json!("the answer is 42"));
+    }
+
     // --- write_response: content collected once; null when no text (fix 5 regression guard)
 
     #[test]
@@ -2868,6 +2950,41 @@ mod tests {
         assert!(raw2.structured_type.is_none());
     }
 
+    /// Regression (MED #8): a context-length overflow signalled ONLY in the prose `message` with a
+    /// null `code` must still synthesize `provider_code = "context_length_exceeded"` so the breaker
+    /// pipeline triggers oversized-request failover instead of penalizing a healthy lane. Fails
+    /// against the old code, which keyed solely on the structured `code` and returned `None` here.
+    #[test]
+    fn extract_error_synthesizes_context_length_from_prose_message() {
+        let body = br#"{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000 tokens. Please reduce the length of the messages.","type":"invalid_request_error","param":"messages","code":null}}"#;
+        let raw = OpenAiReader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a prose-only maximum-context-length message must synthesize the canonical code"
+        );
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some("invalid_request_error")
+        );
+
+        // A structured code still takes precedence and is never overwritten by the message scan.
+        let body2 = br#"{"error":{"message":"too long","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let raw2 = OpenAiReader.extract_error(StatusCode::BAD_REQUEST, body2);
+        assert_eq!(
+            raw2.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+
+        // An unrelated 400 with no context-length phrasing must NOT be misclassified as oversized.
+        let body3 = br#"{"error":{"message":"invalid value for parameter temperature","type":"invalid_request_error","code":null}}"#;
+        let raw3 = OpenAiReader.extract_error(StatusCode::BAD_REQUEST, body3);
+        assert!(
+            raw3.provider_code.is_none(),
+            "a non-context-length 400 must not be tagged context_length_exceeded"
+        );
+    }
+
     // --- Round 2 fix 5: non-text system blocks are projected explicitly, not silently dropped ---
 
     #[test]
@@ -3049,8 +3166,10 @@ mod tests {
 
     #[test]
     fn write_request_assistant_tool_result_block_not_emitted_as_content() {
-        // A ToolResult sitting on a non-Tool-role message has no OpenAI content representation; it
-        // must not leak into the message content array. (Tool results travel via the tool-role path.)
+        // A ToolResult must never leak into the message *content* array on any role. Since MED #7 the
+        // ToolResult ALSO surfaces as a flat `{"role":"tool",...}` entry regardless of role (a
+        // Gemini/Anthropic tool result rides on a non-Tool message), so this asserts both: the content
+        // array carries only the text block, and a separate tool message carries the result.
         let req = crate::ir::IrRequest {
             system: Vec::new(),
             messages: vec![IrMessage {
@@ -3074,13 +3193,25 @@ mod tests {
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
-        let content = out["messages"][0]["content"]
+        let msgs = out["messages"].as_array().expect("messages array");
+        // The assistant message: its content array carries ONLY the text block, never the ToolResult.
+        let assistant = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        let content = assistant["content"]
             .as_array()
-            .expect("content array");
-        // Only the text block survives; the ToolResult is not projected into content.
+            .expect("assistant content array");
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], serde_json::json!("text"));
         assert_eq!(content[0]["text"], serde_json::json!("answer"));
+        // The ToolResult surfaces as a separate flat tool entry (MED #7), not silently dropped.
+        let tool_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("ToolResult must surface as a flat tool message");
+        assert_eq!(tool_msg["tool_call_id"], serde_json::json!("t1"));
+        assert_eq!(tool_msg["content"], serde_json::json!("ignored"));
     }
 
     #[test]

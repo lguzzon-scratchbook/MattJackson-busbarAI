@@ -904,9 +904,50 @@ impl InMemoryStore {
     /// via `reset_swrr_for(pool, cell)` AFTER this returns (the transition lock is released by then,
     /// so the shard lock is taken un-nested — no lock-order inversion against selection, which takes
     /// the shard lock with no transition lock held).
+    ///
+    /// Test-only: the production recovery path (`recover_lane`) now closes cells through
+    /// `cell_closed_if_recoverable` (which re-validates suppression under the lock — LOW #16); the only
+    /// remaining caller of this unconditional close is the `closed_state` test handle.
+    #[cfg(test)]
     fn cell_closed(c: &dyn BreakerCellAccess) {
         let _tx = lock_recover(c.transition_lock());
         Self::cell_closed_locked(c);
+    }
+
+    /// Recovery close for `recover_lane`: close a cell whose suppression the probe is entitled to
+    /// clear, re-validating UNDER the transition lock that no concurrent transition has re-armed the
+    /// cell since the probe snapshotted it. Returns true iff the cell was actually closed.
+    ///
+    /// `observed_cooldown` is the `cooldown_until` value the lock-free pre-filter read for this cell.
+    /// A successful 2xx probe is authoritative for the upstream state it OBSERVED, so it may clear the
+    /// trip/cooldown it saw — but it must NOT clobber a STRICTER suppression a peer armed in the
+    /// meantime. The race the finding (#16) calls out: between the pre-filter read and the close, a
+    /// concurrent `record_hard_down_all_cells` / `cell_record_failure` parks the cell Open with a
+    /// FRESH sticky cooldown (`now_hd + HARD_DOWN_COOLDOWN_SECS`, strictly later than anything the
+    /// probe saw). An unconditional close would drop that just-armed cooldown and recover a lane the
+    /// hard-down meant to keep suppressed.
+    ///
+    /// Discipline (mirrors `cell_record_success`'s CAS-under-lock): take the transition lock once —
+    /// the SAME lock every trip/close uses, so this serializes against them — then re-read the
+    /// cooldown. If it now extends BEYOND what the probe observed (`> observed_cooldown`), a peer
+    /// re-armed a stricter suppression after the snapshot; leave the cell untouched. Otherwise (cell
+    /// still non-Closed, OR a cooldown no later than observed) the probe's clearance still applies and
+    /// we close. A future cooldown the probe ITSELF saw (`<= observed_cooldown`) is still cleared —
+    /// that is the legitimate recovery of a tripped lane.
+    fn cell_closed_if_recoverable(c: &dyn BreakerCellAccess, observed_cooldown: u64) -> bool {
+        let _tx = lock_recover(c.transition_lock());
+        // A peer armed a stricter cooldown than the probe observed → its suppression is newer than the
+        // probe's clearance; do not clobber it.
+        if c.cooldown_until().load(Ordering::Acquire) > observed_cooldown {
+            return false;
+        }
+        // Still suppressed (tripped breaker OR the cooldown the probe saw) → the probe clears it.
+        let suppressed = c.breaker_state().load(Ordering::Acquire) != ST_CLOSED
+            || c.cooldown_until().load(Ordering::Acquire) > 0;
+        if suppressed {
+            Self::cell_closed_locked(c);
+        }
+        suppressed
     }
 
     /// `cell_closed` body, assuming the caller already holds `c.transition_lock()`. Does NOT touch
@@ -1800,22 +1841,40 @@ impl StateStore for InMemoryStore {
         // recovers EVERY cell for this lane (the default/direct-route cell and all per-pool cells),
         // clearing both a tripped (non-Closed) breaker AND a soft cooldown on a Closed cell.
         let now = Self::now_secs();
-        let suppressed = |c: &dyn BreakerCellAccess| {
-            c.breaker_state().load(Ordering::Acquire) != ST_CLOSED
-                || c.cooldown_until().load(Ordering::Acquire) > now
+        // Lock-free pre-filter: skip cells that are plainly Closed-and-cooled so we don't take the
+        // transition lock (and, on close, the SWRR shard lock) for the common already-healthy case.
+        // It returns the cooldown value it OBSERVED (`Some(observed)`) so the under-lock close can
+        // re-validate against it. This pre-read is ONLY a fast path AND the snapshot — the
+        // authoritative decision happens under the transition lock in `cell_closed_if_recoverable`,
+        // which closes the TOCTOU (#16): a concurrent hard-down can park a cell Open with a fresh
+        // sticky cooldown between this read and the close, and an unconditional close would clobber
+        // that just-armed cooldown.
+        let observe = |c: &dyn BreakerCellAccess| -> Option<u64> {
+            let cooldown = c.cooldown_until().load(Ordering::Acquire);
+            let suppressed =
+                c.breaker_state().load(Ordering::Acquire) != ST_CLOSED || cooldown > now;
+            suppressed.then_some(cooldown)
+        };
+        // Close a cell only if it both passed the pre-filter and survives the under-lock re-validation
+        // against the cooldown the pre-filter observed. Returns whether the close actually happened so
+        // the caller can gate the SWRR reset on a real close — a cell a peer re-armed mid-race is left
+        // suppressed and must NOT have its accumulator zeroed.
+        let close = |c: &dyn BreakerCellAccess| -> bool {
+            match observe(c) {
+                Some(observed) => Self::cell_closed_if_recoverable(c, observed),
+                None => false,
+            }
         };
         let ls = self.get_lane(lane);
-        if suppressed(ls.as_ref()) {
-            Self::cell_closed(ls.as_ref());
-            // Reset the recovered cell's SWRR accumulator under its pool's shard lock. The default
-            // cell belongs to the no-pool ("") set. Done after `cell_closed` returns (transition
-            // lock released), so the shard lock is taken un-nested — see `reset_swrr_for`.
+        // The default cell belongs to the no-pool ("") set. The SWRR reset runs after the close
+        // returns (transition lock released), so the shard lock is taken un-nested — see
+        // `reset_swrr_for`.
+        if close(ls.as_ref()) {
             self.reset_swrr_for("", ls.as_ref());
         }
         let cells = read_recover(&self.pool_cells);
         for (pool_name, cell) in cells.get(&lane).into_iter().flatten() {
-            if suppressed(cell.as_ref()) {
-                Self::cell_closed(cell.as_ref());
+            if close(cell.as_ref()) {
                 // Each per-pool cell's SWRR reset runs under ITS pool's shard lock (the map key is
                 // the pool name), serializing against that pool's selections.
                 self.reset_swrr_for(pool_name, cell.as_ref());
@@ -1998,6 +2057,27 @@ impl InMemoryStore {
         window.push(now_time, false);
 
         ls.ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drive the recovery-close gate (`cell_closed_if_recoverable`) directly against a named cell with
+    /// an EXPLICIT `observed_cooldown`. This lets a regression test reproduce the #16 TOCTOU
+    /// deterministically: pass the (smaller) cooldown a probe would have observed, after a concurrent
+    /// hard-down has already re-armed the live cell to a stricter cooldown — exactly the interleaving
+    /// where the old unconditional close clobbered the hard-down. Returns whether the cell was closed.
+    pub(crate) fn recover_close_if_recoverable(
+        &self,
+        pool: &str,
+        lane: usize,
+        observed: u64,
+    ) -> bool {
+        Self::cell_closed_if_recoverable(self.cell(pool, lane).as_ref(), observed)
+    }
+
+    /// Read a cell's raw `cooldown_until` (no `now` subtraction), for race-regression assertions.
+    pub(crate) fn cell_cooldown_until(&self, pool: &str, lane: usize) -> u64 {
+        self.cell(pool, lane)
+            .cooldown_until()
+            .load(Ordering::Acquire)
     }
 }
 
@@ -2254,6 +2334,65 @@ mod tests {
         assert!(
             store.is_ready_any_cell(0, now),
             "default cell recovered (only routed cell) → ready"
+        );
+    }
+
+    /// REGRESSION (LOW #16, TOCTOU): `recover_lane`'s close must re-validate suppression UNDER the
+    /// transition lock against the cooldown the probe OBSERVED, so a concurrent hard-down that re-arms
+    /// a STRICTER sticky cooldown after the snapshot is NOT clobbered. Here a probe observed a tripped
+    /// cell with cooldown `now+600`; before the close runs, a hard-down parks the SAME cell with the
+    /// sticky `HARD_DOWN_COOLDOWN_SECS` cooldown. The old unconditional close would close the cell and
+    /// drop the hard-down (recovering a lane that must stay parked). The fix must leave the cell Open
+    /// with the hard-down's later cooldown intact.
+    #[test]
+    fn test_recover_close_does_not_clobber_concurrent_harddown() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let now = 100_000;
+        let observed = now + 600; // the (transient) cooldown a successful probe snapshotted.
+                                  // A concurrent hard-down wins the transition lock first and arms a STRICTER sticky cooldown.
+        let sticky = now + HARD_DOWN_COOLDOWN_SECS; // 100_000 + 1800, strictly later than `observed`.
+        store.force_open_in("", 0, sticky);
+        // Recovery close runs with the STALE observed cooldown (what the probe saw before the re-arm).
+        let closed = store.recover_close_if_recoverable("", 0, observed);
+        assert!(
+            !closed,
+            "a hard-down re-armed a cooldown stricter than the probe observed → recovery must NOT close"
+        );
+        assert!(
+            matches!(store.breaker_state_in("", 0), BreakerState::Open { .. }),
+            "the cell must remain Open after a clobber-suppressed recovery close"
+        );
+        assert_eq!(
+            store.cell_cooldown_until("", 0),
+            sticky,
+            "the hard-down's sticky cooldown must survive the racing recovery close intact"
+        );
+    }
+
+    /// REGRESSION (LOW #16, positive case): the under-lock re-validation must STILL recover a
+    /// legitimately tripped cell — i.e. the fix must not over-correct. A probe observes an Open cell
+    /// with a future cooldown and nothing re-arms it; the recovery close (observed == live cooldown)
+    /// must close the cell and clear the cooldown.
+    #[test]
+    fn test_recover_close_recovers_tripped_cell_when_unraced() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let now = 100_000;
+        let observed = now + 600;
+        store.force_open_in("", 0, observed);
+        // No racing transition: the probe's observed cooldown equals the live cooldown.
+        let closed = store.recover_close_if_recoverable("", 0, observed);
+        assert!(
+            closed,
+            "an unraced tripped cell whose cooldown the probe observed must be recovered"
+        );
+        assert!(
+            matches!(store.breaker_state_in("", 0), BreakerState::Closed),
+            "the recovered cell must be Closed"
+        );
+        assert_eq!(
+            store.cell_cooldown_until("", 0),
+            0,
+            "recovery must clear the observed cooldown"
         );
     }
 

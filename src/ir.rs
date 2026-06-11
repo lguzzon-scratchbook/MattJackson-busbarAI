@@ -51,12 +51,19 @@ pub(crate) struct IrRequest {
 /// array keeps its string elements (non-string elements are skipped — a malformed entry should not
 /// abort the whole request), and absent/`null`/any other type yields an empty vec (== omitted). Used
 /// by every reader so the cross-protocol seam carries stops uniformly.
+///
+/// Empty-string elements are dropped in both arms: an empty stop sequence is meaningless (no protocol
+/// matches on it) and would otherwise leave a one-element vec that defeats the "empty `Vec` ==
+/// omitted" contract — a degenerate input of `""` or `[""]` collapses to an empty vec (== omitted)
+/// rather than emitting a spurious `stop: [""]` on translation.
 pub(crate) fn read_stop_sequences(val: Option<&Value>) -> Vec<String> {
     match val {
-        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
         Some(Value::Array(arr)) => arr
             .iter()
-            .filter_map(|v| v.as_str().map(String::from))
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
             .collect(),
         _ => Vec::new(),
     }
@@ -310,6 +317,42 @@ mod tests {
                 assert_eq!(a == b, i == j, "role eq mismatch at ({i},{j})");
             }
         }
+    }
+
+    #[test]
+    fn test_read_stop_sequences_drops_empty_strings() {
+        // "Empty Vec == omitted" contract: a degenerate input that carries only empty stop
+        // sequences must collapse to an empty Vec, not a one-element vec holding "", so it never
+        // emits a spurious `stop: [""]` on cross-protocol translation.
+        let bare_empty = Value::String(String::new());
+        assert!(
+            read_stop_sequences(Some(&bare_empty)).is_empty(),
+            "bare empty string should collapse to empty Vec (== omitted)"
+        );
+
+        let arr_empty = Value::Array(vec![Value::String(String::new())]);
+        assert!(
+            read_stop_sequences(Some(&arr_empty)).is_empty(),
+            "[\"\"] should collapse to empty Vec (== omitted)"
+        );
+
+        // Empty elements are dropped from a mixed array while real stops survive in order.
+        let mixed = Value::Array(vec![
+            Value::String("STOP".into()),
+            Value::String(String::new()),
+            Value::Null,
+            Value::String("END".into()),
+        ]);
+        assert_eq!(
+            read_stop_sequences(Some(&mixed)),
+            vec!["STOP".to_string(), "END".to_string()],
+            "empty/non-string elements dropped; real stops kept in order"
+        );
+
+        // Non-empty inputs are unaffected.
+        let bare = Value::String("HALT".into());
+        assert_eq!(read_stop_sequences(Some(&bare)), vec!["HALT".to_string()]);
+        assert!(read_stop_sequences(None).is_empty());
     }
 
     #[test]

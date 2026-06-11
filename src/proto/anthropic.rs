@@ -839,11 +839,27 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                 })
             }
         }
-        _ => Err(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
-            retry_after: None,
-        }),
+        // Forward-compatibility: a valid native Anthropic content-block type the IR does not model
+        // (e.g. `document`, `redacted_thinking`, or a future type Anthropic adds after this build).
+        // These appear in legitimate Messages API requests, so the prior `_ => Err(ClientError)`
+        // catch-all turned an otherwise-valid request into a 400. Mirror the OpenAI reader's
+        // unmodeled-part handling (see `read_openai_block`): degrade gracefully to an empty Text
+        // block — preserving the block's position in the turn without injecting foreign data —
+        // rather than failing the whole request. This is a content-shape match, not a
+        // disposition/breaker match, so a NAMED graceful-degradation arm (binding `other`) is
+        // correct here, and there is no `_ =>` swallowing a real disposition.
+        other => {
+            tracing::warn!(
+                block_type = other,
+                "skipping unmodeled anthropic content-block type during ir parse; degrading to an \
+                 empty text block rather than 400ing a legitimate request"
+            );
+            Ok(crate::ir::IrBlock::Text {
+                text: String::new(),
+                cache_control: None,
+                citations: Vec::new(),
+            })
+        }
     }
 }
 
@@ -2719,6 +2735,41 @@ mod anthropic_hardening_tests {
             }
             other => panic!("expected IrBlock::Image, got {other:?}"),
         }
+    }
+
+    /// R23 #9 (completeness): a valid native Anthropic content-block type the IR does not model
+    /// (e.g. `document`) must NOT hard-error the whole request with a ClientError 400. Mirroring the
+    /// OpenAI reader, `read_block` now degrades an unmodeled block to an empty Text block, preserving
+    /// the turn. Against the old `_ => Err(ClientError)` catch-all this asserted `Err`, so this test
+    /// fails on old code and passes after the named graceful-degradation arm.
+    #[test]
+    fn read_block_unmodeled_document_type_degrades_not_400() {
+        let block_json = serde_json::json!({
+            "type": "document",
+            "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBERi0=" }
+        });
+        let ir = read_block(&block_json)
+            .expect("unmodeled native block (document) must degrade, not 400 a valid request");
+        match ir {
+            crate::ir::IrBlock::Text {
+                text,
+                cache_control,
+                citations,
+            } => {
+                assert_eq!(text, "", "unmodeled block degrades to an empty text block");
+                assert!(cache_control.is_none());
+                assert!(citations.is_empty());
+            }
+            other => panic!("expected graceful IrBlock::Text degradation, got {other:?}"),
+        }
+
+        // A `redacted_thinking` block (another valid native type the IR does not model) must
+        // likewise degrade rather than 400.
+        let redacted = serde_json::json!({ "type": "redacted_thinking", "data": "abc123" });
+        assert!(
+            matches!(read_block(&redacted), Ok(crate::ir::IrBlock::Text { .. })),
+            "redacted_thinking must degrade gracefully, not hard-error"
+        );
     }
 
     /// R19 #10/#26 (synth id uniformity): `synth_id_with_prefix` must draw each base62 character

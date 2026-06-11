@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
+use std::fmt;
 use std::sync::Arc;
 
 use axum::{
@@ -70,11 +71,43 @@ impl AuthMode {
 #[derive(Clone, Default)]
 pub(crate) struct CallerToken(pub(crate) Option<String>);
 
+// MANUAL Debug that NEVER prints the token contents. `CallerToken` wraps a caller credential and is
+// threaded into request extensions, so it can be reached by any future code that debug-formats the
+// extension map (or a struct that holds it). A derived `Debug` would print the plaintext token — a
+// latent credential leak the moment anything debug-logs it. Redact to presence only ("present" /
+// "absent"); never the length and never the value, since even the length is a (small) oracle.
+impl fmt::Debug for CallerToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CallerToken")
+            .field(&if self.0.is_some() {
+                "<present>"
+            } else {
+                "<absent>"
+            })
+            .finish()
+    }
+}
+
 /// AuthMiddleware holds the resolved auth mode and token allowlist.
-#[derive(Debug)]
 pub(crate) struct AuthMiddleware {
     pub(crate) mode: AuthMode,
     pub(crate) client_tokens: Vec<String>,
+}
+
+// MANUAL Debug that REDACTS the allowlist. A derived `Debug` would print every entry of
+// `client_tokens` in PLAINTEXT — a latent credential leak if an `AuthMiddleware` (or any struct that
+// holds one, e.g. `App`) is ever debug-logged. Print only the COUNT of configured tokens, never the
+// values (and never any prefix/suffix, which would be a partial-secret oracle).
+impl fmt::Debug for AuthMiddleware {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthMiddleware")
+            .field("mode", &self.mode)
+            .field(
+                "client_tokens",
+                &format_args!("<redacted; {} configured>", self.client_tokens.len()),
+            )
+            .finish()
+    }
 }
 
 impl AuthMiddleware {
@@ -2479,5 +2512,64 @@ mod tests {
 
         handle.abort();
         server.shutdown().await;
+    }
+
+    #[test]
+    fn test_auth_middleware_debug_redacts_tokens() {
+        // Regression (SECURITY LOW #22): `AuthMiddleware` previously DERIVED `Debug`, which prints
+        // every `client_tokens` entry in PLAINTEXT — a latent credential leak if it (or `App`) is
+        // ever debug-logged. The manual `Debug` must redact the values, exposing only the count.
+        let secret_a = "sk-super-secret-token-AAAA";
+        let secret_b = "sk-super-secret-token-BBBB";
+        let cfg = AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec![secret_a.to_string(), secret_b.to_string()],
+            _legacy_token: None,
+        };
+        let mw = AuthMiddleware::new(&cfg);
+        let dbg = format!("{mw:?}");
+        // No token value (nor any non-trivial prefix of one) may appear in the Debug output.
+        assert!(
+            !dbg.contains(secret_a) && !dbg.contains(secret_b),
+            "AuthMiddleware Debug leaked a token value: {dbg}"
+        );
+        assert!(
+            !dbg.contains("sk-super-secret"),
+            "AuthMiddleware Debug leaked a token prefix: {dbg}"
+        );
+        // The count (and the mode) are non-secret and SHOULD be reported.
+        assert!(
+            dbg.contains('2'),
+            "AuthMiddleware Debug should report the token count: {dbg}"
+        );
+        assert!(
+            dbg.contains("Token"),
+            "AuthMiddleware Debug should report the mode: {dbg}"
+        );
+    }
+
+    #[test]
+    fn test_caller_token_debug_redacts_value() {
+        // `CallerToken` wraps a caller credential threaded into request extensions. Its manual
+        // `Debug` must never print the token value (a derived `Debug` would). Present vs. absent is
+        // reported; the secret itself is not.
+        let secret = "sk-caller-secret-CCCC";
+        let present = CallerToken(Some(secret.to_string()));
+        let dbg = format!("{present:?}");
+        assert!(
+            !dbg.contains(secret) && !dbg.contains("sk-caller"),
+            "CallerToken Debug leaked the token value: {dbg}"
+        );
+        assert!(
+            dbg.contains("present"),
+            "CallerToken Debug should report presence: {dbg}"
+        );
+
+        let absent = CallerToken(None);
+        let dbg_absent = format!("{absent:?}");
+        assert!(
+            dbg_absent.contains("absent"),
+            "CallerToken Debug should report absence: {dbg_absent}"
+        );
     }
 }

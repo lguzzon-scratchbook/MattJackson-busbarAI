@@ -498,7 +498,16 @@ impl ProtocolReader for BedrockReader {
         // `AnthropicReader::extract_error`: scan the raw body for the context-length phrasing and
         // override `provider_code` so the breaker (breaker.rs `code == "context_length_exceeded"`)
         // maps it to `StatusClass::ContextLength`. Keep this in sync with the `classify` helper below.
-        let provider_code = {
+        //
+        // GATE THE SCAN ON A 400. Bedrock ONLY emits an oversized-context error as a `400
+        // ValidationException` — never as a 5xx. The raw body-text scan, left ungated, would also
+        // fire on a 5xx whose body merely happened to echo the phrasing (e.g. an upstream
+        // server-error envelope quoting the request, or a proxied error message), misclassifying a
+        // genuine ServerError as ContextLength and triggering a no-penalty failover that masks an
+        // unhealthy lane. Confining the override to `status == 400` means a 5xx can never trip it
+        // (the structured ServerError path is preserved), while every real Bedrock context-length
+        // error — which is always a 400 — is still caught.
+        let provider_code = if status == StatusCode::BAD_REQUEST {
             let lower = String::from_utf8_lossy(body).to_lowercase();
             if lower.contains("input is longer than the maximum number of tokens")
                 || (lower.contains("maximum-tokens") && lower.contains("requested"))
@@ -509,6 +518,8 @@ impl ProtocolReader for BedrockReader {
             } else {
                 provider_code
             }
+        } else {
+            provider_code
         };
 
         crate::breaker::RawUpstreamError {
@@ -527,11 +538,16 @@ impl ProtocolReader for BedrockReader {
         // Keep this set of context-length phrasings in LOCKSTEP with the production
         // `extract_error` above (R21 #17 added the third `exceeds the maximum` pattern there but
         // not here, drifting the two). All three must match identically so the test-only classifier
-        // mirrors what the breaker actually sees.
-        if lower.contains("input is longer than the maximum number of tokens")
-            || (lower.contains("maximum-tokens") && lower.contains("requested"))
-            || (lower.contains("exceeds the maximum")
-                && (lower.contains("token") || lower.contains("context")))
+        // mirrors what the breaker actually sees. The `status == 400` gate is ALSO part of that
+        // lockstep (R23 LOW #14): `extract_error` only runs the body-scan override on a 400
+        // ValidationException, so a 5xx body that happens to echo context-length phrasing must NOT
+        // be reclassified as ContextLength here either — it falls through to the ServerError arm
+        // below.
+        if status == StatusCode::BAD_REQUEST
+            && (lower.contains("input is longer than the maximum number of tokens")
+                || (lower.contains("maximum-tokens") && lower.contains("requested"))
+                || (lower.contains("exceeds the maximum")
+                    && (lower.contains("token") || lower.contains("context"))))
         {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
@@ -1239,6 +1255,23 @@ impl ProtocolReader for BedrockReader {
                         name,
                         input,
                     });
+                } else if let Some(image) = block_val.get("image") {
+                    // An assistant Converse response can carry an `image` content block (model
+                    // image output / tool-rendered image). Mirror the request-side readers
+                    // (`read_request` content loop + the `toolResult` inner loop), which both decode
+                    // `image` via `read_bedrock_image_block` — handling both `source.bytes` (base64)
+                    // and `source.s3Location` (stashed under the `image_s3` sentinel for faithful
+                    // re-emit). Without this arm the response loop silently DROPPED the image,
+                    // diverging from a direct AWS call. A block with neither source yields `None`
+                    // (no empty-bytes block injected).
+                    if let Some(block) = read_bedrock_image_block(image) {
+                        content.push(block);
+                    } else {
+                        tracing::warn!(
+                            "dropping Converse response image block with no decodable source \
+                             (neither source.bytes nor source.s3Location)"
+                        );
+                    }
                 }
             }
         }
@@ -5395,6 +5428,111 @@ mod tests {
             signal_tok.class,
             StatusClass::ContextLength,
             "classify must match the token variant of the third pattern; got {signal_tok:?}"
+        );
+    }
+
+    // --- Round 23 regression tests: audit findings --------------------------------------------
+
+    /// Regression (R23 LOW #14, context-length body-scan gate): the `extract_error` context-length
+    /// override must be GATED on a `400` — Bedrock only emits an oversized-context error as a `400
+    /// ValidationException`. A 5xx whose body merely echoes context-length phrasing (an upstream
+    /// server-error envelope quoting the request) must NOT be reclassified as
+    /// `context_length_exceeded`: that would trigger a no-penalty failover masking an unhealthy
+    /// lane. The 5xx must keep its structured signal so the breaker maps it to ServerError.
+    #[test]
+    fn test_extract_error_5xx_context_phrasing_not_reclassified() {
+        let reader = BedrockReader;
+        // A 5xx whose body happens to contain the canonical context-length phrasing.
+        let body = br#"{"__type":"InternalServerException","message":"Input is longer than the maximum number of tokens allowed (200000) for this model."}"#;
+
+        let raw = reader.extract_error(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_ne!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 5xx body must NEVER be reclassified as context_length_exceeded; got {raw:?}"
+        );
+        assert_eq!(
+            raw.http_status, 500,
+            "the 5xx status must be preserved; got {raw:?}"
+        );
+
+        // Sanity: the SAME phrasing on a real 400 ValidationException IS still recognized (the gate
+        // does not break the legitimate path).
+        let raw_400 = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw_400.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 400 with context-length phrasing must still surface the canonical code; got {raw_400:?}"
+        );
+
+        // The test-only `classify` helper must agree (lockstep): a 5xx with the phrasing classifies
+        // as ServerError, not ContextLength.
+        let signal = reader.classify(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(
+            signal.class,
+            StatusClass::ServerError,
+            "classify must map a 5xx context-phrasing body to ServerError, in lockstep with \
+             extract_error; got {signal:?}"
+        );
+    }
+
+    /// Regression (R23 LOW #15, response image completeness): the `read_response` content loop must
+    /// carry an `image` block from a Converse response into the IR — the request-side readers
+    /// already decode `image` via `read_bedrock_image_block`, but the response loop silently DROPPED
+    /// it. A base64 `source.bytes` image in the assistant message must surface as an
+    /// `IrBlock::Image`, and an `source.s3Location` image must surface under the `image_s3` sentinel.
+    #[test]
+    fn test_read_response_carries_image_block() {
+        let reader = BedrockReader;
+
+        // base64 source.bytes image in the response message content.
+        let body = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "here is the chart"},
+                        {"image": {"format": "png", "source": {"bytes": "AAAA"}}}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 2}
+        });
+        let ir = reader.read_response(&body).expect("read_response");
+        let img = ir.content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::Image { media_type, data } => Some((media_type, data)),
+            _ => None,
+        });
+        assert_eq!(
+            img,
+            Some((&"image/png".to_string(), &"AAAA".to_string())),
+            "a base64 response image must be carried into IR as an Image block; got {:?}",
+            ir.content
+        );
+
+        // s3Location source: surfaces under the image_s3 sentinel (stashed for faithful re-emit).
+        let body_s3 = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"image": {"format": "jpeg", "source": {"s3Location": {"uri": "s3://b/k"}}}}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 2}
+        });
+        let ir_s3 = reader.read_response(&body_s3).expect("read_response s3");
+        let has_s3 = ir_s3.content.iter().any(|b| {
+            matches!(b, crate::ir::IrBlock::Image { media_type, .. } if media_type == IMAGE_S3_SENTINEL)
+        });
+        assert!(
+            has_s3,
+            "an s3Location response image must be carried into IR under the image_s3 sentinel; \
+             got {:?}",
+            ir_s3.content
         );
     }
 }

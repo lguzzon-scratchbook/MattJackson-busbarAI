@@ -888,6 +888,40 @@ impl ProtocolReader for ResponsesReader {
             }
 
             "response.completed" | "response.failed" | "response.incomplete" => {
+                // A terminal event ends the message. Any content block still open at this point
+                // (a tool index tracked as a raw `idx`, or a text index tracked under
+                // `TEXT_INDEX_KEY_OFFSET`) was opened with a BlockStart but never received its
+                // matching `output_item.done`/`content_part.done` — e.g. the upstream cut the
+                // stream off mid-block, or a `failed`/`incomplete` arrives while content is still
+                // streaming. Pushing MessageStop without closing them emits an unbalanced
+                // BlockStart-without-BlockStop, which a strict SDK reassembling the stream rejects.
+                // Drain `open_tools` and emit a BlockStop for every still-open index BEFORE the
+                // MessageStop, converting text keys (>= TEXT_INDEX_KEY_OFFSET) back to their IR
+                // index. This closure is invoked in EVERY terminal sub-path (incl. the failed
+                // early-return) right before the MessageStop is pushed.
+                let close_open_blocks =
+                    |out: &mut Vec<IrStreamEvent>, state: &mut crate::ir::StreamDecodeState| {
+                        // Drain into a sorted Vec first: closing in ascending IR-index order keeps
+                        // the emitted BlockStop sequence deterministic regardless of insertion order
+                        // (text and tool keys interleave under the offset scheme).
+                        let mut indices: Vec<usize> = state
+                            .open_tools
+                            .iter()
+                            .map(|&key| {
+                                if key >= TEXT_INDEX_KEY_OFFSET {
+                                    key - TEXT_INDEX_KEY_OFFSET
+                                } else {
+                                    key
+                                }
+                            })
+                            .collect();
+                        state.open_tools.clear();
+                        indices.sort_unstable();
+                        for index in indices {
+                            out.push(IrStreamEvent::BlockStop { index });
+                        }
+                    };
+
                 if let Some(response_obj) = data.get("response") {
                     let status = response_obj
                         .get("status")
@@ -917,6 +951,7 @@ impl ProtocolReader for ResponsesReader {
                             provider_signal,
                             retry_after: None,
                         }));
+                        close_open_blocks(&mut out, state);
                         out.push(IrStreamEvent::MessageStop);
                         return out;
                     }
@@ -973,6 +1008,10 @@ impl ProtocolReader for ResponsesReader {
                             cache_read_input_tokens: None,
                         });
 
+                    // Close any still-open content blocks BEFORE the MessageDelta so the emitted
+                    // order is BlockStop* → MessageDelta → MessageStop, mirroring Anthropic's
+                    // content_block_stop-before-message_delta sequencing.
+                    close_open_blocks(&mut out, state);
                     out.push(IrStreamEvent::MessageDelta {
                         stop_reason,
                         // Responses API has no stop_sequence analog in its stream.
@@ -992,18 +1031,35 @@ impl ProtocolReader for ResponsesReader {
                         provider_signal: Some("response_failed".to_string()),
                         retry_after: None,
                     }));
+                    close_open_blocks(&mut out, state);
                     out.push(IrStreamEvent::MessageStop);
                 } else {
                     // Terminal completed/incomplete event with no nested `response` object. We must
                     // still terminate the translated stream with a MessageDelta + MessageStop so
                     // downstream consumers do not hang waiting for the end of the message.
-                    let stop_reason = Some("end_turn".to_string());
+                    //
+                    // The wire `event_type` is the only status signal available — select the stop
+                    // reason from it rather than hardcoding end_turn. A bodyless `incomplete` is NOT
+                    // a successful end_turn: with no nested `incomplete_details.reason` to inspect
+                    // there is no specific truncation reason to surface, so emit None (mirrors the
+                    // body-present `incomplete`/no-details precedent above and the non-streaming
+                    // `read_response`). Only a `completed` event maps to end_turn. (`failed` is
+                    // handled by the branch above; this else covers `completed`/`incomplete`.)
+                    let stop_reason = match event_type {
+                        "response.completed" => Some("end_turn".to_string()),
+                        "response.incomplete" => None,
+                        // No other event_type reaches this arm (the outer match guards the set and
+                        // `response.failed` is handled above), so anything else is an unrecognized
+                        // terminal with no specific reason.
+                        _ => None,
+                    };
                     let usage = crate::ir::IrUsage {
                         input_tokens: 0,
                         output_tokens: 0,
                         cache_creation_input_tokens: None,
                         cache_read_input_tokens: None,
                     };
+                    close_open_blocks(&mut out, state);
                     out.push(IrStreamEvent::MessageDelta {
                         stop_reason,
                         stop_sequence: None,
@@ -3318,7 +3374,10 @@ mod tests {
             events4[0],
             crate::ir::IrStreamEvent::BlockStop { .. }
         ));
-        // response.completed with usage → MessageDelta + MessageStop
+        // response.completed with usage. The function_call block opened at index 1 (events2) was
+        // never closed by an `output_item.done`, so it is STILL OPEN at the terminal event. The
+        // terminal arm must close it (BlockStop{index:1}) BEFORE MessageStop so the stream stays
+        // balanced (MED #5), giving: BlockStop + MessageDelta + MessageStop.
         let completed_json = serde_json::json!({
             "response": {
                 "status": "completed",
@@ -3327,12 +3386,17 @@ mod tests {
         });
         let events5 =
             reader_read_response_events("response.completed", &completed_json, &mut state);
-        assert_eq!(events5.len(), 2);
+        assert_eq!(events5.len(), 3);
+        assert!(
+            matches!(events5[0], crate::ir::IrStreamEvent::BlockStop { index: 1 }),
+            "still-open tool block at index 1 must be closed before MessageStop, got {:?}",
+            events5[0]
+        );
         assert!(matches!(
-            events5[0],
+            events5[1],
             crate::ir::IrStreamEvent::MessageDelta { .. }
         ));
-        assert!(matches!(events5[1], crate::ir::IrStreamEvent::MessageStop));
+        assert!(matches!(events5[2], crate::ir::IrStreamEvent::MessageStop));
         // response.in_progress should not emit MessageStart again (state.started=true)
         let events6 = reader_read_response_events(
             "response.in_progress",
@@ -3490,6 +3554,175 @@ mod tests {
             reopen[0],
             crate::ir::IrStreamEvent::BlockStart { index: 1, .. }
         ));
+    }
+
+    /// Regression (MED #4): a bodyless `response.incomplete` terminal event (no nested `response`
+    /// object) must NOT decode to a successful `end_turn`. With no `incomplete_details.reason`
+    /// available there is no specific truncation reason, so the stop_reason must be None — masking
+    /// a truncation as end_turn would lie to a downstream client. Previously the else branch
+    /// hardcoded `Some("end_turn")` for every bodyless terminal regardless of event_type.
+    #[test]
+    fn test_bodyless_incomplete_is_not_end_turn() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.incomplete",
+            // No nested `response` object at all.
+            &serde_json::json!({}),
+            &mut state,
+        );
+        // Stream still terminates: MessageDelta + MessageStop.
+        let delta_stop = events
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason),
+                _ => None,
+            })
+            .expect("bodyless incomplete must still emit a MessageDelta");
+        assert_eq!(
+            *delta_stop, None,
+            "bodyless incomplete must surface stop_reason None, not a fabricated end_turn"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, crate::ir::IrStreamEvent::MessageStop)),
+            "stream must still terminate with MessageStop"
+        );
+
+        // And a bodyless `completed` still maps to end_turn (the only successful terminal).
+        let mut s2 = crate::ir::StreamDecodeState::default();
+        let completed =
+            reader_read_response_events("response.completed", &serde_json::json!({}), &mut s2);
+        let completed_reason = completed
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason),
+                _ => None,
+            })
+            .expect("bodyless completed must still emit a MessageDelta");
+        assert_eq!(
+            *completed_reason,
+            Some("end_turn".to_string()),
+            "bodyless completed must map to end_turn"
+        );
+    }
+
+    /// Regression (MED #5): a terminal event arriving while a content block is STILL OPEN must
+    /// close that block (BlockStop) before MessageStop. Otherwise the translated stream emits a
+    /// BlockStart with no matching BlockStop — an unbalanced sequence a strict SDK rejects. This
+    /// covers every terminal sub-path: bodyless completed/incomplete, body-present
+    /// completed/incomplete, the body-present `failed` early-return, and the bodyless `failed`
+    /// arm — each with an open text block AND an open tool block to prove both key kinds drain.
+    #[test]
+    fn test_terminal_closes_open_blocks_balanced() {
+        // Helper: opens a text block at index 0 and a tool block at index 1, then fires `etype`
+        // with `data`, and asserts every BlockStart in the WHOLE stream has a matching BlockStop.
+        fn assert_balanced(etype: &str, data: serde_json::Value) {
+            let mut state = crate::ir::StreamDecodeState::default();
+            let mut all: Vec<crate::ir::IrStreamEvent> = Vec::new();
+            // Open a text block at index 0.
+            all.extend(reader_read_response_events(
+                "response.output_text.delta",
+                &serde_json::json!({"output_index": 0, "delta": "partial"}),
+                &mut state,
+            ));
+            // Open a tool block at index 1.
+            all.extend(reader_read_response_events(
+                "response.output_item.added",
+                &serde_json::json!({
+                    "output_index": 1,
+                    "item": {"type": "function_call", "call_id": "c1", "name": "f"}
+                }),
+                &mut state,
+            ));
+            // Sanity: both blocks are open before the terminal event.
+            assert!(
+                state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET),
+                "{etype}: text block should be open"
+            );
+            assert!(
+                state.open_tools.contains(&1),
+                "{etype}: tool block should be open"
+            );
+            // Fire the terminal event.
+            all.extend(reader_read_response_events(etype, &data, &mut state));
+
+            // Count BlockStart vs BlockStop per index — every open index must be closed exactly
+            // once and no stray closes.
+            use std::collections::BTreeMap;
+            let mut starts: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut stops: BTreeMap<usize, usize> = BTreeMap::new();
+            for ev in &all {
+                match ev {
+                    crate::ir::IrStreamEvent::BlockStart { index, .. } => {
+                        *starts.entry(*index).or_insert(0) += 1;
+                    }
+                    crate::ir::IrStreamEvent::BlockStop { index } => {
+                        *stops.entry(*index).or_insert(0) += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                starts, stops,
+                "{etype}: BlockStart/BlockStop counts must balance per index (starts={starts:?} stops={stops:?})"
+            );
+            // Specifically index 0 (text) and index 1 (tool) were each opened once and closed once.
+            assert_eq!(
+                starts.get(&0).copied(),
+                Some(1),
+                "{etype}: text opened once"
+            );
+            assert_eq!(stops.get(&0).copied(), Some(1), "{etype}: text closed once");
+            assert_eq!(
+                starts.get(&1).copied(),
+                Some(1),
+                "{etype}: tool opened once"
+            );
+            assert_eq!(stops.get(&1).copied(), Some(1), "{etype}: tool closed once");
+            // The terminal arm must have drained the open set.
+            assert!(
+                state.open_tools.is_empty(),
+                "{etype}: open_tools must be drained after the terminal event"
+            );
+            // BlockStop for an index must precede MessageStop (a stop after the message-end is
+            // out of order). Verify the last BlockStop comes before MessageStop.
+            let msg_stop_pos = all
+                .iter()
+                .position(|e| matches!(e, crate::ir::IrStreamEvent::MessageStop))
+                .expect("must emit MessageStop");
+            let last_block_stop = all
+                .iter()
+                .rposition(|e| matches!(e, crate::ir::IrStreamEvent::BlockStop { .. }))
+                .expect("must emit BlockStop");
+            assert!(
+                last_block_stop < msg_stop_pos,
+                "{etype}: all BlockStop must precede MessageStop"
+            );
+        }
+
+        // Bodyless terminals (no nested `response`).
+        assert_balanced("response.completed", serde_json::json!({}));
+        assert_balanced("response.incomplete", serde_json::json!({}));
+        assert_balanced("response.failed", serde_json::json!({}));
+
+        // Body-present completed.
+        assert_balanced(
+            "response.completed",
+            serde_json::json!({"response": {"status": "completed"}}),
+        );
+        // Body-present incomplete (truncated mid-block).
+        assert_balanced(
+            "response.incomplete",
+            serde_json::json!({
+                "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+            }),
+        );
+        // Body-present failed (the early-return path).
+        assert_balanced(
+            "response.failed",
+            serde_json::json!({"response": {"status": "failed", "error": {"code": "server_error"}}}),
+        );
     }
 
     /// Regression: content_part.done is also a terminal-of-part signal and must close its block.

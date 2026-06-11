@@ -2517,16 +2517,10 @@ mod tests {
     async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
         let state = Arc::new(MockServerState::new());
 
-        // Mock returns 401 for both scenarios
-        // Push responses in LIFO order (last pushed comes out first)
-        // First push is for scenario A (passthrough), second push is for scenario B (token mode)
-        state.push(MockResponse::Auth {
-            status: StatusCode::UNAUTHORIZED,
-        }); // Scenario A response - consumed first
-        state.push(MockResponse::Auth {
-            status: StatusCode::UNAUTHORIZED,
-        }); // Scenario B response - consumed second
-
+        // Each scenario pushes exactly one 401 immediately before its forward() call.
+        // `next_response()` pops LIFO, but with a single queued response per forward there is
+        // no ordering hazard — the lone pushed response is the one that forward sees and
+        // consumes. (The previous two-up-front pushes leaked one response, never consumed.)
         let server = MockServer::new(state.clone()).await;
 
         // Scenario A: Passthrough mode — lane should NOT be tripped
@@ -2547,6 +2541,11 @@ mod tests {
             .pool("default", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
             .build();
+
+        // Scenario A response: pushed immediately before the forward() that consumes it.
+        state.push(MockResponse::Auth {
+            status: StatusCode::UNAUTHORIZED,
+        });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
@@ -2630,6 +2629,49 @@ mod tests {
         }
 
         server.shutdown().await;
+    }
+
+    /// Regression for R23 LOW #23: `MockServerState` is LIFO (`next_response` pops the stack),
+    /// so when multiple responses are queued up-front the LAST pushed is consumed FIRST. The old
+    /// `test_section6_...` carried an inverted comment claiming the first push is "consumed first",
+    /// which leaked one response and let scenario A accidentally consume scenario B's slot. This
+    /// test pins the actual ordering so a single push-per-consume is the only safe pattern.
+    #[tokio::test]
+    async fn test_mock_server_state_is_lifo() {
+        let state = MockServerState::new();
+        // Two distinguishable responses (different statuses).
+        state.push(MockResponse::Ok {
+            status: StatusCode::ACCEPTED, // 202 — pushed FIRST
+            body: json!({"order": "first"}),
+        });
+        state.push(MockResponse::Ok {
+            status: StatusCode::CREATED, // 201 — pushed SECOND
+            body: json!({"order": "second"}),
+        });
+
+        // LIFO: the second push (201) comes out first.
+        match state.next_response() {
+            Some(MockResponse::Ok { status, .. }) => assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "LIFO: last-pushed (201) must be consumed first"
+            ),
+            other => panic!("expected Ok(201) first, got {other:?}"),
+        }
+        // Then the first push (202).
+        match state.next_response() {
+            Some(MockResponse::Ok { status, .. }) => assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "LIFO: first-pushed (202) must be consumed second"
+            ),
+            other => panic!("expected Ok(202) second, got {other:?}"),
+        }
+        // Queue now empty.
+        assert!(
+            state.next_response().is_none(),
+            "queue must be empty after both responses consumed"
+        );
     }
 
     /// Passthrough forwards the CALLER's bearer token, not busbar's api_key.
@@ -4784,8 +4826,25 @@ mod tests {
 
     async fn openai_mock_handler(
         State(state): State<std::sync::Arc<MockServerState>>,
-        _request: Request<Body>,
+        request: Request<Body>,
     ) -> Response<Body> {
+        let (parts, body) = request.into_parts();
+
+        // Record what the backend received so tests can assert the request was forwarded
+        // intact (path/headers/body), mirroring `mock_handler`.
+        state.record_request_headers(&parts.headers);
+        if let Some(auth_header) = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+        {
+            state.record_auth_header(auth_header);
+        }
+        let body_bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .unwrap_or_default();
+        state.record_request_body(&body_bytes);
+
         let response = state.next_response().unwrap_or(MockResponse::default());
         match response {
             MockResponse::Ok { status, body } => Response::builder()
@@ -4876,6 +4935,34 @@ mod tests {
         let collected = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("hello"), "Response should contain mock body");
+
+        // Assert on what the backend actually received (same-protocol passthrough must forward
+        // the OpenAI body and the lane's api_key verbatim — the handler now records the request
+        // instead of silently dropping it).
+        let upstream_body = state
+            .get_last_request_body()
+            .expect("openai mock should have recorded the upstream request body");
+        let upstream_json: serde_json::Value =
+            serde_json::from_slice(&upstream_body).expect("upstream body must be valid JSON");
+        assert_eq!(
+            upstream_json.get("model").and_then(|m| m.as_str()),
+            Some("test-model"),
+            "backend must receive the original OpenAI body (model preserved): {}",
+            String::from_utf8_lossy(&upstream_body)
+        );
+        assert_eq!(
+            upstream_json
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "backend must receive the original messages array intact"
+        );
+        assert_eq!(
+            state.get_last_auth_header(),
+            Some("Bearer test-key".to_string()),
+            "same-protocol passthrough must forward the lane's api_key as the bearer token"
+        );
 
         server.shutdown().await;
     }

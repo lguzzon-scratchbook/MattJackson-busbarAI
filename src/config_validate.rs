@@ -215,17 +215,31 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     pool_name, member.target
                 ));
             }
-            // Check if member references a known model
-            if !model_protocols.contains_key(member.target.as_str()) {
+            // Resolve the member target. `model_protocols` only holds models whose provider
+            // resolved (the model loop above skips a model whose provider is unknown), so a bare
+            // `!model_protocols.contains_key` lumps two distinct failures under one misleading
+            // "unknown model" message: a target that names NO configured model, and a target that
+            // DOES name a configured model whose `provider` is unresolvable (already reported by the
+            // model loop). Distinguish them with the `model_names` set (every configured model name)
+            // so the operator sees the accurate diagnostic — "unknown model" only when the model is
+            // genuinely absent, and an unresolvable-provider message that points at the real fault
+            // otherwise.
+            if let Some(&protocol) = model_protocols.get(member.target.as_str()) {
+                // Collect protocol for heterogeneity check (only for fully-resolved members).
+                member_protocols.insert(protocol);
+            } else if model_names.contains(member.target.as_str()) {
+                // The model exists but its provider did not resolve (the model loop already pushed
+                // the `references unknown provider` error for it). Emit a member-level message that
+                // names the real cause rather than claiming the model is undefined.
+                errors.push(format!(
+                    "pool '{}' member '{}' references model '{}', which is defined but whose provider is unresolvable; fix that model's provider reference (the model's 'references unknown provider' error is reported separately)",
+                    pool_name, member.target, member.target
+                ));
+            } else {
                 errors.push(format!(
                     "pool '{}' references unknown model '{}'",
                     pool_name, member.target
                 ));
-            } else {
-                // Collect protocol for heterogeneity check (only for valid members)
-                if let Some(&protocol) = model_protocols.get(member.target.as_str()) {
-                    member_protocols.insert(protocol);
-                }
             }
         }
 
@@ -2483,6 +2497,93 @@ mod tests {
         assert!(
             validate(&cfg).is_ok(),
             "the supported 'session' affinity mode must validate"
+        );
+    }
+
+    #[test]
+    fn test_pool_member_model_with_unresolvable_provider_is_not_unknown_model() {
+        // A pool member that names a model which IS defined, but whose provider does not resolve,
+        // must NOT be reported as an "unknown model" (the model exists). The model loop already
+        // emits a "references unknown provider" error for the model itself; the pool-member check
+        // must emit a distinct, accurate diagnostic pointing at the unresolvable provider rather
+        // than misleadingly claiming the model is undefined.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "realprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+
+        // `definedmodel` is a real model entry, but its provider `ghostprovider` is not configured.
+        let mut models = HashMap::new();
+        models.insert("definedmodel".to_string(), make_model("ghostprovider", 10));
+
+        let mut pools = HashMap::new();
+        pools.insert(
+            "mypool".to_string(),
+            make_pool(vec![make_member("definedmodel")]),
+        );
+
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).unwrap_err_or_default(
+            "a model with an unresolvable provider must fail validation".to_string(),
+        );
+
+        // The model loop must still report the root cause on the model itself.
+        assert!(
+            errs.iter().any(|e| e.contains("definedmodel")
+                && e.contains("references unknown provider")
+                && e.contains("ghostprovider")),
+            "expected the model-level unknown-provider error; got: {errs:?}"
+        );
+
+        // The pool-member check must NOT call a DEFINED model "unknown".
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("references unknown model 'definedmodel'")),
+            "a defined model must not be reported as an unknown model; got: {errs:?}"
+        );
+
+        // It must instead emit the accurate provider-unresolvable diagnostic for the pool member.
+        assert!(
+            errs.iter().any(|e| e.contains("mypool")
+                && e.contains("definedmodel")
+                && e.contains("provider is unresolvable")),
+            "expected a pool-member 'provider is unresolvable' diagnostic; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pool_member_truly_unknown_model_still_reports_unknown_model() {
+        // Guard the other side of the distinction: a member naming a model that is NOT defined at
+        // all must still get the "references unknown model" diagnostic (not the new
+        // provider-unresolvable one).
+        let mut providers = HashMap::new();
+        providers.insert(
+            "realprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+
+        let models = HashMap::new();
+
+        let mut pools = HashMap::new();
+        pools.insert(
+            "mypool".to_string(),
+            make_pool(vec![make_member("nosuchmodel")]),
+        );
+
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg)
+            .unwrap_err_or_default("an undefined member model must fail validation".to_string());
+
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("references unknown model") && e.contains("nosuchmodel")),
+            "a genuinely undefined model must still be reported as unknown; got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("provider is unresolvable")),
+            "an undefined model must not get the provider-unresolvable message; got: {errs:?}"
         );
     }
 

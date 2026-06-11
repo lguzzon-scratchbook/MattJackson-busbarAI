@@ -36,6 +36,57 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str, proto: &str) -> 
     None
 }
 
+/// Re-enforce the virtual key's `allowed_pools` ACL against EVERY fallback pool the request could
+/// reach if the requested pool exhausts (`OnExhausted::FallbackPool`). The initial `pool_authorized`
+/// check only gates the FIRST pool; without this, a key restricted to pool A could be served by a
+/// fallback pool B (configured via A's `on_exhausted = fallback_pool:B`) it is not allowed to touch,
+/// because the fallback dispatch in `forward::handle_fallback_pool` never re-checks the key (the
+/// `gov` context is not threaded that deep — the ACL is an INGRESS concern, enforced here).
+///
+/// The fallback chain is multi-level (A→B→C: B's own `on_exhausted` may name C) and may cycle
+/// (A→B→A). We walk it with the SAME visited-pool termination guard `handle_fallback_pool` uses, so
+/// the walk always terminates, and we reject (403) the moment any reachable fallback pool is one the
+/// key may not use — mirroring the initial `pool_authorized` 403 exactly (same status/kind/body, so
+/// the denial is vendor-indistinguishable whether it trips on the initial or a fallback pool).
+///
+/// No-op when governance is off (`gov.key` is None) or the key allows all pools.
+fn fallback_pools_authorized(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+    pool: &str,
+    proto: &str,
+) -> Option<Response> {
+    let key = gov.key.as_ref()?;
+    // A key with no restriction (empty `allowed_pools`) admits every pool — nothing to walk.
+    if key.allowed_pools.is_empty() {
+        return None;
+    }
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut current = pool;
+    loop {
+        // Termination guard: a chain that cycles back to an already-walked pool (A→B→A) stops —
+        // mirrors `handle_fallback_pool`'s `visited_pools` guard so the two cannot diverge.
+        if !visited.insert(current) {
+            return None;
+        }
+        let next = match app.on_exhausted_cfgs.get(current) {
+            Some(crate::config::OnExhausted::FallbackPool(fallback)) => fallback.as_str(),
+            // `Status503` and `LeastBad` stay within `current` (no new pool name is introduced), and
+            // an unconfigured pool defaults to 503 — neither can reach a different pool, so the walk
+            // ends here. Explicit arms, no `_ =>` catch-all.
+            Some(crate::config::OnExhausted::Status503)
+            | Some(crate::config::OnExhausted::LeastBad)
+            | None => return None,
+        };
+        // Re-run the identical ACL gate against the fallback pool name before it could ever be
+        // dispatched to. A 403 here is byte-for-byte the initial-pool 403.
+        if let Some(resp) = pool_authorized(gov, next, proto) {
+            return Some(resp);
+        }
+        current = next;
+    }
+}
+
 /// Build the token-usage sink for a request: when governance is on and a virtual key resolved, the
 /// response stream charges its tapped token usage to that key's budget at completion (token-accurate
 /// accounting). `None` disables it (governance off / no key).
@@ -133,6 +184,15 @@ async fn governance_guard(
     // the request-log webhook). Passing it raw was an unbounded-cardinality DoS vector.
     let label = pool_label(app, pool);
     if let Some(resp) = pool_authorized(gov, pool, proto) {
+        return Some(finish(app, gov, proto, label, started, charged_at, resp));
+    }
+    // The initial-pool ACL passed, but the requested pool may be configured to fail over to a
+    // FALLBACK pool on exhaustion (`OnExhausted::FallbackPool`). Re-enforce the key's `allowed_pools`
+    // against every fallback pool reachable from here, so a key restricted to pool A can never be
+    // served by a fallback pool B it is not allowed to use (the fallback dispatch in
+    // `forward::handle_fallback_pool` does not — and cannot — re-check the key; the ACL is enforced
+    // at this ingress boundary). A denial is the SAME protocol-native 403 the initial check emits.
+    if let Some(resp) = fallback_pools_authorized(app, gov, pool, proto) {
         return Some(finish(app, gov, proto, label, started, charged_at, resp));
     }
     if let Some(resp) = budget_check(app, gov, proto).await {
@@ -5332,6 +5392,184 @@ mod tests {
             "bedrock 403 body __type is AccessDeniedException; got {body}"
         );
         handle.abort();
+    }
+
+    // ---- SECURITY MED #3: the allowed_pools ACL must also gate the FALLBACK pool ----
+    //
+    // A virtual key's `allowed_pools` was enforced only on the INITIAL pool. A pool configured with
+    // `on_exhausted = fallback_pool:B` would, on exhaustion, route the request to pool B inside
+    // `forward::handle_fallback_pool` — which never re-checks the key (the `gov` context is not
+    // threaded that deep). So a key allowed ONLY on pool A could be served by pool B it was never
+    // permitted to use. The fix (`fallback_pools_authorized`, wired into `governance_guard`) walks
+    // the fallback chain reachable from the requested pool and re-runs the SAME `pool_authorized`
+    // 403 gate against every fallback pool name BEFORE any dispatch.
+
+    /// REGRESSION (SECURITY MED #3): a key restricted to pool A must be DENIED (403, the same
+    /// protocol-native permission envelope as the initial-pool denial) when A is configured to fail
+    /// over to a fallback pool B the key is NOT allowed on — even though the key passes A's own ACL
+    /// and A's backend would itself answer 200. Against the pre-fix code this request reached A and
+    /// returned 200 (the fallback ACL was never checked); with the fix it is a 403 upfront, because B
+    /// is reachable from A on exhaustion and the key may not use B.
+    #[tokio::test]
+    async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        crate::metrics::init();
+
+        // Pool A's backend would succeed (200) if the request ever reached it — proving the 403 is
+        // due ONLY to the fallback-pool ACL, not to A being unreachable.
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: anthropic_ok_body(),
+        });
+        let server = MockServer::new(state).await;
+        let a_url = server.base_url();
+
+        const SECRET: &str = "sk-vk-fallback-acl";
+        let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "kfb".to_string(),
+                key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
+                name: "fb".to_string(),
+                // Allowed ONLY on pool A. Pool B (the fallback target) is NOT in the list.
+                allowed_pools: vec!["A".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        // Lane 0 → pool A (reachable mock). Lane 1 → pool B (the disallowed fallback target).
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(LaneSpec::new("A", crate::proto::Protocol::anthropic(), &a_url).provider("zai"))
+            .lane(
+                LaneSpec::new(
+                    "B",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("A", &[(0, 1)])
+            .pool("B", &[(1, 1)])
+            // A fails over to B on exhaustion — B is exactly the pool the key may NOT use.
+            .fallback_pool("B", &[(1, 1)])
+            .on_exhausted(
+                "A",
+                crate::config::OnExhausted::FallbackPool("B".to_string()),
+            )
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        // Request pool A via the named Anthropic ingress. The key is allowed on A, but A→B fallback
+        // is configured and the key is not allowed on B, so the request must be rejected upfront.
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/A/v1/messages"))
+            .bearer_auth(SECRET)
+            .body(
+                json!({"model": "A", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "key restricted to A must be denied (not served) when A falls back to disallowed pool B"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("permission_error"),
+            "fallback-pool ACL 403 carries the SAME permission_error envelope as the initial check; got {body}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// COMPLEMENT to the above: a key that IS allowed on BOTH the initial pool A and its fallback
+    /// pool B is NOT spuriously rejected — the fallback-pool ACL walk only denies pools outside the
+    /// key's `allowed_pools`. The request reaches A's backend and round-trips 200. Guards against the
+    /// fix over-rejecting legitimate fallback configurations.
+    #[tokio::test]
+    async fn test_fallback_pool_acl_allows_key_permitted_on_both_pools() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        crate::metrics::init();
+
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: anthropic_ok_body(),
+        });
+        let server = MockServer::new(state).await;
+        let a_url = server.base_url();
+
+        const SECRET: &str = "sk-vk-fallback-ok";
+        let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "kfb2".to_string(),
+                key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
+                name: "fb2".to_string(),
+                // Allowed on BOTH A and the fallback target B → no ACL rejection on either.
+                allowed_pools: vec!["A".to_string(), "B".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(LaneSpec::new("A", crate::proto::Protocol::anthropic(), &a_url).provider("zai"))
+            .lane(
+                LaneSpec::new(
+                    "B",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("A", &[(0, 1)])
+            .pool("B", &[(1, 1)])
+            .fallback_pool("B", &[(1, 1)])
+            .on_exhausted(
+                "A",
+                crate::config::OnExhausted::FallbackPool("B".to_string()),
+            )
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/A/v1/messages"))
+            .bearer_auth(SECRET)
+            .body(
+                json!({"model": "A", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "key allowed on both A and fallback B must NOT be rejected by the fallback ACL walk"
+        );
+        handle.abort();
+        server.shutdown().await;
     }
 
     // ---- MEDIUM/test-coverage: adhoc `/{provider}/{model}/v1/messages` E2E through the router ----
