@@ -189,7 +189,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
             // probes presented a 100%-error window to the error-rate breaker and tripped spuriously
             // (LOW #23). This does NOT force any breaker transition — recovery, when warranted,
             // already happened above; here we only push the outcome.
-            record_probe_success_all_cells(app, i);
+            app.store.record_probe_success_all_cells(i);
             return;
         }
         Ok(r) => {
@@ -260,37 +260,6 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
                 lane = %lane.model,
                 "health probe got a client-fault/context-length response; lane not penalized"
             );
-        }
-    }
-}
-
-/// Push a SUCCESS outcome into the sliding error-rate window of every cell lane `i` routes against —
-/// the default/direct-route cell (`""`) AND every per-pool cell the lane is a member of — mirroring
-/// the all-cells reach of the failed-probe `record_probe_failure_all_cells` and the successful-probe
-/// `recover_lane`. This is the success half of symmetric probe accounting (LOW #23): the failed-probe
-/// path feeds failures into each cell's window, so without a matching success record a lane whose
-/// probes sometimes fail and sometimes succeed would present a window containing ONLY failures, and
-/// the error-rate breaker (errors / total over the window) would read 100% error and trip a lane that
-/// is in fact mostly healthy.
-///
-/// It does NOT force a HalfOpen→Closed transition: callers invoke this only on the 2xx path AFTER
-/// `recover_lane` has already closed any suppressed cell, so no cell is HalfOpen here and the
-/// underlying `record_success_in` only pushes the outcome (its HalfOpen→Closed CAS is a no-op on an
-/// already-Closed cell). The recover-on-2xx semantics are therefore left fully intact — this only
-/// adds the previously-missing success sample.
-///
-/// The cell set is derived from `app.pools` (config pool membership keyed by lane index) plus the
-/// always-present default cell. Recording into a per-pool cell lazily materializes it Closed if it
-/// did not yet exist, which is harmless (a Closed cell is the lane default) and keeps the success and
-/// failure paths trained on the same cells real traffic is selected against.
-fn record_probe_success_all_cells(app: &Arc<App>, i: usize) {
-    // Default/direct-route cell — the `""` (no-pool) cell `named`/`adhoc` routes read.
-    app.store.record_success_in("", i);
-    // Every pool this lane is a member of, so the success dilutes the SAME per-pool error-rate
-    // windows the failed-probe path trips against (organic traffic routes on the per-pool cells).
-    for (pool_name, members) in &app.pools {
-        if members.iter().any(|m| m.idx == i) {
-            app.store.record_success_in(pool_name, i);
         }
     }
 }
@@ -574,6 +543,49 @@ mod tests {
              success + 4 errors = 5 at 0.8 error rate) and trips Open; a Closed cell here would mean \
              the success was dropped, got {:?}",
             app.store.breaker_state(0)
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (R24 LOW #17): a single SUCCESSFUL probe bumps the lane-global `ok` stat EXACTLY
+    /// ONCE — not once per cell. The lane sits in THREE pools, so the pre-fix code (which recorded the
+    /// success via a per-cell `record_success_in` loop over the default cell plus every pool) bumped
+    /// `LaneState.ok` 4 times per 2xx probe (1 default + 3 pools), inflating the public `/stats` `ok`
+    /// metric by (N+1). The R23 fix had already decoupled the SYMMETRIC failure path (one `err` bump
+    /// per probe) but the success path still multi-counted. After the fix `ok` rises by exactly 1 per
+    /// successful probe, mirroring how `record_probe_failure_all_cells` bumps `err` once. We drive 2
+    /// probes and assert `ok == 2` (the pre-fix code would read 8).
+    #[tokio::test]
+    async fn test_probe_success_bumps_lane_ok_once_not_per_cell() {
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), &server.base_url())
+                    .api_key("sk-test")
+                    .health(health_active()),
+            )
+            // Same lane fronted by three distinct pools — the per-cell success loop would bump the
+            // lane-global `ok` (1 default + 3 pools) = 4 times per probe under the old code.
+            .pool("a", &[(0, 1)])
+            .pool("b", &[(0, 1)])
+            .pool("c", &[(0, 1)])
+            .build();
+
+        for _ in 0..2 {
+            state.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: serde_json::json!({ "ok": true }),
+            });
+            probe_lane(&app, 0, Duration::from_secs(5)).await;
+        }
+
+        assert_eq!(
+            app.store.snapshot(0, now()).ok,
+            2,
+            "a successful probe must bump the lane-global `ok` exactly once (mirroring the single \
+             `err` bump on the failure path); a lane in 3 pools probed twice must read ok == 2, not \
+             ok == 8 (the pre-fix per-cell multi-count of 4 per probe)"
         );
         server.shutdown().await;
     }

@@ -8,41 +8,72 @@ use std::sync::OnceLock;
 
 /// Hard cap on the number of distinct tool-call frame indices recorded in `state.open_tools` for a
 /// single stream. The set is intentionally never shrunk (so each tool's IR block index stays stable
-/// for its lifetime — see `cohere_tool_ir_index`), which means a malicious or buggy upstream that
-/// streams an unbounded number of distinct `tool-call-start` frame indices would grow it without
-/// bound. No legitimate Cohere v2 stream approaches this many parallel tool calls; past the cap we
-/// stop recording new frames so memory stays bounded. The cap leaves every realistic stream
+/// for its lifetime — see `cohere_lookup_tool_ir_index`), which means a malicious or buggy upstream
+/// that streams an unbounded number of distinct `tool-call-start` frame indices would grow it
+/// without bound. No legitimate Cohere v2 stream approaches this many parallel tool calls; past the
+/// cap we stop recording new frames so memory stays bounded. The cap leaves every realistic stream
 /// untouched.
 const MAX_TRACKED_TOOL_FRAMES: usize = 4096;
 
 /// Reserved sentinel recorded in `state.open_tools` the first time a text content block opens on a
 /// Cohere stream. It encodes the otherwise-unrecoverable fact that "a text block has occupied IR
-/// index 0 at some point this stream", which `cohere_tool_ir_index` needs to keep tool blocks off
+/// index 0 at some point this stream", which the tool-index assignment needs to keep tool blocks off
 /// index 0 EVEN AFTER the text block has closed (`text_block_open` reverts to false on
 /// `content-end`, so that live flag cannot answer the question — see the HIGH finding this fixes).
 ///
-/// `usize::MAX` is used because real Cohere v2 streams number content/tool frames with small
-/// sequential indices (0, 1, 2, …); a frame index of `usize::MAX` can never occur in practice, so
-/// the sentinel never collides with a genuine tool frame and is trivially excluded from the
-/// rank computation below. Recording it in the existing `open_tools` set keeps the fix entirely
-/// within this protocol module (the shared `StreamDecodeState` carries no text-high-water field).
+/// `usize::MAX` is used because every genuine tool entry recorded in `open_tools` is a small
+/// bit-PACKED `(frame_idx, ir_index)` value (see `pack_tool_entry`), bounded far below `usize::MAX`
+/// by `MAX_TRACKED_TOOL_FRAMES`; a packed entry of `usize::MAX` can never occur in practice, so the
+/// sentinel never collides with a genuine tool entry and is trivially excluded from every scan
+/// below. Recording it in the existing `open_tools` set keeps the fix entirely within this protocol
+/// module (the shared `StreamDecodeState` carries no text-high-water field).
 ///
-/// The wire `index` is upstream-controlled, so a hostile/buggy backend could send exactly
-/// `usize::MAX` and collide with this sentinel — corrupting tool tracking. Every read site clamps
-/// the wire index to `MAX_TOOL_FRAME_INDEX` (well below `usize::MAX`) before use, so no real
-/// `frame_idx` can ever equal the sentinel. See `clamp_frame_index`.
+/// The wire `index` is upstream-controlled, so a hostile/buggy backend could send a huge value; the
+/// frame component of every packed entry is clamped to `MAX_TOOL_FRAME_INDEX` (see
+/// `clamp_frame_index`), so no real entry can ever reach the sentinel.
 const TEXT_BLOCK_SEEN_SENTINEL: usize = usize::MAX;
 
 /// Upper bound applied to the upstream-controlled stream-frame `index` at every tool-call read
-/// site. The wire value is attacker-controllable; an `index` of `usize::MAX` would collide with
-/// `TEXT_BLOCK_SEEN_SENTINEL` and corrupt tool tracking. Clamping to a small bounded cap (matching
-/// `MAX_TRACKED_TOOL_FRAMES`, far below the sentinel) guarantees no genuine `frame_idx` can equal
-/// the sentinel, while leaving every realistic stream (small sequential indices) untouched. Mirrors
-/// the OpenAI reader's `MAX_TOOL_INDEX` clamp.
+/// site. The wire value is attacker-controllable; clamping to a small bounded cap (matching
+/// `MAX_TRACKED_TOOL_FRAMES`) keeps the packed `(frame_idx, ir_index)` entries far below the
+/// `TEXT_BLOCK_SEEN_SENTINEL`, while leaving every realistic stream (small sequential indices)
+/// untouched. Mirrors the OpenAI reader's `MAX_TOOL_INDEX` clamp.
 const MAX_TOOL_FRAME_INDEX: u64 = MAX_TRACKED_TOOL_FRAMES as u64;
 
+/// Number of low bits each packed `open_tools` entry reserves for the assigned IR block index; the
+/// remaining high bits hold the wire `frame_idx`. Both fields are bounded well below
+/// `MAX_TRACKED_TOOL_FRAMES` (4096 < 2^13 < 2^20), so 20 bits per field cannot overflow and the
+/// largest possible packed value (`MAX_TOOL_FRAME_INDEX << 20 | mask` ≈ 2^32) stays far below the
+/// `TEXT_BLOCK_SEEN_SENTINEL` (`usize::MAX`, ≥ 2^64 on every supported target).
+const TOOL_ENTRY_IR_BITS: u32 = 20;
+
+/// Low-bit mask isolating the assigned IR index from a packed `open_tools` entry.
+const TOOL_ENTRY_IR_MASK: usize = (1usize << TOOL_ENTRY_IR_BITS) - 1;
+
+/// Pack a tool call's wire `frame_idx` and the IR block index ASSIGNED to it at `tool-call-start`
+/// into a single `usize` recorded in `state.open_tools`. The IR index lives in the low
+/// `TOOL_ENTRY_IR_BITS`; the frame index in the high bits. Storing BOTH is what makes the IR index
+/// immutable for the tool's lifetime: it is assigned once on start and looked up verbatim on
+/// delta/end (see `cohere_lookup_tool_ir_index`), so a non-monotonic upstream `frame_idx` can no
+/// longer perturb a live rank and shift a tool's index mid-lifecycle (the LOW finding this fixes).
+fn pack_tool_entry(frame_idx: usize, ir_index: usize) -> usize {
+    (frame_idx << TOOL_ENTRY_IR_BITS) | (ir_index & TOOL_ENTRY_IR_MASK)
+}
+
+/// The wire `frame_idx` component of a packed `open_tools` entry. Caller must exclude the
+/// `TEXT_BLOCK_SEEN_SENTINEL` before calling.
+fn tool_entry_frame(entry: usize) -> usize {
+    entry >> TOOL_ENTRY_IR_BITS
+}
+
+/// The assigned IR block index component of a packed `open_tools` entry. Caller must exclude the
+/// `TEXT_BLOCK_SEEN_SENTINEL` before calling.
+fn tool_entry_ir_index(entry: usize) -> usize {
+    entry & TOOL_ENTRY_IR_MASK
+}
+
 /// Read the upstream-controlled stream-frame `index`, defaulting to 0 when absent/non-numeric, and
-/// clamp it to `MAX_TOOL_FRAME_INDEX` so it can never collide with `TEXT_BLOCK_SEEN_SENTINEL`.
+/// clamp it to `MAX_TOOL_FRAME_INDEX` so the packed entry can never collide with the sentinel.
 fn clamp_frame_index(data: &serde_json::Value) -> usize {
     data.get("index")
         .and_then(|i| i.as_u64())
@@ -136,34 +167,67 @@ fn cohere_error_is_content_moderation(signal: &str) -> bool {
         || s.contains("content_filter")
 }
 
-/// Resolve the STABLE IR block index for a Cohere stream tool call identified by its wire
-/// `frame_idx`. A text content block always occupies IR index 0, so when one has appeared this
-/// stream the tool base offset is 1, otherwise 0.
-///
-/// The base must be derived from whether a text block was EVER opened, NOT from the live
-/// `text_block_open` flag: native Cohere v2 emits the text content block (content-start/delta/end)
-/// in full BEFORE the first tool-call-start, so by the time tools arrive `content-end` has already
-/// reset `text_block_open` to false. Keying the base on that live flag let the first tool reuse
-/// index 0 — the same index the now-closed text block consumed — emitting two BlockStart frames at
-/// index 0 (the HIGH finding). We therefore key the base on the `TEXT_BLOCK_SEEN_SENTINEL` recorded
-/// in `open_tools` when the text block first opened, which persists for the whole stream.
-///
-/// The per-tool offset is the rank of `frame_idx` among every tool frame seen this stream — i.e.
-/// the number of recorded REAL frame indices strictly less than it (the sentinel is excluded, both
-/// by the `< frame_idx` comparison since it is `usize::MAX` and explicitly for clarity).
-/// `state.open_tools` is populated on tool-call-start and NEVER shrunk for the stream's lifetime, so
-/// this rank is fixed once a tool starts: start, delta(s), and end for a given tool all resolve to
-/// the same IR index even though Cohere closes each tool before opening the next. (Deriving the
-/// index from a set that shrank on end was an earlier defect — it collapsed the second and later
-/// tools onto the first tool's index.)
-fn cohere_tool_ir_index(state: &crate::ir::StreamDecodeState, frame_idx: usize) -> usize {
-    let base = usize::from(state.open_tools.contains(&TEXT_BLOCK_SEEN_SENTINEL));
-    let rank = state
+/// Number of genuine tool frames currently recorded in `state.open_tools` (excludes the
+/// `TEXT_BLOCK_SEEN_SENTINEL`). `open_tools` may also carry the text sentinel, so the raw `len()` is
+/// NOT the tool count.
+fn cohere_tracked_tool_count(state: &crate::ir::StreamDecodeState) -> usize {
+    state
         .open_tools
         .iter()
-        .filter(|&&i| i != TEXT_BLOCK_SEEN_SENTINEL && i < frame_idx)
-        .count();
-    base + rank
+        .filter(|&&e| e != TEXT_BLOCK_SEEN_SENTINEL)
+        .count()
+}
+
+/// Look up the IMMUTABLE IR block index previously ASSIGNED to the tool call whose wire `frame_idx`
+/// was recorded at `tool-call-start`, or `None` if that frame was never tracked (a duplicate-free
+/// frame past the cap, or an end/delta with no matching start). The index is read verbatim from the
+/// packed `open_tools` entry — it is NOT recomputed from a live rank — so start, delta(s), and end
+/// for a given tool always resolve to the SAME IR index even when the upstream streams frame indices
+/// out of order (the LOW finding: a non-monotonic frame index used to perturb the recomputed rank
+/// and shift a tool's index mid-lifecycle).
+fn cohere_lookup_tool_ir_index(
+    state: &crate::ir::StreamDecodeState,
+    frame_idx: usize,
+) -> Option<usize> {
+    state
+        .open_tools
+        .iter()
+        .find(|&&e| e != TEXT_BLOCK_SEEN_SENTINEL && tool_entry_frame(e) == frame_idx)
+        .map(|&e| tool_entry_ir_index(e))
+}
+
+/// Record a `tool-call-start` for wire `frame_idx`, ASSIGNING it a stable IR block index, and return
+/// that index. Returns `None` (emit nothing) when the frame is a duplicate of one already open, or
+/// when the per-stream cap is reached.
+///
+/// The assigned IR index is `base + tracked_tool_count`, where `base` is 1 if a text block has ever
+/// occupied IR index 0 this stream (recorded via `TEXT_BLOCK_SEEN_SENTINEL`) else 0. Keying the base
+/// on the persistent sentinel — not the live `text_block_open` flag, which `content-end` resets to
+/// false before tools arrive — keeps tool blocks off the text block's index 0 (the HIGH finding).
+/// Keying the per-tool offset on INSERTION ORDER (the count of already-tracked tools) rather than the
+/// wire-index rank makes the assignment independent of monotonic wire indices and immutable once
+/// made: a later tool with a SMALLER wire `frame_idx` no longer retroactively shifts an earlier
+/// tool's index (the LOW finding). `state.open_tools` is never shrunk for the stream's lifetime, so a
+/// recorded entry — and the IR index packed into it — survives until the stream ends.
+fn cohere_assign_tool_ir_index(
+    state: &mut crate::ir::StreamDecodeState,
+    frame_idx: usize,
+) -> Option<usize> {
+    // Duplicate tool-call-start for a frame already open: no-op (do not re-assign or re-emit).
+    if cohere_lookup_tool_ir_index(state, frame_idx).is_some() {
+        return None;
+    }
+    let tracked = cohere_tracked_tool_count(state);
+    // New frame past the cap: not tracked, emit nothing (bounds per-stream memory).
+    if tracked >= MAX_TRACKED_TOOL_FRAMES {
+        return None;
+    }
+    let base = usize::from(state.open_tools.contains(&TEXT_BLOCK_SEEN_SENTINEL));
+    let ir_index = base + tracked;
+    state
+        .open_tools
+        .insert(pack_tool_entry(frame_idx, ir_index));
+    Some(ir_index)
 }
 
 #[derive(Clone)]
@@ -775,14 +839,17 @@ impl ProtocolReader for CohereReader {
             // silently discarded. Tool blocks occupy IR indices after any open text block.
             //
             // IR-index assignment must be STABLE for a tool's whole lifetime. Cohere v2 closes each
-            // tool (tool-call-end) BEFORE opening the next (tool-call-start), so a scheme that
-            // derived the IR index from the LIVE rank of `frame_idx` in a set that shrinks on end
-            // collapsed the second and later tools onto the first tool's index. Instead we record
-            // each frame_idx in `state.open_tools` on start and NEVER remove it, then derive the IR
-            // index from the rank of `frame_idx` among all frames ever seen (the count of recorded
-            // frame indices strictly less than it). Because Cohere assigns frame indices in
-            // increasing order, that rank is fixed once assigned regardless of earlier tools closing
-            // — so start/delta/end for a given tool all resolve to the same IR block index.
+            // tool (tool-call-end) BEFORE opening the next (tool-call-start). A scheme that derived
+            // the IR index from the LIVE rank of `frame_idx` was unstable two ways: derived from a
+            // set that shrank on end it collapsed later tools onto the first tool's index, and even
+            // from a never-shrunk set a NON-MONOTONIC upstream `frame_idx` (a later tool with a
+            // smaller wire index) retroactively shifted an earlier tool's rank between its start and
+            // its end (the LOW finding). Instead the IR index is ASSIGNED ONCE at tool-call-start by
+            // insertion order (`cohere_assign_tool_ir_index`), PACKED alongside the frame index into
+            // `state.open_tools`, and looked up VERBATIM on delta/end
+            // (`cohere_lookup_tool_ir_index`). `open_tools` is never shrunk, so the assignment
+            // survives the stream and start/delta/end for a tool all resolve to the same IR index
+            // regardless of wire-index ordering.
             "tool-call-start" => {
                 let frame_idx = clamp_frame_index(data);
                 let tc = data
@@ -800,28 +867,12 @@ impl ProtocolReader for CohereReader {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                // A DUPLICATE tool-call-start for a frame already being tracked is a no-op: the
-                // block is already open at its stable IR index, so re-emitting BlockStart would
-                // push a spurious second opening frame for the same block. Likewise, a genuinely
-                // new frame that the cap prevents us from tracking must emit NO tool block events:
-                // `cohere_tool_ir_index` would still compute an IR index for it, but that index is
-                // not backed by a tracked frame and collides with the index of the highest tracked
-                // tool (which keeps the same rank because the new frame was never recorded), and
-                // tool-call-delta / tool-call-end for the untracked frame are dropped — so its
-                // BlockStart would be orphaned. Only emit when the frame is (or becomes) tracked.
-                let tracked = if state.open_tools.contains(&frame_idx) {
-                    // Already open this stream: duplicate start, no-op (no re-emit).
-                    false
-                } else if state.open_tools.len() < MAX_TRACKED_TOOL_FRAMES {
-                    // New frame with room to track: record it and emit its block events.
-                    state.open_tools.insert(frame_idx);
-                    true
-                } else {
-                    // New frame past the cap: not tracked, emit nothing (see above).
-                    false
-                };
-                if tracked {
-                    let ir_idx = cohere_tool_ir_index(state, frame_idx);
+                // Assign (and record) the tool's immutable IR index. Returns None for a DUPLICATE
+                // start (block already open — re-emitting BlockStart would push a spurious second
+                // opening frame) or a genuinely new frame past the cap (not tracked — its
+                // delta/end would be dropped, so emitting a BlockStart now would orphan it). Only
+                // emit when the frame is freshly tracked.
+                if let Some(ir_idx) = cohere_assign_tool_ir_index(state, frame_idx) {
                     out.push(IrStreamEvent::BlockStart {
                         index: ir_idx,
                         block: crate::ir::IrBlockMeta::ToolUse { id, name },
@@ -843,13 +894,11 @@ impl ProtocolReader for CohereReader {
             "tool-call-delta" => {
                 let frame_idx = clamp_frame_index(data);
                 // Only forward deltas for a frame we actually tracked (and therefore opened a
-                // BlockStart for). A frame past MAX_TRACKED_TOOL_FRAMES was never recorded and never
-                // opened, so its `cohere_tool_ir_index` would collide with the highest tracked tool;
-                // emitting a delta there would corrupt that block's arguments. Mirrors the
-                // tool-call-end guard. The mapping is stable because `open_tools` is never shrunk
-                // for the lifetime of the stream (see tool-call-start).
-                if state.open_tools.contains(&frame_idx) {
-                    let ir_idx = cohere_tool_ir_index(state, frame_idx);
+                // BlockStart for); resolve its immutable, ASSIGNED IR index. A frame past
+                // MAX_TRACKED_TOOL_FRAMES was never recorded and `cohere_lookup_tool_ir_index`
+                // returns None, so its delta is dropped rather than corrupting another block's
+                // arguments. Mirrors the tool-call-end guard.
+                if let Some(ir_idx) = cohere_lookup_tool_ir_index(state, frame_idx) {
                     if let Some(args) = data
                         .get("delta")
                         .and_then(|d| d.get("message"))
@@ -868,11 +917,11 @@ impl ProtocolReader for CohereReader {
             }
             "tool-call-end" => {
                 let frame_idx = clamp_frame_index(data);
-                // Only close a tool we actually opened; resolve its stable IR index. We do NOT
-                // remove the frame_idx from `open_tools` — removing it would shift the rank of every
-                // later tool and collapse them onto reused indices (the defect this fix addresses).
-                if state.open_tools.contains(&frame_idx) {
-                    let ir_idx = cohere_tool_ir_index(state, frame_idx);
+                // Only close a tool we actually opened; resolve its immutable, ASSIGNED IR index. We
+                // do NOT remove the frame's entry from `open_tools` — the recorded packed entry is
+                // what keeps each tool's IR index stable for the stream's lifetime, and removing it
+                // would let a later tool reuse a freed insertion slot.
+                if let Some(ir_idx) = cohere_lookup_tool_ir_index(state, frame_idx) {
                     out.push(IrStreamEvent::BlockStop { index: ir_idx });
                 }
             }
@@ -2646,7 +2695,8 @@ mod tests {
             state
                 .open_tools
                 .iter()
-                .all(|&i| i <= MAX_TOOL_FRAME_INDEX as usize),
+                .filter(|&&e| e != TEXT_BLOCK_SEEN_SENTINEL)
+                .all(|&e| tool_entry_frame(e) <= MAX_TOOL_FRAME_INDEX as usize),
             "every recorded tool frame index must be clamped to MAX_TOOL_FRAME_INDEX, got {:?}",
             state.open_tools
         );
@@ -3067,12 +3117,14 @@ mod tests {
             evs[0],
             crate::ir::IrStreamEvent::BlockStop { index: 0 }
         ));
-        // tool-call-end emits the BlockStop but intentionally does NOT remove the frame index from
-        // `open_tools`: the recorded set is what keeps each tool's IR index stable for its lifetime
-        // (and the rank of any LATER tool stable), so it grows monotonically across the stream.
-        assert!(
-            state.open_tools.contains(&0),
-            "the closed tool's frame index is retained to keep later tool indices stable"
+        // tool-call-end emits the BlockStop but intentionally does NOT remove the frame's entry
+        // from `open_tools`: the recorded packed entry is what keeps each tool's ASSIGNED IR index
+        // stable for its lifetime (and the insertion slot of any LATER tool stable), so the set
+        // grows monotonically across the stream.
+        assert_eq!(
+            cohere_lookup_tool_ir_index(&state, 0),
+            Some(0),
+            "the closed tool's assigned IR index is retained to keep later tool indices stable"
         );
     }
 
@@ -3706,6 +3758,76 @@ mod tests {
             &evs[0],
             crate::ir::IrStreamEvent::BlockStop { index } if *index == idx2
         ));
+    }
+
+    /// Regression (LOW #9): a tool call's IR block index is ASSIGNED at `tool-call-start` and is
+    /// IMMUTABLE for the tool's whole lifetime — it must NOT change because a LATER tool arrives
+    /// with a smaller (non-monotonic) wire `frame_idx`. The prior scheme RECOMPUTED the index as the
+    /// live rank of `frame_idx` among recorded frames, so a second tool whose wire index sorts
+    /// BEFORE an earlier still-tracked tool retroactively bumped that earlier tool's rank: its
+    /// `tool-call-end` then resolved to a different IR index than its `tool-call-start`/`delta`,
+    /// emitting BlockStop for a block that was never opened and leaving the real block unclosed.
+    ///
+    /// Feed two interleaved tool calls where the SECOND tool's wire index (5) is LARGER but the
+    /// THIRD's (2) is SMALLER than the first (10), all opened before any closes, and assert that each
+    /// tool's start, delta, and end frames all resolve to the SAME IR index the start was assigned.
+    #[test]
+    fn test_stream_tool_ir_index_stable_under_non_monotonic_frame_indices() {
+        let reader = CohereReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        let start = |wire: u64, id: &str| {
+            serde_json::json!({
+                "type": "tool-call-start",
+                "index": wire,
+                "delta": {"message": {"tool_calls": {
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": "f", "arguments": ""}
+                }}}
+            })
+        };
+        let start_idx = |evs: &[IrStreamEvent]| match evs.first() {
+            Some(IrStreamEvent::BlockStart { index, .. }) => *index,
+            other => panic!("expected a BlockStart, got {other:?}"),
+        };
+
+        // Open three tools with DELIBERATELY non-monotonic wire indices: 10, then 5, then 2.
+        let a_idx = start_idx(&reader.read_response_events("", &start(10, "call_a"), &mut state));
+        let b_idx = start_idx(&reader.read_response_events("", &start(5, "call_b"), &mut state));
+        let c_idx = start_idx(&reader.read_response_events("", &start(2, "call_c"), &mut state));
+
+        // Assignment is by INSERTION ORDER, so the three tools get distinct, contiguous indices
+        // regardless of their (descending) wire indices.
+        assert_eq!(
+            (a_idx, b_idx, c_idx),
+            (0, 1, 2),
+            "tool IR indices must be assigned by insertion order, not wire-index rank"
+        );
+
+        // For each tool, its delta and end (resolved LATER, after the out-of-order siblings were
+        // recorded) must still land on the SAME index its start was assigned. Under the old
+        // live-rank scheme, tool A (wire 10) would have ranked 0 at start but 2 by end (because
+        // wires 5 and 2 were inserted below it), shifting its close to the wrong block.
+        for (wire, expected) in [(10u64, a_idx), (5, b_idx), (2, c_idx)] {
+            let delta = serde_json::json!({
+                "type": "tool-call-delta",
+                "index": wire,
+                "delta": {"message": {"tool_calls": {"function": {"arguments": "{}"}}}}
+            });
+            let devs = reader.read_response_events("", &delta, &mut state);
+            assert!(
+                matches!(devs.first(), Some(IrStreamEvent::BlockDelta { index, .. }) if *index == expected),
+                "delta for wire {wire} must resolve to its assigned IR index {expected}, got {devs:?}"
+            );
+
+            let end = serde_json::json!({ "type": "tool-call-end", "index": wire });
+            let eevs = reader.read_response_events("", &end, &mut state);
+            assert!(
+                matches!(eevs.first(), Some(IrStreamEvent::BlockStop { index }) if *index == expected),
+                "end for wire {wire} must close its assigned IR index {expected}, got {eevs:?}"
+            );
+        }
     }
 
     /// A leading text block must push tool blocks to IR index 1+ while keeping each tool distinct.

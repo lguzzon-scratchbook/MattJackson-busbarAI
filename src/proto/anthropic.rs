@@ -269,11 +269,23 @@ impl ProtocolReader for AnthropicReader {
             }
         }
 
-        // Handle messages array
+        // Handle messages array. Anthropic's Messages API has NO `system` role inside `messages` —
+        // system instructions live in the top-level `system` field. A cross-protocol IR, however, can
+        // carry an `IrRole::System` message (e.g. translated from an OpenAI `system` message), and a
+        // wire body could nominally present a `role:"system"` message too. PROMOTE any such message
+        // into `system_blocks` here at the root rather than pushing it into `req.messages`, so the
+        // writer never sees an `IrRole::System` message and can never emit the INVALID Anthropic
+        // `role:"system"` (which upstream rejects with a 400). System blocks are appended in order,
+        // preserving their position relative to any top-level `system` field already read above.
         let mut messages: Vec<crate::ir::IrMessage> = Vec::new();
         if let Some(messages_val) = obj.get("messages") {
             for msg_val in messages_val.as_array().unwrap_or(&Vec::new()) {
-                messages.push(read_message(msg_val)?);
+                let msg = read_message(msg_val)?;
+                if msg.role == crate::ir::IrRole::System {
+                    system_blocks.extend(msg.content);
+                } else {
+                    messages.push(msg);
+                }
             }
         }
 
@@ -592,26 +604,28 @@ impl ProtocolReader for AnthropicReader {
             .and_then(|r| r.as_str())
             .map(String::from);
 
-        // Parse usage
-        let usage_val = obj.get("usage").ok_or(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
-            retry_after: None,
-        })?;
+        // Parse usage. `usage` is OPTIONAL on read here: do NOT `ok_or?` it. A native Anthropic
+        // non-streaming `Message` always carries `usage`, but an Anthropic-compatible backend that
+        // doesn't implement usage counting (or makes it conditional) may omit it — hard-requiring the
+        // field turned an otherwise-valid 200 body into a 400, inconsistent with this protocol's own
+        // streaming readers (`message_start`/`message_delta` above already zero-default a missing
+        // `usage` rather than bailing) and with the gemini/cohere reader tolerance. When `usage` is
+        // absent each counter defaults to zero (`Some` → parse, `None` → 0).
+        let usage_val = obj.get("usage");
         let usage = crate::ir::IrUsage {
             input_tokens: usage_val
-                .get("input_tokens")
+                .and_then(|u| u.get("input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             output_tokens: usage_val
-                .get("output_tokens")
+                .and_then(|u| u.get("output_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: usage_val
-                .get("cache_creation_input_tokens")
+                .and_then(|u| u.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64()),
             cache_read_input_tokens: usage_val
-                .get("cache_read_input_tokens")
+                .and_then(|u| u.get("cache_read_input_tokens"))
                 .and_then(|v| v.as_u64()),
         };
 
@@ -1000,9 +1014,14 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
 
 fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
     let role_str = match msg.role {
-        crate::ir::IrRole::System => "system",
         crate::ir::IrRole::User => "user",
         crate::ir::IrRole::Assistant => "assistant",
+        // Anthropic's Messages API has NO `system` role inside `messages` — system content lives in
+        // the top-level `system` field. `write_request` folds every `IrRole::System` message into
+        // that top-level array and FILTERS it out of the per-message loop, so this arm is unreachable
+        // on the request path. Map it to `"user"` defensively (NOT the invalid `"system"`) so that
+        // even a direct `write_message` call can never emit a `role:"system"` Anthropic rejects.
+        crate::ir::IrRole::System => "user",
         // Anthropic has no "tool" message role — tool results are carried as `user` messages whose
         // content holds `tool_result` block(s). (Reachable when translating an OpenAI `tool` message.)
         crate::ir::IrRole::Tool => "user",
@@ -1275,11 +1294,30 @@ impl ProtocolWriter for AnthropicWriter {
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
-        if !req.system.is_empty() {
-            let system_array: Vec<_> = req.system.iter().map(write_block).collect();
+        // Anthropic's Messages API has NO `system` role inside `messages` — system content lives in
+        // the top-level `system` field. Anthropic's OWN reader canonicalizes a wire `role:"system"`
+        // message into `req.system` (see `read_request`), but a CROSS-PROTOCOL IR (e.g. read by the
+        // OpenAI reader) can still carry an `IrRole::System` message in `req.messages` that never
+        // passed through that promotion. Fold any such message's blocks into the top-level system
+        // array here so `write_message` never receives a System role and can never emit the INVALID
+        // `role:"system"` (which upstream rejects with a 400) — mirroring the gemini/bedrock writers,
+        // which `continue` past an `IrRole::System` message in their request message loop.
+        let mut system_blocks: Vec<&crate::ir::IrBlock> = req.system.iter().collect();
+        for msg in &req.messages {
+            if msg.role == crate::ir::IrRole::System {
+                system_blocks.extend(msg.content.iter());
+            }
+        }
+        if !system_blocks.is_empty() {
+            let system_array: Vec<_> = system_blocks.into_iter().map(write_block).collect();
             out.insert("system".to_string(), serde_json::Value::Array(system_array));
         }
-        let messages_array: Vec<_> = req.messages.iter().map(write_message).collect();
+        let messages_array: Vec<_> = req
+            .messages
+            .iter()
+            .filter(|msg| msg.role != crate::ir::IrRole::System)
+            .map(write_message)
+            .collect();
         out.insert(
             "messages".to_string(),
             serde_json::Value::Array(messages_array),
@@ -3557,5 +3595,157 @@ mod anthropic_hardening_tests {
                 );
             }
         }
+    }
+
+    /// Finding #10 regression: a 200 `read_response` body that OMITS `usage` must read back
+    /// successfully with each counter zero-defaulted, NOT 400. The prior `obj.get("usage").ok_or?`
+    /// hard-required the field — inconsistent with this protocol's own streaming readers
+    /// (`message_start`/`message_delta` already zero-default a missing `usage`) and the gemini/cohere
+    /// tolerance. Fails against the old `ok_or?` (which returned Err), passes after.
+    #[test]
+    fn read_response_without_usage_zero_defaults_no_error() {
+        let body = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}]
+            // NOTE: no `usage` field
+        });
+        let ir = AnthropicReader
+            .read_response(&body)
+            .expect("a 200 body without usage must read back, not 400");
+        assert_eq!(ir.usage.input_tokens, 0, "missing usage → input_tokens 0");
+        assert_eq!(ir.usage.output_tokens, 0, "missing usage → output_tokens 0");
+        assert_eq!(ir.usage.cache_creation_input_tokens, None);
+        assert_eq!(ir.usage.cache_read_input_tokens, None);
+        match &ir.content[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hi"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    /// Finding #11 regression (ROOT fix): a wire `role:"system"` message inside `messages` must be
+    /// PROMOTED into `IrRequest.system` by `read_request`, not pushed into `req.messages` as an
+    /// `IrRole::System` message. Anthropic's Messages API has no `system` role in `messages`
+    /// (system goes top-level), so the writer must never see a System message. Guards the root.
+    #[test]
+    fn read_request_promotes_system_role_message_into_system_blocks() {
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                {"role": "system", "content": "you are terse"},
+                {"role": "user", "content": "hi"}
+            ],
+            "max_tokens": 16
+        });
+        let ir = AnthropicReader
+            .read_request(&body)
+            .expect("system-role message must parse, not panic");
+        // The system message was promoted out of `messages` into `system`.
+        assert!(
+            ir.messages
+                .iter()
+                .all(|m| m.role != crate::ir::IrRole::System),
+            "no IrRole::System message may remain in req.messages after read_request"
+        );
+        assert_eq!(
+            ir.messages.len(),
+            1,
+            "only the user message survives in messages"
+        );
+        assert_eq!(ir.messages[0].role, crate::ir::IrRole::User);
+        assert_eq!(
+            ir.system.len(),
+            1,
+            "system content promoted into req.system"
+        );
+        match &ir.system[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "you are terse"),
+            other => panic!("expected promoted system text block, got {other:?}"),
+        }
+    }
+
+    /// Finding #11 regression (writer): `write_request` must NEVER emit a message with
+    /// `role:"system"` — even for a CROSS-PROTOCOL IR that still carries an `IrRole::System` message
+    /// in `req.messages` (one that never passed through Anthropic's own `read_request` promotion).
+    /// The writer folds it into the top-level `system` field and filters it out of `messages`,
+    /// mirroring the gemini/bedrock writers. Fails against old code (which emitted `role:"system"`).
+    #[test]
+    fn write_request_never_emits_system_role_message() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::System,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "be terse".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "hi".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: Some(16),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: Vec::new(),
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = AnthropicWriter.write_request(&req);
+        let messages = out
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array must be present");
+        for msg in messages {
+            assert_ne!(
+                msg.get("role").and_then(|r| r.as_str()),
+                Some("system"),
+                "write_request must never emit an Anthropic message with role:\"system\""
+            );
+        }
+        assert_eq!(messages.len(), 1, "only the user message remains");
+        assert_eq!(
+            messages[0].get("role").and_then(|r| r.as_str()),
+            Some("user")
+        );
+        // The system content was folded into the top-level `system` field.
+        let system = out
+            .get("system")
+            .and_then(|s| s.as_array())
+            .expect("system content must be promoted to top-level system field");
+        assert_eq!(system.len(), 1);
+        assert_eq!(
+            system[0].get("text").and_then(|t| t.as_str()),
+            Some("be terse")
+        );
+    }
+
+    /// Finding #11 regression (writer unit): a direct `write_message` call on an `IrRole::System`
+    /// message must NOT emit `role:"system"` (the invalid Anthropic role). Defense-in-depth: even if
+    /// a future caller bypasses `write_request`, the writer can never produce the rejected role.
+    #[test]
+    fn write_message_system_role_does_not_emit_system() {
+        let msg = crate::ir::IrMessage {
+            role: crate::ir::IrRole::System,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "x".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+        };
+        let out = write_message(&msg);
+        assert_ne!(
+            out.get("role").and_then(|r| r.as_str()),
+            Some("system"),
+            "write_message must never emit role:\"system\" for an IrRole::System message"
+        );
     }
 }

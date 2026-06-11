@@ -1944,10 +1944,35 @@ impl ProtocolWriter for BedrockWriter {
                     }));
                 }
 
+                crate::ir::IrBlock::Image { media_type, data } => {
+                    // An assistant response CAN legitimately carry an Image block (e.g. a
+                    // cross-protocol egress whose source emitted an image in the model turn).
+                    // Bedrock Converse natively represents it as an `{"image": ...}` content block,
+                    // so project it through the same encoder `write_request` uses instead of
+                    // silently dropping it. A source kind with no native Bedrock projection
+                    // (URL-source / structured-json sentinel) returns `None` and is omitted with a
+                    // trace by the helper, never corrupting the block.
+                    if let Some(image_block) = bedrock_image_block(media_type, data) {
+                        content_arr.push(serde_json::json!({ "image": image_block }));
+                    }
+                }
+
                 crate::ir::IrBlock::Thinking { .. } => {}
 
-                crate::ir::IrBlock::ToolResult { .. } | crate::ir::IrBlock::Image { .. } => {}
+                // A `toolResult` is a USER-turn content block in Bedrock Converse; it has no place
+                // in an ASSISTANT response message, so it is the only genuine no-op here. Handled
+                // explicitly — no catch-all.
+                crate::ir::IrBlock::ToolResult { .. } => {}
             }
+        }
+
+        // Bedrock Converse rejects an assistant message with an empty `content` array
+        // (ValidationException), exactly as `write_request` guards every turn. A response whose
+        // blocks were ALL non-representable here (e.g. thinking-only, or a stray toolResult) would
+        // otherwise emit `content: []`. Mirror the request-side guard with a minimal placeholder
+        // text block so the body stays valid.
+        if content_arr.is_empty() {
+            content_arr.push(serde_json::json!({ "text": "" }));
         }
 
         let stop_reason_str = resp.stop_reason.as_deref().unwrap_or("end_turn");
@@ -3876,6 +3901,119 @@ mod tests {
         assert_eq!(
             body.pointer("/usage/totalTokens").and_then(|v| v.as_u64()),
             Some(15)
+        );
+    }
+
+    /// Regression (R24 LOW#7 — writer, non-stream `write_response`): an assistant response carrying
+    /// an `IrBlock::Image` must be PROJECTED as a native Bedrock `{"image": ...}` content block, not
+    /// silently dropped by the old combined `ToolResult | Image => {}` no-op arm. A base64 image
+    /// uses the `bytes` source and the subtype-derived `format`.
+    #[test]
+    fn test_write_response_projects_image_block() {
+        let writer = BedrockWriter;
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Text {
+                    text: "see image".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+                crate::ir::IrBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let body = writer.write_response(&resp);
+        let content = body
+            .pointer("/output/message/content")
+            .and_then(|v| v.as_array())
+            .expect("content array present");
+        // Both the text block and the projected image block survive (2 entries, none dropped).
+        assert_eq!(content.len(), 2, "image block must not be dropped: {body}");
+        let image = content
+            .iter()
+            .find(|b| b.get("image").is_some())
+            .expect("a native image block must be present");
+        assert_eq!(
+            image.pointer("/image/format").and_then(|v| v.as_str()),
+            Some("png"),
+            "image format derived from MIME subtype: {body}"
+        );
+        assert_eq!(
+            image
+                .pointer("/image/source/bytes")
+                .and_then(|v| v.as_str()),
+            Some("aGVsbG8="),
+            "base64 image data carried as `bytes` source: {body}"
+        );
+    }
+
+    /// Regression (R24 LOW#8 — writer, non-stream `write_response`): a response whose blocks are ALL
+    /// non-representable in an assistant Converse message (here a lone `ToolResult`, which belongs to
+    /// a user turn, plus a `Thinking` block) must NOT emit an empty `content: []` array — Bedrock
+    /// rejects that with a ValidationException. `write_request` already guards every turn; this
+    /// mirrors that guard with a minimal placeholder text block.
+    #[test]
+    fn test_write_response_empty_content_emits_placeholder() {
+        let writer = BedrockWriter;
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Thinking {
+                    text: String::new(),
+                    signature: None,
+                },
+                crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    content: Vec::new(),
+                    is_error: false,
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let body = writer.write_response(&resp);
+        let content = body
+            .pointer("/output/message/content")
+            .and_then(|v| v.as_array())
+            .expect("content array present");
+        assert!(
+            !content.is_empty(),
+            "content array must never be empty (Bedrock rejects it): {body}"
+        );
+        assert_eq!(
+            content.len(),
+            1,
+            "exactly one placeholder block when all blocks are non-representable: {body}"
+        );
+        assert_eq!(
+            content[0].get("text").and_then(|v| v.as_str()),
+            Some(""),
+            "placeholder is a minimal empty-text block (mirrors write_request): {body}"
         );
     }
 

@@ -202,6 +202,20 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     for (pool_name, pool_cfg) in &cfg.pools {
         let mut member_protocols: HashSet<&str> = HashSet::new();
 
+        // A pool with NO members parses fine but is permanently un-routable: the selector has zero
+        // candidates, so every request to the pool exhausts immediately and the forward loop returns
+        // a generic 503 with a misleading "overloaded" message — the pool boots and then 503s every
+        // request, with no boot diagnostic. This is the empty-set twin of the per-member
+        // weight:0 / max_concurrent:0 / breaker n:0 fail-loud guards: reject it here so the operator
+        // learns at startup that the pool can never serve a request, rather than diagnosing it from
+        // a runtime "overloaded" that points at nothing.
+        if pool_cfg.members.is_empty() {
+            errors.push(format!(
+                "pool '{}' has no members; a pool with an empty member list is un-routable — every request to it 503s with a misleading 'overloaded' message. Add at least one member, or remove the pool",
+                pool_name
+            ));
+        }
+
         for member in &pool_cfg.members {
             // A `weight: 0` member is silently mis-balanced by the SWRR selector: it contributes 0
             // to the running total and its current_weight never increases, so it is never selected
@@ -2365,6 +2379,39 @@ mod tests {
                 .any(|e| e.contains("weight must be >= 1") && e.contains("mymodel")),
             "expected a weight:0 rejection for 'mymodel'; got: {errs:?}"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_pool_members() {
+        // A pool with an EMPTY member list parses fine but is permanently un-routable: every
+        // request to it exhausts immediately and 503s with a misleading "overloaded" message, with
+        // no boot diagnostic. This is the empty-set twin of the weight:0 / max_concurrent:0 /
+        // breaker n:0 fail-loud guards — reject it at startup. (Fails against old code, which had
+        // no empty-members check and let such a pool boot.)
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        pools.insert("emptypool".to_string(), make_pool(vec![]));
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("an empty-members pool must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("emptypool") && e.contains("no members")),
+            "expected a no-members rejection for 'emptypool'; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_pool_with_at_least_one_member() {
+        // A pool with one or more members must NOT trip the empty-members guard.
+        let (providers, models, pools) = valid_maps();
+        let cfg = make_root_cfg(providers, models, pools);
+        let result = validate(&cfg);
+        if let Err(errs) = &result {
+            assert!(
+                !errs.iter().any(|e| e.contains("no members")),
+                "a pool with a member must not trip the empty-members guard; got: {errs:?}"
+            );
+        }
     }
 
     #[test]

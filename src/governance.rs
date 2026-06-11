@@ -128,11 +128,11 @@ impl GovState {
         self.offload_store_write("token usage record failed", key_id, move |store| {
             store.add_usage(&key_owned, window, spend, tokens, false)
         });
-        // Feed the TPM counter UPDATE-only: this path has just the key id, not the key's caps, so it
-        // cannot prove the key is capped. It credits an existing entry (created by `check_rate` for a
-        // capped key) but never materialises one — an uncapped key has no entry and must not gain one
-        // here, otherwise the rate map grows unboundedly for caps-free deployments.
-        self.add_rate_tokens(key_id, now, tokens, false);
+        // Feed the TPM counter. `add_rate_tokens` is UPDATE-only: it credits an existing entry
+        // (created by `check_rate` for a capped key) but never materialises one — an uncapped key has
+        // no entry and must not gain one here, otherwise the rate map grows unboundedly for caps-free
+        // deployments.
+        self.add_rate_tokens(key_id, now, tokens);
     }
 
     /// Acquire the `rate` map for writing, recovering from a poisoned lock rather than panicking.
@@ -395,73 +395,48 @@ impl GovState {
     }
 
     /// Add tokens to the key's rate window for TPM accounting. Called post-response from
-    /// `record_request`/`record_tokens`. Tokens are attributed to the window implied by `now` (the
-    /// moment the response completed): if the entry is missing or belongs to a stale (earlier)
-    /// window, we (re)initialise it for `now`'s window and credit the tokens there. We never credit a
-    /// stale window, so a late response cannot inflate a window that has already closed.
+    /// `record_tokens` (the token-fee path). Tokens are attributed to the window implied by `now` (the
+    /// moment the response completed): if the entry belongs to a stale (earlier) window, we
+    /// reinitialise it for `now`'s window and credit the tokens there. We never credit a stale window,
+    /// so a late response cannot inflate a window that has already closed.
     ///
-    /// MEMORY BOUND (the rate map must not grow for uncapped keys). `create_if_absent` gates whether a
-    /// MISSING entry is materialised. `check_rate` only ever creates entries for keys that carry an
-    /// RPM/TPM cap (it early-returns for uncapped keys before touching the map), so an uncapped key
-    /// has no entry here. Materialising one unconditionally — as the prior code did on EVERY response,
-    /// for EVERY key — leaked one entry per uncapped key forever, since the sweep only evicts entries
-    /// whose window is stale and a busy uncapped key keeps refreshing its own. So:
-    ///   - callers that KNOW the key has a cap (`record_request`, which holds the `VirtualKey`) pass
-    ///     `create_if_absent = true`, preserving the swept-capped-key recovery: a capped key whose
-    ///     entry the sweep evicted between admission and completion still gets its tokens credited.
-    ///   - callers WITHOUT the cap (`record_tokens`, which only has the key id) pass `false`: an entry
-    ///     is updated if present (the normal case — `check_rate` created it for a capped key) but is
-    ///     never created from scratch, so an uncapped key cannot grow the map through this path.
-    ///
-    /// Updating an entry that already exists is always safe regardless of the flag: only a capped key
-    /// could have produced that entry in the first place.
-    fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64, create_if_absent: bool) {
+    /// UPDATE-ONLY (the rate map must not grow for uncapped keys). This method credits an entry that
+    /// ALREADY EXISTS but never materialises a missing one. `check_rate` only ever creates entries for
+    /// keys that carry an RPM/TPM cap (it early-returns for uncapped keys before touching the map), so
+    /// the only entries that exist belong to capped keys — and crediting one is always safe. An
+    /// uncapped key has no entry, and because we do not create one here, it cannot grow the map
+    /// through this path. (Materialising unconditionally — as very old code did on EVERY response, for
+    /// EVERY key — leaked one entry per uncapped key forever, since the sweep only evicts entries
+    /// whose window is stale and a busy uncapped key keeps refreshing its own.)
+    fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64) {
         if tokens == 0 {
             return;
         }
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
         let mut map = self.rate_write();
-        if let Some(st) = map.get_mut(key_id) {
-            if st.window_start == window {
-                // Entry is for the window this response belongs to -> credit it.
-                st.tokens = st.tokens.saturating_add(tokens);
-            } else if st.window_start < window {
-                // Entry is for an OLDER window (it rolled forward as `check_rate` evicted/reset it)
-                // -> reinitialise for this response's window and credit there. Previously these
-                // tokens were silently dropped, so any response that completed in a different 60s
-                // window than it started (the common streaming case) never reached the TPM counter,
-                // letting a key sustain above its configured limit. This is the fix.
-                *st = RateState {
-                    window_start: window,
-                    requests: 0,
-                    tokens,
-                };
-            }
-            // else: entry is for a NEWER window than this (late) response -> its window has already
-            // closed; drop the credit rather than revive a stale window or inflate the current one.
-        } else if create_if_absent {
-            // No entry yet, but the caller vouches the key is capped -> create one for this
-            // response's window and credit it (recovers a capped key whose entry the sweep evicted
-            // between admission and completion). An uncapped key never reaches here.
-            map.insert(
-                key_id.to_string(),
-                RateState {
-                    window_start: window,
-                    requests: 0,
-                    tokens,
-                },
-            );
+        let Some(st) = map.get_mut(key_id) else {
+            // No entry -> do NOT materialise one. An uncapped key has no entry (check_rate never made
+            // one), so skipping creation here bounds the rate map for caps-free deployments. A capped
+            // key's entry is created by `check_rate` on admission, so the credit lands there.
+            return;
+        };
+        if st.window_start == window {
+            // Entry is for the window this response belongs to -> credit it.
+            st.tokens = st.tokens.saturating_add(tokens);
+        } else if st.window_start < window {
+            // Entry is for an OLDER window (it rolled forward as `check_rate` evicted/reset it) ->
+            // reinitialise for this response's window and credit there. Previously these tokens were
+            // silently dropped, so any response that completed in a different 60s window than it
+            // started (the common streaming case) never reached the TPM counter, letting a key sustain
+            // above its configured limit. This is the fix.
+            *st = RateState {
+                window_start: window,
+                requests: 0,
+                tokens,
+            };
         }
-        // else: no entry and the caller can't prove the key is capped -> do NOT materialise one. An
-        // uncapped key has no entry (check_rate never made one), so this prevents the unbounded
-        // growth of the rate map for deployments whose keys have no RPM/TPM cap.
-    }
-
-    /// Whether a key carries any in-window rate cap (RPM or TPM). Only such keys may have an entry in
-    /// the ephemeral `rate` map; uncapped keys are early-returned by `check_rate` and never fed it,
-    /// which keeps the map bounded (see `add_rate_tokens`).
-    fn key_has_rate_cap(key: &VirtualKey) -> bool {
-        key.rpm_limit.is_some() || key.tpm_limit.is_some()
+        // else: entry is for a NEWER window than this (late) response -> its window has already
+        // closed; drop the credit rather than revive a stale window or inflate the current one.
     }
 
     /// Is this key already at/over its budget for the current window? (No cap → never.) Synchronous
@@ -531,15 +506,13 @@ impl GovState {
         self.offload_store_write("usage record failed", &key.id, move |store| {
             store.add_usage(&key_id, window, fee, tokens, true)
         });
-        // Feed the rate window's TPM counter ONLY for keys that carry an RPM/TPM cap. An uncapped key
-        // is never rate-limited (`check_rate` early-returns and never creates an entry for it), so
-        // feeding the rate map for it would leak one entry per uncapped key forever — the unbounded
-        // growth this guards against. We hold the full `VirtualKey` here, so we can prove the cap and
-        // pass `create_if_absent = true`, which preserves crediting a capped key whose entry the
-        // sweep evicted between admission and completion.
-        if Self::key_has_rate_cap(key) {
-            self.add_rate_tokens(&key.id, now, tokens, true);
-        }
+        // Feed the rate window's TPM counter. `add_rate_tokens` is UPDATE-only, so this is a no-op for
+        // an uncapped key (which has no entry — `check_rate` early-returns and never creates one for
+        // it) and credits a capped key's existing entry otherwise. No cap check is needed here because
+        // the update-only behaviour already bounds the map: only capped keys can have an entry to
+        // credit. (Production always passes `tokens = 0` — the per-request fee carries no tokens — so
+        // this returns at the `tokens == 0` guard; the token fee feeds TPM via `record_tokens`.)
+        self.add_rate_tokens(&key.id, now, tokens);
     }
 
     fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {
@@ -1655,6 +1628,61 @@ mod tests {
         assert!(
             map.get("uncapped").is_none(),
             "uncapped key still absent after a capped key was added"
+        );
+    }
+
+    #[test]
+    fn test_add_rate_tokens_is_update_only_never_materialises_entry() {
+        // LOW #12 (completeness): `add_rate_tokens` is UPDATE-ONLY. It must NEVER create a missing
+        // entry, even for a capped key. The former `create_if_absent = true` recovery branch (fed by
+        // `record_request` for a "swept-capped-key") was DEAD: production always passes `tokens = 0`
+        // through `record_request`, so the credit returns at the `tokens == 0` guard before reaching
+        // any create path, and the token fee flows through `record_tokens` (update-only). Old code
+        // with the recovery branch would have materialised an entry here from `record_request` with
+        // non-zero tokens; the corrected update-only code must not.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 5, 7, None).unwrap();
+
+        // A CAPPED key with NO prior `check_rate` admission -> it has no rate-map entry yet.
+        let mut capped = sample_key("late", "h_late");
+        capped.rpm_limit = Some(10);
+        capped.tpm_limit = Some(1000);
+        let now = 1_700_000_040;
+
+        // Feed non-zero tokens via record_request WITHOUT a preceding check_rate. The dead recovery
+        // branch (create_if_absent) would have inserted an entry crediting 500 tokens; update-only
+        // must leave the map untouched for this key.
+        gov.record_request(&capped, now, 500);
+        assert!(
+            gov.rate
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("late")
+                .is_none(),
+            "add_rate_tokens must not materialise an entry for a key with no prior check_rate"
+        );
+
+        // Likewise via record_tokens (the token-fee path): no entry exists, so nothing is created.
+        gov.record_tokens("late", "total", now, 500);
+        assert!(
+            gov.rate
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("late")
+                .is_none(),
+            "record_tokens (update-only) must not materialise an entry either"
+        );
+
+        // Once check_rate creates the entry (the real admission path), a subsequent credit lands.
+        assert!(gov.check_rate(&capped, now).is_ok());
+        gov.record_request(&capped, now, 300);
+        let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            map.get("late")
+                .expect("entry exists after check_rate")
+                .tokens,
+            300,
+            "an existing entry is credited update-only",
         );
     }
 

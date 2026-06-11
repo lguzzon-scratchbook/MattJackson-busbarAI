@@ -779,13 +779,15 @@ pub(crate) struct StreamTranslate {
     /// split start-vs-terminal usage. `None` until the first `MessageStart` carrying usage is seen.
     start_usage: Option<crate::ir::IrUsage>,
     /// Set once a terminal `MessageStop` has been emitted for this stream. Guards against an
-    /// out-of-order trailing usage-only `MessageDelta{stop_reason: None}` (the OpenAI `include_usage`
-    /// convention puts token totals in a chunk that arrives AFTER the finish chunk) being written
-    /// AFTER the terminal frame on a NON-eventstream ingress — e.g. an Anthropic `message_delta`
-    /// after `message_stop`, which is invalid stream framing and a proxy tell. The bedrock
-    /// (`ingress_eventstream`) path folds that late usage into its single `metadata` frame and so is
-    /// handled separately above; for every other ingress the late usage delta is dropped once the
-    /// message has stopped (matching v1.0.0-rc.2, which did not read trailing usage at all).
+    /// out-of-order trailing `MessageDelta` of ANY flavour being written AFTER the terminal frame on
+    /// a NON-eventstream ingress — e.g. an Anthropic `message_delta` after `message_stop`, which is
+    /// invalid stream framing and a proxy tell. The common case is a usage-only
+    /// `MessageDelta{stop_reason: None}` (the OpenAI `include_usage` convention puts token totals in a
+    /// chunk that arrives AFTER the finish chunk); a re-emitting backend can also repeat a terminal
+    /// `MessageDelta{stop_reason: Some(_)}` after the stop. The bedrock (`ingress_eventstream`) path
+    /// folds late usage into its single `metadata` frame and so is handled separately above; for
+    /// every other ingress ANY post-stop `MessageDelta` is dropped once the message has stopped
+    /// (matching v1.0.0-rc.2, which did not read trailing usage at all).
     message_stopped: bool,
 }
 
@@ -981,21 +983,16 @@ impl StreamTranslate {
             }
 
             // Non-eventstream ingress ordering guard: once the terminal `MessageStop` has been
-            // emitted, drop a trailing usage-only `MessageDelta{stop_reason: None}` (OpenAI
-            // `include_usage` delivers token totals in a chunk that arrives AFTER the finish chunk).
-            // Writing it now would put a `message_delta` AFTER `message_stop` on the wire — invalid
-            // stream framing and a proxy tell for SSE ingress (Anthropic/Gemini/Cohere/OpenAI). The
-            // bedrock (`ingress_eventstream`) path already folded such usage into its single
-            // `metadata` frame above and returned via `continue`, so it never reaches here.
-            if self.message_stopped
-                && matches!(
-                    ev,
-                    crate::ir::IrStreamEvent::MessageDelta {
-                        stop_reason: None,
-                        ..
-                    }
-                )
-            {
+            // emitted, drop ANY trailing `MessageDelta` (regardless of `stop_reason`). The common
+            // case is a usage-only `MessageDelta{stop_reason: None}` (OpenAI `include_usage`
+            // delivers token totals in a chunk that arrives AFTER the finish chunk), but a backend
+            // can also re-emit a DUPLICATE terminal `MessageDelta{stop_reason: Some(_)}` after the
+            // stop. Either one, written now, would put a `message_delta` AFTER `message_stop` on the
+            // wire — invalid stream framing and a proxy tell for SSE ingress
+            // (Anthropic/Gemini/Cohere/OpenAI). The bedrock (`ingress_eventstream`) path already
+            // folded such usage into its single `metadata` frame above and returned via `continue`,
+            // so it never reaches here.
+            if self.message_stopped && matches!(ev, crate::ir::IrStreamEvent::MessageDelta { .. }) {
                 continue;
             }
             if matches!(ev, crate::ir::IrStreamEvent::MessageStop) {
@@ -4690,6 +4687,43 @@ mod stream_translate_tests {
         assert!(
             delta_pos.is_some() && stop_pos.is_some() && delta_pos < stop_pos,
             "Anthropic writer must emit message_delta before message_stop; got {wire:?}"
+        );
+    }
+
+    /// LOW #6 regression: the post-`MessageStop` ordering guard must drop a DUPLICATE terminal
+    /// `MessageDelta` (one carrying a `stop_reason`), not only the usage-only
+    /// `MessageDelta{stop_reason: None}` flavour. A misbehaving / re-emitting egress backend can
+    /// repeat its finish event after the stop; writing the second `message_delta` AFTER
+    /// `message_stop` is invalid stream framing and a proxy tell. Drive an Anthropic SSE egress
+    /// (so we control the exact `message_delta`/`message_stop` ordering) into an OpenAI ingress
+    /// (a terminal `MessageDelta` surfaces as a `finish_reason` chunk), inject a second terminal
+    /// `message_delta` after the stop, and assert exactly ONE `finish_reason` chunk reaches the
+    /// wire. Before the broadened guard the duplicate slipped through as a second finish chunk.
+    #[test]
+    fn test_duplicate_terminal_message_delta_after_stop_is_dropped() {
+        let mut st = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            // DUPLICATE terminal delta AFTER the stop — must be dropped by the guard.
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+        ] {
+            raw.extend(st.feed(frame.as_bytes()));
+        }
+
+        let out = String::from_utf8(raw).expect("utf8 SSE");
+        // Exactly one OpenAI terminal chunk: the terminal `MessageDelta` maps to a
+        // `finish_reason:"stop"` chunk (intermediate chunks carry `finish_reason:null`), and the
+        // duplicate that arrived after the stop must NOT add a second terminal chunk.
+        let finishes = out.matches("\"finish_reason\":\"stop\"").count();
+        assert_eq!(
+            finishes, 1,
+            "exactly one terminal finish_reason chunk; the duplicate terminal delta must be dropped; got:\n{out}"
         );
     }
 

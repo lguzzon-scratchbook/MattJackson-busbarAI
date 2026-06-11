@@ -1224,9 +1224,17 @@ impl ProtocolReader for ResponsesReader {
             });
         }
 
-        if content
-            .iter()
-            .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. }))
+        // Promote a successful end_turn to tool_use when the assembled content carries a tool call,
+        // mirroring the streaming `response.completed` arm. Guard the override on `end_turn` ONLY: an
+        // `incomplete` status (max_tokens/safety/other truncation reason) means the model was cut off
+        // mid-output — even if a partial function_call survived, the turn did NOT cleanly finish on a
+        // tool call, and clobbering `max_tokens`/`safety` with `tool_use` would tell the client the
+        // call is complete and deny the truncation signal to the breaker. Only the clean-finish case
+        // (`end_turn`) is promoted; any other reason is left untouched.
+        if matches!(stop_reason.as_deref(), Some("end_turn"))
+            && content
+                .iter()
+                .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. }))
         {
             stop_reason = Some("tool_use".to_string());
         }
@@ -2514,15 +2522,39 @@ impl ProtocolWriter for ResponsesWriter {
             _ => "completed",
         };
 
+        // Build the `output` array in IR ENCOUNTER order, emitting one native output item per block
+        // exactly as the streaming writer's `drain_output_items` does. The streaming path assigns each
+        // Text/ToolUse BlockStart its own `output_index` (in arrival order) and drains them in that
+        // order, so a response that interleaves text and tool blocks (e.g. text → tool → text) streams
+        // those items in that sequence. A prior revision collected text separately and `insert(0)`'d a
+        // single coalesced message item at the FRONT of the array — that forced text ahead of any tool
+        // item and broke the order for any non-text-first or interleaved content, so the non-stream
+        // body disagreed with the stream a client reassembling `response.output[]` would observe.
+        // Process in order with no hardcoded index: each block appends to `output_arr` where it occurs.
         let mut output_arr: Vec<serde_json::Value> = Vec::new();
-
-        let mut text_blocks: Vec<&str> = Vec::new();
         for block in &resp.content {
             match block {
                 crate::ir::IrBlock::Text { text, .. } => {
-                    if !text.is_empty() {
-                        text_blocks.push(text);
+                    if text.is_empty() {
+                        continue;
                     }
+                    // Match the native message-item shape the STREAMING `output_item.done` emits: an
+                    // item-level `id` (`msg_…`), a `status`, and `annotations: []` on the `output_text`
+                    // content part. Omitting them is a proxy tell — a typed SDK reading `item.id` /
+                    // `item.status` / `content[0].annotations` sees missing fields on the non-stream
+                    // path. Each non-empty text block becomes its OWN message item at its encounter
+                    // position (mirroring the per-index message items the stream emits).
+                    output_arr.push(serde_json::json!({
+                        "type": "message",
+                        "id": synthesize_item_id("msg"),
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": []
+                        }]
+                    }));
                 }
                 crate::ir::IrBlock::ToolUse { id, name, input } => {
                     let args_str =
@@ -2548,28 +2580,6 @@ impl ProtocolWriter for ResponsesWriter {
                 crate::ir::IrBlock::ToolResult { .. } => {}
                 crate::ir::IrBlock::Image { .. } => {}
             }
-        }
-
-        if !text_blocks.is_empty() {
-            let text_content = text_blocks.join("");
-            // Match the native message-item shape the STREAMING `output_item.done` emits: an
-            // item-level `id` (`msg_…`), a `status`, and `annotations: []` on the `output_text`
-            // content part. Omitting them is a proxy tell — a typed SDK reading `item.id` /
-            // `item.status` / `content[0].annotations` sees missing fields on the non-stream path.
-            output_arr.insert(
-                0,
-                serde_json::json!({
-                    "type": "message",
-                    "id": synthesize_item_id("msg"),
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{
-                        "type": "output_text",
-                        "text": text_content,
-                        "annotations": []
-                    }]
-                }),
-            );
         }
 
         let mut usage_map = serde_json::Map::new();
@@ -3154,6 +3164,103 @@ mod tests {
             id.starts_with("fc_") && id.len() > 3,
             "function_call item id must be a native opaque fc_ token, got {id}"
         );
+    }
+
+    /// Regression (MED #1): the NON-streaming `read_response` tool-use override must NOT clobber a
+    /// truncation reason. An `incomplete` body with `incomplete_details.reason=max_output_tokens` that
+    /// also carries a (partial) `function_call` item was cut off mid-output — its stop_reason must stay
+    /// `max_tokens`, NOT be promoted to `tool_use`. Before the fix the override fired unconditionally on
+    /// any ToolUse block, clobbering `max_tokens` and telling the client the call was complete (and
+    /// denying the truncation signal to the breaker). The override is now guarded on `end_turn` only,
+    /// mirroring the streaming `response.completed` arm.
+    #[test]
+    fn test_read_response_incomplete_with_function_call_keeps_max_tokens() {
+        let json = serde_json::json!({
+            "id": "resp_trunc",
+            "object": "response",
+            "created_at": 1_700_000_000_u64,
+            "status": "incomplete",
+            "model": "gpt-4o",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"SF\"}"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let reader = ResponsesReader;
+        let resp = reader.read_response(&json).expect("read should succeed");
+
+        // The tool call survived as content...
+        assert!(
+            resp.content
+                .iter()
+                .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. })),
+            "the partial function_call must still be present as a ToolUse block"
+        );
+        // ...but the truncation reason must NOT have been clobbered to tool_use.
+        assert_eq!(
+            resp.stop_reason,
+            Some("max_tokens".to_string()),
+            "an incomplete (max_output_tokens) response must keep stop_reason=max_tokens, not be \
+             promoted to tool_use just because a partial function_call survived"
+        );
+    }
+
+    /// Regression (LOW #5): `write_response` must build the `output` array in IR ENCOUNTER order so it
+    /// mirrors the streaming `drain_output_items` order. A prior revision `insert(0)`'d the text message
+    /// item at the FRONT, so a text-AFTER-tool response emitted [message, function_call] on the
+    /// non-stream path while the stream emitted [function_call, message] — a client reassembling
+    /// `response.output[]` saw the two paths disagree. Order must now follow the blocks: tool, then text.
+    #[test]
+    fn test_write_response_preserves_text_after_tool_order() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            id: Some("resp_order".to_string()),
+            model: Some("gpt-4o".to_string()),
+            created: Some(1_700_000_000),
+            content: vec![
+                crate::ir::IrBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "SF"}),
+                },
+                crate::ir::IrBlock::Text {
+                    text: "Here is the weather.".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            system_fingerprint: None,
+        };
+        let writer = ResponsesWriter;
+        let out = writer.write_response(&resp);
+        let arr = out["output"].as_array().expect("output is an array");
+        assert_eq!(arr.len(), 2, "one item per non-empty block, in order");
+        // Encounter order: the tool block came first, the text block second.
+        assert_eq!(
+            arr[0]["type"], "function_call",
+            "the tool block was first in IR content, so it must be output[0]"
+        );
+        assert_eq!(arr[0]["call_id"], "call_1");
+        assert_eq!(
+            arr[1]["type"], "message",
+            "the text block came after the tool block, so it must NOT be forced to output[0]"
+        );
+        assert_eq!(arr[1]["content"][0]["text"], "Here is the weather.");
     }
 
     /// The native Responses error envelope an official SDK decodes: a JSON object whose `error`

@@ -116,8 +116,58 @@ impl ProtocolReader for GeminiReader {
             }
         };
 
+        // Gemini signals a DEAD egress credential (revoked/wrong/expired key, or a key lacking
+        // access to the Generative Language API) as an HTTP 400 `INVALID_ARGUMENT` — or a 403
+        // `PERMISSION_DENIED` — carrying the google.rpc.ErrorInfo `reason: API_KEY_INVALID` and a
+        // message like "API key not valid. Please pass a valid API key." A bare 400 maps to
+        // StatusClass::ClientError → ClientFault, which records NOTHING, never benches/fails over the
+        // lane, and relays the upstream body verbatim — so a lane wired to a dead key keeps being
+        // picked and serves a guaranteed auth rejection on every request. Detect the bad-key signal
+        // here and re-shape the raw error so the breaker classifies it as Auth → HardDown (park the
+        // lane, fail over to a sibling). 401 is the canonical Auth-classifying HTTP status in
+        // `breaker::normalize_raw_error` (operator-error-map-INDEPENDENT, unlike a `provider_code`
+        // that would only map via a configured entry the shipped Gemini error_map lacks); overriding
+        // `http_status` is safe because the forwarder relays the INGRESS-native auth status to the
+        // client (forward.rs `auth_failure_status_and_kind`), never this raw value — it is consumed
+        // ONLY for breaker classification. `provider_code` is also set to the canonical `"auth"`
+        // string (`breaker::status_class_from_str`) so an operator who DOES map it is reinforced.
+        //
+        // PRECISION: the override fires ONLY on an explicit api-key-invalid signal — the documented
+        // `API_KEY_INVALID` reason (ErrorInfo `details[].reason` or the same token anywhere in the
+        // body) OR an "api key (not / in)valid / expired" message — and NEVER on a generic
+        // `INVALID_ARGUMENT` field-validation 400 (e.g. a bad `contents[0].role`), which must stay a
+        // lane-healthy ClientFault. A bare `PERMISSION_DENIED`/`INVALID_ARGUMENT` with no api-key text
+        // is left untouched.
+        let (http_status, provider_code) = {
+            let lower = String::from_utf8_lossy(body).to_lowercase();
+            // The documented machine-readable reason wins on its own (it is unambiguous), regardless
+            // of which status name accompanied it.
+            let has_api_key_invalid_reason = lower.contains("api_key_invalid");
+            // A prose api-key-invalid message: an explicit "api key" reference paired with an
+            // invalid/expired/not-valid signal. Requiring BOTH tokens keeps a generic validation 400
+            // ("invalid value at 'contents[0].role'") from ever matching.
+            let mentions_api_key = lower.contains("api key") || lower.contains("api-key");
+            let signals_key_bad = lower.contains("not valid")
+                || lower.contains("invalid")
+                || lower.contains("expired");
+            let api_key_message = mentions_api_key && signals_key_bad;
+            // Only consider the auth heuristic on the google.rpc.Code statuses Gemini actually uses
+            // for an auth/permission failure, so an unrelated status carrying the words by accident
+            // cannot trip it. The documented reason is authoritative on its own; the prose message is
+            // only trusted under one of these statuses.
+            let status_is_auth_shaped = matches!(
+                structured_type.as_deref(),
+                Some("INVALID_ARGUMENT") | Some("PERMISSION_DENIED") | Some("UNAUTHENTICATED")
+            );
+            if has_api_key_invalid_reason || (status_is_auth_shaped && api_key_message) {
+                (401u16, Some("auth".to_string()))
+            } else {
+                (status.as_u16(), provider_code)
+            }
+        };
+
         crate::breaker::RawUpstreamError {
-            http_status: status.as_u16(),
+            http_status,
             provider_code,
             structured_type,
             retry_after_secs: None,
@@ -2865,6 +2915,110 @@ mod tests {
             Some("400"),
             "a non-context-length 400 must not be misclassified as context_length_exceeded"
         );
+    }
+
+    /// Regression (R24 MED #3, dead-credential failover): a Gemini bad EGRESS key surfaces as an
+    /// HTTP 400 `INVALID_ARGUMENT` carrying `reason: API_KEY_INVALID` (google.rpc.ErrorInfo) plus an
+    /// "API key not valid" message. A bare 400 normalizes to ClientFault — records nothing, never
+    /// benches/fails over the lane — so a lane wired to a dead key keeps serving guaranteed
+    /// auth-rejections. `extract_error` must re-shape it so the breaker classifies it as
+    /// Auth → HardDown (park + fail over). Asserted end-to-end through `normalize_raw_error` +
+    /// `classify` against an EMPTY error_map (the shipped Gemini map has no auth entry), proving the
+    /// fix is operator-config-independent.
+    #[test]
+    fn test_extract_error_bad_api_key_classifies_as_auth_harddown() {
+        let reader = GeminiReader;
+        // Native Gemini bad-key envelope: 400 INVALID_ARGUMENT, ErrorInfo reason API_KEY_INVALID.
+        let body = br#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com"}]}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        // Re-shaped to the canonical Auth-classifying HTTP status so the breaker benches the lane.
+        assert_eq!(
+            raw.http_status, 401,
+            "a dead Gemini key must re-shape to the Auth-classifying status, not relay 400"
+        );
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("auth"),
+            "bad-key 400 must synthesize the canonical auth provider_code"
+        );
+        // Normalize against an EMPTY error_map → must still land on Auth → HardDown.
+        let empty_map = std::collections::HashMap::new();
+        let sig = crate::breaker::normalize_raw_error(&raw, &empty_map);
+        assert!(
+            matches!(sig.class, StatusClass::Auth),
+            "bad Gemini key must classify as Auth, got {:?}",
+            sig.class
+        );
+        assert!(
+            matches!(
+                crate::breaker::classify(&sig),
+                crate::breaker::Disposition::HardDown
+            ),
+            "a dead credential must HardDown the lane so it parks and fails over"
+        );
+    }
+
+    /// The documented machine-readable `API_KEY_INVALID` reason can also accompany a 403
+    /// `PERMISSION_DENIED` (a key lacking access). It must classify the same way.
+    #[test]
+    fn test_extract_error_bad_api_key_permission_denied_is_auth() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":403,"message":"Permission denied: API key not valid.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID"}]}}"#;
+        let raw = reader.extract_error(StatusCode::FORBIDDEN, body);
+        assert_eq!(raw.http_status, 401);
+        assert_eq!(raw.provider_code.as_deref(), Some("auth"));
+        let empty_map = std::collections::HashMap::new();
+        let sig = crate::breaker::normalize_raw_error(&raw, &empty_map);
+        assert!(matches!(sig.class, StatusClass::Auth));
+    }
+
+    /// PRECISION GUARD: a GENERIC `INVALID_ARGUMENT` 400 (a real field-validation error, no api-key
+    /// signal) must NOT be misclassified as auth — it stays a lane-healthy ClientFault that records
+    /// nothing and relays verbatim. Without a precise heuristic the override would bench healthy lanes
+    /// on every malformed caller request.
+    #[test]
+    fn test_extract_error_generic_invalid_argument_stays_client_fault() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":400,"message":"Invalid value at 'contents[0].role' (TYPE_ENUM), \"banana\"","status":"INVALID_ARGUMENT"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        // Untouched: real 400, bare status code, no auth synthesis.
+        assert_eq!(
+            raw.http_status, 400,
+            "a generic validation 400 must NOT be re-shaped to the auth status"
+        );
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("400"),
+            "a generic INVALID_ARGUMENT must keep its bare status code, not become auth"
+        );
+        let empty_map = std::collections::HashMap::new();
+        let sig = crate::breaker::normalize_raw_error(&raw, &empty_map);
+        assert!(
+            matches!(sig.class, StatusClass::ClientError),
+            "a generic validation 400 must stay ClientError, got {:?}",
+            sig.class
+        );
+        assert!(
+            matches!(
+                crate::breaker::classify(&sig),
+                crate::breaker::Disposition::ClientFault
+            ),
+            "a generic validation 400 must stay a no-penalty ClientFault"
+        );
+    }
+
+    /// PRECISION GUARD: a bare `PERMISSION_DENIED` with NO api-key text (e.g. the existing
+    /// status-fallback fixture shape) must NOT be re-shaped — the prose heuristic requires an explicit
+    /// "api key" + invalid/expired signal, so a permission error without that text stays as-is and is
+    /// classified by HTTP status alone.
+    #[test]
+    fn test_extract_error_bare_permission_denied_not_treated_as_bad_key() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"status":"PERMISSION_DENIED"}}"#;
+        let raw = reader.extract_error(StatusCode::FORBIDDEN, body);
+        // http_status is the real 403, provider_code falls back to the status name — unchanged.
+        assert_eq!(raw.http_status, 403);
+        assert_eq!(raw.provider_code.as_deref(), Some("PERMISSION_DENIED"));
     }
 
     /// Malformed (non-JSON) error bodies yield None fields without panicking.

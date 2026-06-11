@@ -609,12 +609,22 @@ async fn forward_resolved(
         // Route through forward_with_pool with this ingress protocol so a request to a
         // different-protocol backend is translated both ways. (The `forward` wrapper assumes
         // Anthropic ingress, which is correct only for the /v1/messages routes — not here.)
+        //
+        // pool_name is "" — the lane-default breaker CELL shared by every direct/single-model
+        // route (forward.rs: `forward` passes "" for the same reason; LOW #4). This is a
+        // by_model hit, NOT a named pool, so it must share breaker state with the same model
+        // reached via the `named`/`adhoc` single-model paths. Passing the MODEL name here would
+        // track the same lane under a model-keyed cell on universal ingress but under the ""
+        // cell on the /v1/messages routes, splitting breaker state (and /stats, /healthz) for
+        // one lane across two cells purely by route shape. The bounded `pool` metric LABEL still
+        // resolves to the model name for the "" cell (forward.rs `metric_pool_label`), so the
+        // request/upstream metric correlation is unaffected — only the cell key is unified.
         let resp = forward_with_pool(
             app.clone(),
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
             caller_token,
-            model,
+            "",
             None,
             proto,
             usage_sink(app, gov, charged_at),
@@ -6211,6 +6221,106 @@ mod tests {
             state.get_last_request_body().is_some(),
             "upstream received the forwarded request via the named by_model fallback"
         );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    // ---- LOW #4 (re-audit, completeness): breaker cell-key consistency for by_model routes ----
+    //
+    // A single-model lane (no pool) can be reached two ways:
+    //   1. the universal body-model ingress (`/v1/chat/completions` etc.) → `forward_resolved`'s
+    //      `by_model` arm, which calls `forward_with_pool` directly with the ingress protocol so a
+    //      cross-protocol backend is translated both ways; and
+    //   2. the Anthropic `/<model>/v1/messages` (`named`) / `/<provider>/<model>/v1/messages`
+    //      (`adhoc`) routes → `crate::forward::forward`, which passes `""` (the lane-default breaker
+    //      CELL shared by every direct/single-model route — forward.rs design intent).
+    //
+    // forward.rs records every breaker outcome against the CELL keyed by the `pool_name` argument
+    // (`record_transient_in(pool_name, …)`). If `forward_resolved`'s by_model arm passes the MODEL
+    // name as `pool_name` (the pre-fix bug) while the named/adhoc paths pass `""`, the SAME lane's
+    // breaker state is split across two cells purely by route shape: failures driven through the
+    // universal ingress would never trip (and never be seen by) the `""` cell that `/<model>/v1/
+    // messages` selects against, and vice-versa. The fix passes `""` from the by_model arm too, so
+    // both route shapes converge on the one lane-default cell.
+    //
+    // This drives the trip THRESHOLD worth of upstream 5xx through the universal (openai) by_model
+    // ingress, then asserts the `""` cell tripped Open while the model-keyed cell stayed Closed —
+    // the exact inverse of the pre-fix behavior, so it fails against the old code.
+
+    /// LOW #4: a by_model lane reached via the universal (openai) ingress must record breaker state
+    /// on the lane-default `""` cell — the SAME cell the `named`/`adhoc` single-model routes use —
+    /// not on a model-keyed cell, so a lane reached by-name and by-pool shares one breaker view.
+    ///
+    /// The discriminating observable is the lane-default `""` cell's pending cooldown: a single
+    /// upstream 5xx through the by_model arm records `record_transient_in(pool_name, …)`, which sets
+    /// a cooldown ONLY on the cell keyed by `pool_name`. The `""` cell is the `LaneState` itself
+    /// (store.rs `cell`: `pool.is_empty()` → `self.lanes[lane]`), written by the FIX (`pool_name ==
+    /// ""`) and left untouched (cooldown 0) by the pre-fix code (which wrote a SEPARATE model-keyed
+    /// pool cell). So `cooldown_remaining_in("", 0) > 0` is true after the fix and false before it.
+    ///
+    /// NOTE: the model-keyed cell is NOT a usable counter-assertion — reading `*_in(model, 0)` LAZILY
+    /// CREATES that cell, and a freshly-minted pool cell INHERITS the lane's (i.e. the `""` cell's)
+    /// current cooldown/state (store.rs `cell`, lines ~701-725). Under the fix it would therefore
+    /// inherit the non-zero `""` cooldown and read non-zero too — indistinguishable. The `""` cell
+    /// cooldown alone cleanly separates fixed from broken.
+    #[tokio::test]
+    async fn test_forward_resolved_by_model_uses_lane_default_breaker_cell() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        // One upstream 5xx is enough: a single transient failure sets a pending cooldown on the
+        // routed breaker cell (the trip-to-Open threshold is irrelevant — the cooldown is recorded
+        // on the very first transient, on whichever cell `pool_name` selects).
+        let model = "glm-4.5";
+        state.push(MockResponse::ServerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: json!({"error": {"message": "boom"}}),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Lane registered in by_model ONLY (no `.pool(...)`), so the universal ingress resolves it
+        // through `forward_resolved`'s by_model arm — the site under test.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(model, crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .build();
+        // Hold a handle to the same App the router serves so the breaker cell can be inspected after
+        // the request (`serve` only needs a clone of the Arc).
+        let app_for_inspect = app.clone();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(
+                json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        // The forward fails (single lane, no failover target) — the breaker transient is recorded
+        // before the exhausted response is returned, which is all this test cares about.
+        assert!(
+            !resp.status().is_success(),
+            "a 5xx-backed forward returns a non-2xx to the client"
+        );
+
+        // The lane-default `""` cell — the SAME cell the `named`/`adhoc` single-model routes select
+        // against — must carry the breaker effect of the by_model forward. Under the pre-fix bug
+        // (`pool_name == model`) this cell is never written and reads cooldown 0; the fix
+        // (`pool_name == ""`) records here, so it reads a pending cooldown.
+        assert!(
+            app_for_inspect
+                .store
+                .cooldown_remaining_in("", 0, crate::store::now())
+                > 0,
+            "by_model forwards must record breaker state on the lane-default \"\" cell (the cell \
+             /<model>/v1/messages selects against); a 0 cooldown means the failure was tracked under \
+             a model-keyed cell instead, splitting breaker state by route shape"
+        );
+
         handle.abort();
         server.shutdown().await;
     }

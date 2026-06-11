@@ -234,6 +234,23 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     #[cfg(test)]
     fn record_success(&self, lane: usize);
     fn record_success_in(&self, pool: &str, lane: usize);
+    /// A SUCCESSFUL (2xx) out-of-band health probe: push a success outcome into the sliding
+    /// error-rate window of EVERY cell for the lane (the default/direct-route cell AND every existing
+    /// per-pool cell), mirroring the all-cells iteration of `record_probe_failure_all_cells`. The
+    /// failed-probe path feeds a failure into each cell's window, so without a matching success record
+    /// a lane whose probes sometimes fail and sometimes succeed would present a window of ONLY
+    /// failures and the error-rate breaker would read 100% error and trip a mostly-healthy lane (the
+    /// LOW #23 success half of symmetric probe accounting).
+    ///
+    /// Crucially the lane-global `LaneState.ok` stat is bumped EXACTLY ONCE per probe — once per
+    /// SUCCESSFUL PROBE, not once per cell. Recording per cell via `record_success_in` instead bumped
+    /// `LaneState.ok` (N+1) times for a lane in N pools (the default cell plus one per pool), inflating
+    /// the public `/stats` `ok` metric. This is the exact mirror of how `record_probe_failure_all_cells`
+    /// bumps `LaneState.err` exactly once (only the default cell's `cell_record_failure` touches
+    /// `LaneState.err`; the per-pool cells bump their own separate `BreakerCell.err`). Here the
+    /// per-cell `cell_record_success` touches no `ok`/`err` counter at all, so the single lane-global
+    /// `ok` bump is applied explicitly, once.
+    fn record_probe_success_all_cells(&self, lane: usize);
     fn record_client_fault(&self, lane: usize);
     /// Record a transient upstream failure. `cfg` is the routing pool's resolved breaker config,
     /// which drives the trip decision (error-rate vs consecutive thresholds) and cooldown backoff.
@@ -1734,6 +1751,37 @@ impl StateStore for InMemoryStore {
 
     fn record_success_in(&self, pool: &str, lane: usize) {
         self.record_success_for(pool, lane);
+    }
+
+    fn record_probe_success_all_cells(&self, lane: usize) {
+        let ls = self.get_lane(lane);
+        // Administratively-dead lane: count the success for observability (matching
+        // `record_success_for`'s dead-lane branch) but do not touch the breaker. Bump `ok` exactly
+        // once and return, mirroring `record_probe_failure_all_cells`'s dead-lane early-out.
+        if ls.dead.load(Ordering::Relaxed) {
+            ls.ok.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let now = Self::now_secs();
+        // Default cell (direct/ad-hoc routes) — IS the `LaneState`. `cell_record_success` pushes the
+        // success outcome and runs the HalfOpen→Closed CAS (a no-op on an already-Closed cell, which
+        // is the steady state here since callers run `recover_lane` first on the 2xx path). It does
+        // NOT touch `ok`/`err`, so it never double-counts the lane-global stat. The recovered-bool is
+        // intentionally discarded: any SWRR reset is `record_success_for`'s job on the organic path,
+        // and no cell is HalfOpen here, so there is nothing to reset.
+        let _ = Self::cell_record_success(ls.as_ref(), now);
+        // Every existing per-pool cell for this lane — the cells organic traffic is selected against,
+        // so the probe success dilutes the SAME per-pool error-rate windows the failed-probe path
+        // trips against. Mirrors `record_probe_failure_all_cells`'s `pool_cells` iteration exactly
+        // (existing cells only — a cell not yet created inherits health lazily on first access).
+        let cells = read_recover(&self.pool_cells);
+        for (_pool_name, cell) in cells.get(&lane).into_iter().flatten() {
+            let _ = Self::cell_record_success(cell.as_ref(), now);
+        }
+        // Bump the lane-GLOBAL `ok` counter EXACTLY ONCE per probe (not once per cell). This is the
+        // R24 fix: the prior per-cell `record_success_in` loop bumped `LaneState.ok` (N+1) times for a
+        // lane in N pools. Mirrors `record_probe_failure_all_cells`, which bumps `LaneState.err` once.
+        ls.ok.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_client_fault(&self, lane: usize) {

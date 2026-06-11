@@ -672,33 +672,50 @@ async fn method_not_allowed_handler(uri: axum::http::Uri) -> axum::response::Res
     )
 }
 
+/// The exact body axum 0.7's `DefaultBodyLimit` emits when a request exceeds the limit: its
+/// extractor rejection (`FailedToBufferBody::LengthLimitError`) renders a 413 with this literal
+/// `text/plain` body. This is the SENTINEL used to distinguish axum's OWN body-limit 413 from a
+/// forward-path-relayed upstream 413 (LOW #14): the reshape acts only on a response whose body is
+/// exactly this marker, so a relayed upstream 413 (any other body, JSON or not) passes through
+/// untouched. (Pinned to axum's wire shape; covered by `test_reshape_oversized_413_passthrough`.)
+const AXUM_BODY_LIMIT_413_MARKER: &[u8] = b"length limit exceeded";
+
 /// Reshape an oversized-body rejection into a protocol-native error. axum's `DefaultBodyLimit`
 /// rejects a too-large request with HTTP 413 and a bare `text/plain` body (`"length limit
 /// exceeded"`) — a router/proxy tell no native vendor API emits (the §8.1 indistinguishability
 /// gap). This middleware wraps the body-limit layer: it captures the request path, runs the inner
-/// stack, and when the result is a 413 whose body is NOT already `application/json`, it replaces
-/// that response with the inferred ingress protocol's native JSON `request_too_large` envelope
-/// (Bedrock variants also gain `x-amzn-*` headers, via [`fallback_error_response`]). A 413 that a
-/// real ingress handler already shaped as JSON is passed through untouched.
+/// stack, and when the result is axum's OWN body-limit 413 (identified by the
+/// [`AXUM_BODY_LIMIT_413_MARKER`] sentinel body — NOT merely any non-JSON 413), it replaces that
+/// response with the inferred ingress protocol's native JSON `request_too_large` envelope (Bedrock
+/// variants also gain `x-amzn-*` headers, via [`fallback_error_response`]). Any other 413 — a
+/// forward-path-relayed UPSTREAM 413 (whatever its content-type), or one a real ingress handler
+/// already shaped as JSON — is passed through untouched.
 async fn reshape_body_limit_413(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_owned();
     let resp = next.run(req).await;
-    reshape_oversized_413(&path, resp)
+    reshape_oversized_413(&path, resp).await
 }
 
 /// Pure reshaping step of [`reshape_body_limit_413`], split out so it is unit-testable without
-/// constructing a `Next`. Returns `resp` unchanged unless it is a 413 with a non-JSON body — in
-/// which case it is replaced by the inferred ingress protocol's native JSON `request_too_large`
-/// envelope. A 413 a real ingress handler already shaped as `application/json` is passed through.
-fn reshape_oversized_413(path: &str, resp: axum::response::Response) -> axum::response::Response {
+/// constructing a `Next`. Returns `resp` unchanged unless it is axum's OWN body-limit 413 —
+/// identified by status 413 with a non-JSON content-type AND a body exactly equal to
+/// [`AXUM_BODY_LIMIT_413_MARKER`] — in which case it is replaced by the inferred ingress protocol's
+/// native JSON `request_too_large` envelope. A 413 a real ingress handler already shaped as
+/// `application/json`, or any forward-relayed UPSTREAM 413 (different/non-marker body), is passed
+/// through verbatim (the body is buffered to inspect the sentinel, then re-attached unchanged).
+async fn reshape_oversized_413(
+    path: &str,
+    resp: axum::response::Response,
+) -> axum::response::Response {
     if resp.status() != axum::http::StatusCode::PAYLOAD_TOO_LARGE {
         return resp;
     }
-    // Only reshape the bare-text rejection. If a handler already produced an `application/json`
-    // 413 (a native too-large envelope), leave it alone — re-wrapping would corrupt it.
+    // A handler (or upstream relay) that already produced an `application/json` 413 is a native
+    // too-large envelope — leave it alone without even buffering the body; re-wrapping would
+    // corrupt it, and axum's own body-limit reject is never JSON.
     let is_json = resp
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -706,6 +723,22 @@ fn reshape_oversized_413(path: &str, resp: axum::response::Response) -> axum::re
         .is_some_and(|ct| ct.starts_with("application/json"));
     if is_json {
         return resp;
+    }
+    // Non-JSON 413: it could be axum's OWN body-limit reject (reshape it) OR a forward-relayed
+    // UPSTREAM 413 that happens to be non-JSON (e.g. a `text/plain`/`text/html` upstream error —
+    // LOW #14: must pass through untouched). Distinguish by the sentinel body. Buffer the body so
+    // we can compare it; if it is not the sentinel, re-attach the buffered bytes verbatim.
+    use http_body_util::BodyExt as _;
+    let (parts, body) = resp.into_parts();
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        // A 413 body that fails to buffer cannot be confirmed as axum's sentinel; pass the
+        // already-consumed parts through with an empty body rather than reshape a non-axum reject.
+        Err(_) => return axum::response::Response::from_parts(parts, axum::body::Body::empty()),
+    };
+    if bytes.as_ref() != AXUM_BODY_LIMIT_413_MARKER {
+        // A relayed upstream 413 (or any non-axum 413): pass through untouched, body re-attached.
+        return axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
     }
     fallback_error_response(
         path,
@@ -1037,7 +1070,7 @@ mod tests {
         )
             .into_response();
 
-        let reshaped = reshape_oversized_413("/v1/chat/completions", axum_native_413);
+        let reshaped = reshape_oversized_413("/v1/chat/completions", axum_native_413).await;
         assert_eq!(reshaped.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         let ct = reshaped
             .headers()
@@ -1080,7 +1113,7 @@ mod tests {
         )
             .into_response();
 
-        let reshaped = reshape_oversized_413("/model/some.model/converse", axum_native_413);
+        let reshaped = reshape_oversized_413("/model/some.model/converse", axum_native_413).await;
         assert_eq!(reshaped.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
             reshaped
@@ -1115,7 +1148,7 @@ mod tests {
 
         // Non-413: untouched.
         let ok = (axum::http::StatusCode::OK, "hello").into_response();
-        let passed = reshape_oversized_413("/v1/chat/completions", ok);
+        let passed = reshape_oversized_413("/v1/chat/completions", ok).await;
         assert_eq!(passed.status(), axum::http::StatusCode::OK);
         let bytes = passed.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
@@ -1134,12 +1167,88 @@ mod tests {
             r#"{"error":{"type":"request_too_large","message":"native"}}"#,
         )
             .into_response();
-        let passed = reshape_oversized_413("/v1/chat/completions", already_json);
+        let passed = reshape_oversized_413("/v1/chat/completions", already_json).await;
         let bytes = passed.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             v["error"]["message"], "native",
             "an already-JSON 413 must be passed through, not re-wrapped"
         );
+    }
+
+    /// REGRESSION (LOW #14): a forward-path-relayed UPSTREAM 413 with a NON-JSON content-type (e.g.
+    /// an upstream that itself answers 413 with a `text/plain`/`text/html` body that is NOT axum's
+    /// own `length limit exceeded` marker) must pass through `reshape_oversized_413` UNTOUCHED —
+    /// reshaping it would clobber the upstream's relayed error with busbar's own envelope.
+    ///
+    /// Against the OLD code (which reshaped ANY non-JSON 413) this body would be rewritten into
+    /// busbar's `request_too_large` JSON, so the `text/plain` content-type + verbatim-body
+    /// assertions below fail; after the sentinel gate they pass.
+    #[tokio::test]
+    async fn test_relayed_upstream_413_not_reshaped() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt as _;
+
+        // An upstream-relayed 413 whose body is NOT axum's body-limit sentinel.
+        let upstream_413 = (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            "upstream says: prompt is too long",
+        )
+            .into_response();
+
+        let passed = reshape_oversized_413("/v1/chat/completions", upstream_413).await;
+        assert_eq!(passed.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        // Content-type must remain the upstream's text/plain — NOT rewritten to application/json.
+        assert_eq!(
+            passed
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "a relayed upstream 413 must keep its own content-type, not be reshaped to JSON"
+        );
+        let bytes = passed.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &bytes[..],
+            b"upstream says: prompt is too long",
+            "a relayed upstream 413 body must pass through verbatim, not be clobbered"
+        );
+    }
+
+    /// The sentinel gate must be exact: a non-JSON 413 whose body equals axum's
+    /// [`AXUM_BODY_LIMIT_413_MARKER`] IS reshaped (it is axum's own reject), confirming the
+    /// passthrough above is driven by the body content and not merely the content-type.
+    #[tokio::test]
+    async fn test_axum_marker_413_is_reshaped_even_as_plain_text() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt as _;
+
+        let axum_native_413 = (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            std::str::from_utf8(AXUM_BODY_LIMIT_413_MARKER).unwrap(),
+        )
+            .into_response();
+
+        let reshaped = reshape_oversized_413("/v1/chat/completions", axum_native_413).await;
+        assert_eq!(
+            reshaped
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json"),
+            "axum's own body-limit 413 (sentinel body) must be reshaped to JSON"
+        );
+        let bytes = reshaped.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("reshaped 413 body must be valid JSON");
+        assert!(v.get("error").is_some());
     }
 }

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Matthew Jackson
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde::Deserialize;
 
@@ -96,7 +97,7 @@ pub(crate) struct RootCfg {
     pub(crate) pools: HashMap<String, PoolCfg>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct AuthCfg {
     #[serde(default = "default_auth_mode")]
     pub(crate) mode: String,
@@ -105,6 +106,32 @@ pub(crate) struct AuthCfg {
     pub(crate) _legacy_token: Option<String>,
     #[serde(default)]
     pub(crate) client_tokens: Vec<String>,
+}
+
+// MANUAL Debug that REDACTS every credential field. A derived `Debug` would print every entry of
+// `client_tokens` AND the deprecated `_legacy_token` in PLAINTEXT — a latent credential leak the
+// moment an `AuthCfg` (or any struct that embeds it, e.g. `RootCfg`/`DeployCfg`) is debug-logged.
+// Print only the COUNT of allowlist tokens and presence of the legacy token, never the values (and
+// never any prefix/suffix, which would be a partial-secret oracle). Mirrors `auth::AuthMiddleware`.
+impl fmt::Debug for AuthCfg {
+    #[allow(deprecated)] // reading the deprecated field solely to redact it
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthCfg")
+            .field("mode", &self.mode)
+            .field(
+                "_legacy_token",
+                &if self._legacy_token.is_some() {
+                    "<redacted; present>"
+                } else {
+                    "<absent>"
+                },
+            )
+            .field(
+                "client_tokens",
+                &format_args!("<redacted; {} configured>", self.client_tokens.len()),
+            )
+            .finish()
+    }
 }
 
 impl AuthCfg {
@@ -147,7 +174,7 @@ fn default_auth_mode() -> String {
     crate::auth::AuthMode::NONE.to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct ProviderCfg {
     #[serde(default = "default_protocol")]
     pub(crate) protocol: String,
@@ -167,6 +194,32 @@ pub(crate) struct ProviderCfg {
     // Future fields (parse and be inert):
     #[serde(default, rename = "api_key")]
     pub(crate) _legacy_api_key: Option<String>,
+}
+
+// MANUAL Debug that REDACTS the legacy inline API key. A derived `Debug` would print
+// `_legacy_api_key` in PLAINTEXT — a latent credential leak if a `ProviderCfg` (or `RootCfg`, which
+// holds them) is debug-logged. `api_key_env` is only the NAME of an env var, not the secret, so it
+// stays. Print presence only for the legacy key, never the value.
+impl fmt::Debug for ProviderCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderCfg")
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("health", &self.health)
+            .field("error_map", &self.error_map)
+            .field("path", &self.path)
+            .field("auth", &self.auth)
+            .field(
+                "_legacy_api_key",
+                &if self._legacy_api_key.is_some() {
+                    "<redacted; present>"
+                } else {
+                    "<absent>"
+                },
+            )
+            .finish()
+    }
 }
 
 fn default_protocol() -> String {
@@ -455,7 +508,7 @@ pub(crate) struct ProviderDef {
 }
 
 /// Provider deployment - operator config in config.yaml (names provider + supplies key).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub(crate) struct ProviderDeploy {
     pub(crate) api_key_env: String,
     #[serde(default)]
@@ -482,6 +535,32 @@ pub(crate) struct ProviderDeploy {
     pub(crate) _legacy_api_key: Option<String>,
 }
 
+// MANUAL Debug that REDACTS the legacy inline API key. A derived `Debug` would print
+// `_legacy_api_key` in PLAINTEXT — a latent credential leak if a `ProviderDeploy` (or `DeployCfg`,
+// which holds them) is debug-logged. `api_key_env` is only the NAME of an env var, not the secret,
+// so it stays. Print presence only for the legacy key, never the value.
+impl fmt::Debug for ProviderDeploy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderDeploy")
+            .field("api_key_env", &self.api_key_env)
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("error_map", &self.error_map)
+            .field("path", &self.path)
+            .field("auth", &self.auth)
+            .field("health", &self.health)
+            .field(
+                "_legacy_api_key",
+                &if self._legacy_api_key.is_some() {
+                    "<redacted; present>"
+                } else {
+                    "<absent>"
+                },
+            )
+            .finish()
+    }
+}
+
 /// Deployment configuration - operator-owned config.yaml structure.
 #[derive(Debug, Deserialize)]
 pub(crate) struct DeployCfg {
@@ -505,7 +584,7 @@ pub(crate) struct DeployCfg {
 
 /// Governance config. When present + enabled, callers authenticate with virtual keys
 /// (not the static auth token) and are subject to per-key allowed-pools / budgets / rate limits.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub(crate) struct GovernanceCfg {
     #[serde(default)]
     pub(crate) enabled: bool,
@@ -522,6 +601,28 @@ pub(crate) struct GovernanceCfg {
     /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,
+}
+
+// MANUAL Debug that REDACTS the admin bearer token. A derived `Debug` would print `admin_token` in
+// PLAINTEXT — a latent credential leak if a `GovernanceCfg` (or `DeployCfg`, which holds it) is
+// debug-logged. Print presence only, never the value.
+impl fmt::Debug for GovernanceCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GovernanceCfg")
+            .field("enabled", &self.enabled)
+            .field("db_path", &self.db_path)
+            .field("price_per_request_cents", &self.price_per_request_cents)
+            .field("price_per_1k_tokens_cents", &self.price_per_1k_tokens_cents)
+            .field(
+                "admin_token",
+                &if self.admin_token.is_some() {
+                    "<redacted; present>"
+                } else {
+                    "<absent>"
+                },
+            )
+            .finish()
+    }
 }
 
 fn default_gov_db_path() -> String {
@@ -1516,5 +1617,143 @@ models: {}
             default_max_cooldown(),
             "max_cooldown_secs default diverged from default_max_cooldown()"
         );
+    }
+
+    /// REGRESSION (LOW #15/#16, SECURITY): every config struct that carries a secret must REDACT it
+    /// in `Debug`, not print it in plaintext. A derived `Debug` (the pre-R24 state for AuthCfg,
+    /// GovernanceCfg, ProviderCfg, ProviderDeploy) would leak the literal token/api_key the moment
+    /// the struct — or any struct that embeds it (RootCfg/DeployCfg) — is debug-logged. Against the
+    /// old derived impls these assertions FAIL (the secret appears); they pass once the manual
+    /// redacting impls are in place. The secret values are deliberately distinctive so a substring
+    /// search is decisive.
+    #[test]
+    #[allow(deprecated)] // constructing the deprecated `_legacy_token` field solely to verify redaction
+    fn test_debug_redacts_all_config_secrets() {
+        // AuthCfg: client_tokens + the deprecated _legacy_token.
+        let auth = AuthCfg {
+            mode: "token".to_string(),
+            _legacy_token: Some("SECRET-legacy-auth-token-xyz".to_string()),
+            client_tokens: vec![
+                "SECRET-client-token-aaa".to_string(),
+                "SECRET-client-token-bbb".to_string(),
+            ],
+        };
+        let dbg = format!("{auth:?}");
+        assert!(
+            !dbg.contains("SECRET-legacy-auth-token-xyz"),
+            "AuthCfg Debug leaked the legacy token: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET-client-token-aaa") && !dbg.contains("SECRET-client-token-bbb"),
+            "AuthCfg Debug leaked a client token: {dbg}"
+        );
+        assert!(
+            dbg.contains("2 configured"),
+            "AuthCfg Debug should report the allowlist COUNT: {dbg}"
+        );
+
+        // GovernanceCfg: admin_token.
+        let gov = GovernanceCfg {
+            enabled: true,
+            db_path: "x.db".to_string(),
+            price_per_request_cents: 1,
+            price_per_1k_tokens_cents: 0,
+            admin_token: Some("SECRET-admin-bearer-token-qqq".to_string()),
+        };
+        let dbg = format!("{gov:?}");
+        assert!(
+            !dbg.contains("SECRET-admin-bearer-token-qqq"),
+            "GovernanceCfg Debug leaked admin_token: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted; present>"),
+            "GovernanceCfg Debug should mark admin_token present-but-redacted: {dbg}"
+        );
+
+        // ProviderCfg: inline _legacy_api_key.
+        let prov = ProviderCfg {
+            protocol: "anthropic".to_string(),
+            base_url: "https://example".to_string(),
+            api_key_env: "PROV_KEY".to_string(),
+            health: None,
+            error_map: HashMap::new(),
+            path: None,
+            auth: None,
+            _legacy_api_key: Some("SECRET-inline-provider-key-www".to_string()),
+        };
+        let dbg = format!("{prov:?}");
+        assert!(
+            !dbg.contains("SECRET-inline-provider-key-www"),
+            "ProviderCfg Debug leaked the inline api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("PROV_KEY"),
+            "ProviderCfg Debug should still show the api_key_env NAME (not a secret): {dbg}"
+        );
+
+        // ProviderDeploy: inline _legacy_api_key.
+        let deploy = ProviderDeploy {
+            api_key_env: "DEPLOY_KEY".to_string(),
+            _legacy_api_key: Some("SECRET-inline-deploy-key-zzz".to_string()),
+            ..ProviderDeploy::default()
+        };
+        let dbg = format!("{deploy:?}");
+        assert!(
+            !dbg.contains("SECRET-inline-deploy-key-zzz"),
+            "ProviderDeploy Debug leaked the inline api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("DEPLOY_KEY"),
+            "ProviderDeploy Debug should still show the api_key_env NAME (not a secret): {dbg}"
+        );
+    }
+
+    /// REGRESSION (LOW #15/#16, SECURITY): the redaction must hold TRANSITIVELY — a derived `Debug`
+    /// on an embedding struct (DeployCfg) delegates to each field's `Debug`, so the redacting impls
+    /// above are what protect the whole-config dump an operator is most likely to log. This builds a
+    /// DeployCfg containing every secret and asserts none survive its Debug output.
+    #[test]
+    #[allow(deprecated)]
+    fn test_debug_redacts_secrets_transitively_through_deploycfg() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprov".to_string(),
+            ProviderDeploy {
+                api_key_env: "DEPLOY_KEY".to_string(),
+                _legacy_api_key: Some("SECRET-embedded-deploy-key".to_string()),
+                ..ProviderDeploy::default()
+            },
+        );
+        let deploy = DeployCfg {
+            listen: "127.0.0.1:8080".to_string(),
+            auth: Some(AuthCfg {
+                mode: "token".to_string(),
+                _legacy_token: Some("SECRET-embedded-legacy-token".to_string()),
+                client_tokens: vec!["SECRET-embedded-client-token".to_string()],
+            }),
+            providers,
+            models: HashMap::new(),
+            pools: HashMap::new(),
+            observability: None,
+            governance: Some(GovernanceCfg {
+                enabled: true,
+                db_path: "x.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: Some("SECRET-embedded-admin-token".to_string()),
+            }),
+        };
+        let dbg = format!("{deploy:?}");
+        for secret in [
+            "SECRET-embedded-deploy-key",
+            "SECRET-embedded-legacy-token",
+            "SECRET-embedded-client-token",
+            "SECRET-embedded-admin-token",
+        ] {
+            assert!(
+                !dbg.contains(secret),
+                "DeployCfg Debug leaked a nested secret ({secret}): {dbg}"
+            );
+        }
     }
 }

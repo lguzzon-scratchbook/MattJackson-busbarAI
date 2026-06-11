@@ -172,6 +172,25 @@ pub(crate) async fn create_key(
             json!({"error": "tpm_limit must be >= 1 (omit the field for unlimited)"}),
         );
     }
+    // NON-FATAL ingress diagnostic for `allowed_pools`. Unlike the rejections above, an
+    // allowed-pools entry that names no currently-configured pool is NOT a 400: minting a key whose
+    // pool will be configured later is a legitimate, supported workflow (key first, pool wired
+    // afterward), so the store accepts any string. But an entry that matches no configured pool is
+    // far more often a typo (`"smrt"` for `"smart"`) than a deliberate forward reference, and a
+    // typo'd allow-entry silently scopes the key to a pool it can never reach. Surface it at the
+    // ingress with a `tracing::warn!` (matching the module's validate-at-ingress convention) so the
+    // typo is visible in logs, while still creating the key — the forward-reference case stays
+    // unbroken. `app.pools` is the authoritative set of configured pool names (see `state::App`).
+    for pool in &req.allowed_pools {
+        if !app.pools.contains_key(pool) {
+            tracing::warn!(
+                pool = %pool,
+                key_name = %req.name,
+                "create_key: allowed_pools entry names no configured pool (possible typo; \
+                 key still created — configure the pool later to activate this entry)"
+            );
+        }
+    }
     let spec = NewKeySpec {
         name: req.name,
         allowed_pools: req.allowed_pools,
@@ -360,6 +379,62 @@ mod tests {
     use crate::governance::{GovState, NewKeySpec, SqliteStore};
     use crate::test_support::TestApp;
     use std::sync::Arc;
+
+    /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
+    /// assert a particular `tracing::warn!` fired (mirrors the established pattern in config.rs /
+    /// config_validate.rs / eventstream.rs).
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            // Capture the rendered message AND every other field (e.g. the structured `pool` /
+            // `key_name` on create_key's diagnostic) so a test can assert on a field value, not just
+            // the static message text. Fields are flattened into one `key=value` string per event.
+            #[derive(Default)]
+            struct Vis {
+                message: String,
+                fields: String,
+            }
+            impl Vis {
+                fn record(&mut self, field: &tracing::field::Field, rendered: String) {
+                    if field.name() == "message" {
+                        self.message = rendered;
+                    } else {
+                        if !self.fields.is_empty() {
+                            self.fields.push(' ');
+                        }
+                        self.fields
+                            .push_str(&format!("{}={}", field.name(), rendered));
+                    }
+                }
+            }
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.record(field, format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.record(field, value.to_string());
+                }
+            }
+            let mut vis = Vis::default();
+            event.record(&mut vis);
+            if let Ok(mut msgs) = self.0.lock() {
+                msgs.push(format!("{} {}", vis.message, vis.fields));
+            }
+        }
+    }
 
     /// Build a router whose App has governance enabled with a known admin token, returning the
     /// listen address + the live server handle.
@@ -844,6 +919,102 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[test]
+    fn test_create_key_warns_on_unconfigured_allowed_pool() {
+        // Regression (LOW #13, completeness): create_key accepted `allowed_pools` with NO ingress
+        // diagnostic, unlike its sibling validations. An entry naming no configured pool must NOT be
+        // a 400 (minting a key before its pool exists is a supported forward-reference workflow), but
+        // it MUST surface a NON-FATAL `tracing::warn!` so a typo (`"smrt"` for `"smart"`) is visible.
+        // Against the old code (no warn) the unknown-pool assertion FAILS; it passes once the
+        // diagnostic is emitted. We also assert the key is still created (201) and that a configured
+        // pool produces NO warning (no false positive on the legitimate path).
+        //
+        // The diagnostic fires synchronously in the handler BEFORE the `spawn_blocking().await`, so a
+        // thread-local subscriber (`with_default`) on a current-thread runtime captures it — we call
+        // the handler directly rather than through the HTTP server (whose task would run on a
+        // different thread, out of the subscriber's reach).
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        // App has exactly one configured pool, "smart" (lane 0). "smrt" is the typo'd sibling.
+        let app = TestApp::new()
+            .lane(crate::test_support::LaneSpec::new(
+                "m",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:0",
+            ))
+            .pool("smart", &[(0, 1)])
+            .governance(gov)
+            .build();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let (unknown_status, known_status) = tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                // Request 1: references "smart" (configured, OK) AND "smrt" (typo, no such pool).
+                let req1: super::CreateKeyReq = serde_json::from_value(serde_json::json!({
+                    "name": "k-typo",
+                    "allowed_pools": ["smart", "smrt"]
+                }))
+                .unwrap();
+                let r1 =
+                    super::create_key(axum::extract::State(app.clone()), axum::extract::Json(req1))
+                        .await;
+                let s1 = r1.status().as_u16();
+
+                // Request 2: references ONLY the configured pool — no warning expected.
+                let req2: super::CreateKeyReq = serde_json::from_value(serde_json::json!({
+                    "name": "k-ok",
+                    "allowed_pools": ["smart"]
+                }))
+                .unwrap();
+                let r2 =
+                    super::create_key(axum::extract::State(app), axum::extract::Json(req2)).await;
+                let s2 = r2.status().as_u16();
+                (s1, s2)
+            })
+        });
+
+        // Both keys are still created — the diagnostic is non-fatal (forward-reference preserved).
+        assert_eq!(
+            unknown_status, 201,
+            "an unconfigured allowed_pool must NOT 400 — the key is still minted"
+        );
+        assert_eq!(
+            known_status, 201,
+            "a configured allowed_pool creates the key"
+        );
+
+        let msgs = cap.0.lock().unwrap();
+        // Exactly one warning, naming the typo'd pool — "smart" (configured) must NOT warn.
+        let pool_warns: Vec<&String> = msgs
+            .iter()
+            .filter(|m| m.contains("allowed_pools entry names no configured pool"))
+            .collect();
+        assert_eq!(
+            pool_warns.len(),
+            1,
+            "exactly one allowed_pools diagnostic expected (only the typo'd entry): {msgs:?}"
+        );
+        assert!(
+            pool_warns[0].contains("smrt"),
+            "the warning must name the typo'd pool 'smrt': {:?}",
+            pool_warns[0]
+        );
+        assert!(
+            !pool_warns[0].contains("smart\""),
+            "the configured pool 'smart' must NOT be reported as unconfigured: {:?}",
+            pool_warns[0]
+        );
     }
 
     #[tokio::test]
