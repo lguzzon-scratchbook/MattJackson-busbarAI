@@ -7,7 +7,9 @@
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-1.0.0--rc.4-blue)
 
-**Docs:** [ai-bus.bar](https://ai-bus.bar) · **Install:** `curl -fsSL https://ai-bus.bar/install.sh | sh` · **Agent-readable:** [ai-bus.bar/llms.txt](https://ai-bus.bar/llms.txt)
+📖 **Docs:** [ai-bus.bar](https://ai-bus.bar)  
+⚡ **Install:** `curl -fsSL https://ai-bus.bar/install.sh | sh`  
+🤖 **Agent-readable:** [ai-bus.bar/llms.txt](https://ai-bus.bar/llms.txt)
 
 Busbar sits between your application and your LLM providers. Point any SDK — OpenAI, Anthropic, Gemini, Bedrock, Cohere — at one URL, and it routes, translates, and **keeps serving through provider failures**. It's a different class of tool than a proxy with a long model list.
 
