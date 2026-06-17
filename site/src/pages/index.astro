@@ -215,9 +215,9 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
         <div class="col col-providers">
           <div class="col-label">Backends · any provider</div>
-          <div class="node">Anthropic</div>
-          <div class="node">OpenAI</div>
+          <div class="node">Anthropic · OpenAI</div>
           <div class="node">Gemini · Bedrock</div>
+          <div class="node node-more">+ 38 more</div>
         </div>
       </div>
     </section>
@@ -456,6 +456,17 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         background: #fff; border: 1px solid var(--line); border-radius: 9px;
         padding: 11px 14px; font-size: 13.5px; font-weight: 600; color: var(--charcoal);
         box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+      }
+      /* Provider tiles read as an OPEN SET of many — a stacked-deck depth distinguishes them
+         from the exact six protocol boxes on the left (different kind of thing, not a 1:1 mirror). */
+      .col-providers .node:not(.node-more) {
+        box-shadow: 0 1px 2px rgba(15,23,42,0.04),
+          4px 4px 0 -1px #fff, 4px 4px 0 0 var(--line),
+          8px 8px 0 -1px #fff, 8px 8px 0 0 var(--line);
+      }
+      /* The "+ N more" tile: dashed + muted, clearly "the rest / any provider", not a missing slot. */
+      .node-more {
+        background: transparent; border-style: dashed; color: var(--muted); box-shadow: none;
       }
       .link-zone svg { width: 100%; height: 150px; }
       .link-zone path { fill: none; stroke: #cbd5e1; stroke-width: 1.6; stroke-dasharray: 5 5; }
