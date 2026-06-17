@@ -418,6 +418,8 @@ curl -s -X POST http://localhost:8080/admin/keys \
 
 Response includes `id` (`vk_<16hex>`), `secret` (`sk-bb-<32hex>`, **shown once**), and all attributes. Store the secret immediately.
 
+To also issue an AWS credential pair for Bedrock-SDK clients, add `"issue_aws_credential": true` to the request body. The 201 response then additionally includes `aws_access_key_id` and `aws_secret_access_key` — both shown **once** and never returned by any subsequent read API. Configure your Bedrock SDK with those credentials; Busbar verifies the inbound SigV4 signature and enforces the key's governance controls. See [Bedrock ingress](protocols.md#bedrock).
+
 Create-key field validation: `budget_period` must be `total`, `daily`, or `monthly` (400 otherwise); `max_budget_cents` must be ≥ 0; `rpm_limit` and `tpm_limit` must each be ≥ 1 when set. `allowed_pools` that name no configured pool logs a warning but does not fail.
 
 #### List keys
@@ -466,7 +468,7 @@ Understanding where each limit is precise and where it is approximate is importa
 
 **TPM** — best-effort. Token counts are recorded post-response, after the upstream reports them. In-flight concurrent requests do not yet contribute to the window. The first request of each new 60-second window is always admitted regardless of the previous window's total. If multiple large concurrent requests arrive simultaneously at the window boundary, all may be admitted before the TPM limit kicks in.
 
-**Budget** — soft under concurrency. The over-budget check (read) and the spend charge (write) are not atomic. Under high concurrency, simultaneous requests may both pass the over-budget check and both be charged, causing the key to overshoot its budget by up to the number of concurrent requests at that instant. The over-budget check also fails open (treats the request as not over budget) on a store error, to preserve availability. Budget is best used as a spending guardrail, not a hard accounting guarantee.
+**Budget** — soft under concurrency. The over-budget check (read) and the spend charge (write) are not atomic. Under high concurrency, simultaneous requests may both pass the over-budget check and both be charged, causing the key to overshoot its budget by up to the number of concurrent requests at that instant. On a store error during the admission check, behavior is controlled by `governance.budget_on_store_error`: the default `allow` fails open (preserves availability); set `deny` for a hard budget guarantee that rejects on any store error. A definitive over-budget result always rejects regardless of this setting. Budget is best used as a spending guardrail unless you set `deny`.
 
 **`allowed_pools` ACL** — precise and pre-forwarding. A key with `allowed_pools: ["fast"]` trying to target `overflow` or any direct model route not in the list gets `403` before any upstream call.
 
@@ -540,6 +542,12 @@ Always enabled; no config needed.
 | `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout`, `connect`, `transient_upstream`, `hard_down`, or `context_length`. A high rate on one pool indicates a flapping member. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. Useful for auditing unexpected protocol conversion. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency including failover hops. |
+| `busbar_key_spend_cents` | gauge | `key` | Per-virtual-key spend in cents for the current budget window (scrape-time). Only emitted when governance is enabled. Use for burn-rate alerting. |
+| `busbar_key_budget_remaining_cents` | gauge | `key` | Max budget minus current spend for keys with a `max_budget_cents` cap. Only emitted for capped keys. Drive Prometheus budget-burn alerts. |
+| `busbar_key_tokens_total` | gauge | `key` | Accumulated tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
+| `busbar_lane_state` | gauge | `pool`, `lane` | Per-(pool, lane-index) circuit-breaker health: `0` = Closed (healthy), `1` = HalfOpen (cooling, probe admitted), `2` = Open (tripped). Side-effect-free at scrape time. |
+| `busbar_route_decisions_total` | counter | `pool`, `policy`, `outcome` | Routing policy decisions. `outcome` is `prefer`, `abstain`, `timeout`, `error`, or `reject`. |
+| `busbar_route_decision_seconds` | histogram | `pool`, `policy` | Routing policy decision latency (webhook/script only). |
 
 The `pool` label is always a configured pool name or the sentinel `unresolved` (for routes that did not resolve to a pool). It is never a raw client-supplied model string, which would create unbounded label cardinality.
 

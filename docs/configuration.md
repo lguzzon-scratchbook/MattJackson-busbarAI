@@ -222,7 +222,12 @@ auth:
 - `mode: none` + non-empty `client_tokens` → startup warning (the list has no effect).
 - `mode: passthrough` + a provider whose `api_key_env` resolves to a non-empty value → startup warning (credential-leak risk: an unauthenticated caller's request will carry Busbar's own key to the upstream).
 
-**Bedrock ingress.** Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization: AWS4-HMAC-SHA256 …`). Busbar's auth middleware only recognises bearer-style carriers — it does not verify inbound SigV4 (signing is outbound-only). A SigV4-signed request therefore carries no token Busbar can match and is rejected 403 (AccessDenied) under `token` or governance mode. **Bedrock ingress must use `mode: passthrough` (or `mode: none`)**, where the SigV4 header is ignored by Busbar and forwarded upstream. All other five ingress protocols use bearer-style auth and work in every mode.
+**Bedrock ingress.** Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization: AWS4-HMAC-SHA256 …`). There are two tracks:
+
+- **Without governance** (`mode: passthrough` or `none`): Busbar does not verify the inbound SigV4 signature. The header is forwarded upstream (passthrough) or ignored entirely (none). Use this for transparent Bedrock proxying without per-key controls.
+- **With governance** (`mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+
+All other five ingress protocols use bearer-style auth and work in every mode.
 
 ---
 
@@ -404,7 +409,7 @@ pools:
 | `script` | string | none | `script` | Inline Rhai source string. Exactly one of `script` or `script_file` is required when `route: script`. Mutually exclusive with `script_file`. |
 | `script_file` | string | none | `script` | Path to a Rhai script file on disk. Alternative to inline `script`. |
 
-The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See [routing.md](routing.md) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route` observability header.
+The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See [routing.md](routing.md) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
 
 ---
 
@@ -607,13 +612,14 @@ governance:
 | `admin_token` | string | no | none (admin API disabled) | Must be non-empty (non-whitespace) when `enabled: true` | Guards the `/admin/keys` API. If absent when `enabled: true`, Busbar refuses to start (the admin API would be silently inaccessible). |
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
+| `budget_on_store_error` | string | no | `allow` | `allow` or `deny` | Behavior when the budget store errors during the atomic admission check-and-charge. `allow` (default) fails open — the request proceeds, preserving availability on a store hiccup. `deny` fails closed — the request is rejected, providing a hard budget guarantee for security/regulated deployments. A definitive over-budget result always rejects regardless of this setting. |
 
 **Budget spend per request:** `price_per_request_cents + (total_tokens / 1000) * price_per_1k_tokens_cents`.
 
 **Enforcement semantics (important for operators):**
 - **RPM is precise.** The per-minute counter is incremented synchronously on admission.
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
-- **Budget is best-effort/soft under concurrency.** The budget check and deduction are not atomic; concurrent requests can overshoot. Overshoot is bounded by the degree of parallelism, not unbounded. The check fails open on store errors (requests are admitted) to preserve availability.
+- **Budget is best-effort/soft under concurrency.** The budget check and deduction are not atomic; concurrent requests can overshoot. Overshoot is bounded by the degree of parallelism, not unbounded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed hard guarantee).
 
 **Incompatible combination:** `enabled: true` + `auth.mode: passthrough` is a startup error. Governance supersedes passthrough; the combination is unsupported.
 
@@ -623,13 +629,13 @@ governance:
 
 | Route | Method | Description |
 |---|---|---|
-| `/admin/keys` | `POST` | Mint a new virtual key. Returns plaintext secret once. |
+| `/admin/keys` | `POST` | Mint a new virtual key. Returns plaintext bearer `secret` once. Pass `"issue_aws_credential": true` to also receive `aws_access_key_id` + `aws_secret_access_key` for Bedrock-SDK clients (both shown once). |
 | `/admin/keys` | `GET` | List all keys (metadata only; no secrets). |
 | `/admin/keys/:id` | `PATCH` | Update key fields. Three-state semantics: absent = unchanged, `null` = clear to unlimited, value = set. |
 | `/admin/keys/:id/usage` | `GET` | Current-window spend, tokens, and request count. |
 | `/admin/keys/:id` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
 
-See [operations.md](operations.md) for the full admin API payload schemas and virtual key fields.
+See [operations.md](operations.md) for the full admin API payload schemas and virtual key fields, including the `issue_aws_credential` Bedrock SigV4 option.
 
 ---
 

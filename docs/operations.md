@@ -95,6 +95,12 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout` / `connect` / `transient_upstream` / `hard_down`. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency. |
+| `busbar_key_spend_cents` | gauge | `key` | Per-virtual-key spend in cents for the current budget window. Only emitted when governance is enabled. |
+| `busbar_key_budget_remaining_cents` | gauge | `key` | Max budget minus current spend for capped keys. Enables Prometheus burn-rate alerting. Only emitted for keys with a `max_budget_cents` cap. |
+| `busbar_key_tokens_total` | gauge | `key` | Tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
+| `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
+| `busbar_route_decisions_total` | counter | `pool`, `policy`, `outcome` | Routing policy decisions. `outcome` is `prefer` / `abstain` / `timeout` / `error` / `reject`. |
+| `busbar_route_decision_seconds` | histogram | `pool`, `policy` | Policy decision latency (webhook/script policies only). |
 
 `/metrics` requires a valid client token in `token` mode (or a virtual key under
 governance) — it is treated as an information-disclosure surface and goes through
@@ -220,9 +226,10 @@ the admin API returns `401`.
 
 | Method · Route | Purpose |
 |---|---|
-| `POST /admin/keys` | Mint a virtual key. The plaintext secret is returned **once**. |
+| `POST /admin/keys` | Mint a virtual key. The plaintext secret is returned **once**. Pass `"issue_aws_credential": true` to also mint an AWS credential pair for Bedrock-SDK clients (see below). |
 | `GET /admin/keys` | List key metadata (never secrets/hashes). |
 | `GET /admin/keys/:id/usage` | Current-window usage: `spend_cents`, `tokens`, `requests`. |
+| `PATCH /admin/keys/:id` | Update key fields (budget, rate limits, allowed pools). Three-state: absent = unchanged, `null` = clear to unlimited, value = set. |
 | `DELETE /admin/keys/:id` | Revoke a key. |
 
 ### Creating a key
@@ -251,6 +258,7 @@ Create-key fields:
 | `budget_period` | string | `total` | `total` (all-time), `daily` (UTC midnight), or `monthly` (UTC first-of-month). |
 | `rpm_limit` | integer | none | Requests per 60s window; exceeded → `429` + `Retry-After`. |
 | `tpm_limit` | integer | none | Tokens per 60s window; exceeded → `429` + `Retry-After`. |
+| `issue_aws_credential` | bool | `false` | When `true`, also issues an AWS-style `aws_access_key_id` + `aws_secret_access_key` for inbound SigV4 auth (Bedrock SDK clients). Both fields are returned **once** in the 201 response alongside the bearer `secret` and never again. See [Bedrock ingress with governance](protocols.md#bedrock). |
 
 ### Enforcement model
 

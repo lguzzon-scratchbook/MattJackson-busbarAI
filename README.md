@@ -9,7 +9,7 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-1.0.0--rc.4-blue)
+![Status](https://img.shields.io/badge/status-1.0.0--rc.5-blue)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
@@ -25,7 +25,7 @@ Busbar sits between your application and your LLM providers. Point any SDK — O
 
 A single static Rust binary — no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
 
-> **Status: 1.0.0-rc.4** — feature-complete, API-stable, hardened across a multi-round security and correctness audit. AGPL-3.0.
+> **Status: 1.0.0-rc.5** — feature-complete, API-stable, hardened across a multi-round security and correctness audit. AGPL-3.0.
 
 ---
 

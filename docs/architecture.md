@@ -124,15 +124,9 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 - With governance disabled, the static `AuthMode` applies (`token` allowlist,
   `passthrough`, or `none`). The caller's bearer token is threaded through for
   passthrough forwarding.
-- **Bedrock ingress** is the one exception to "any ingress works in any mode".
-  `extract_client_token` only reads bearer-style carriers (`Authorization: Bearer`,
-  `x-api-key`, `x-goog-api-key`); it deliberately ignores SigV4
-  (`Authorization: AWS4-HMAC-SHA256 …`). busbar has no inbound SigV4 verifier
-  (`src/sigv4.rs` is sign-only). A native Bedrock SDK client therefore presents no
-  matchable token and is rejected `403` (AccessDenied — a genuine SigV4 rejection is 403,
-  not 401) under `token`/governance mode, so Bedrock
-  ingress must run under `passthrough` (or `none`), where the caller's SigV4
-  credentials are forwarded upstream.
+- **Bedrock ingress** has two modes depending on governance:
+  - *Without governance* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
+  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and — on success — attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth.rs`.
 
 ### 3. Governance checks
 

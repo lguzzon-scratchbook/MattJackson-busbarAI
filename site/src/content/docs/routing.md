@@ -127,9 +127,7 @@ Use this when your members have different `max_concurrent` limits or when you wa
 
 `policy.name: usage`
 
-> **Landing alongside.** The `usage` policy is registered and passes startup validation, but the rate-headroom signal it ranks on (RPM/TPM headroom from upstream governance counters) is still being wired by a parallel effort. Until that signal is plumbed, `usage` always abstains and falls back to SWRR.
-
-Intended behavior: prefer the member with the most remaining upstream rate-limit headroom, routing traffic away from lanes approaching their RPM/TPM limit toward lanes with more capacity. Per-lane lifetime budget (`max_requests` / `budget_remaining`) is a separate, already-available signal — `usage` specifically targets the rate-headroom gap.
+Prefers the member with the most remaining rate-limit headroom (RPM/TPM headroom from the caller key's governance counters). The `rate_headroom` signal is computed in `src/forward.rs` (`rate_headroom_for_token`) and passed to each `Candidate` before the routing decision. Candidates with no headroom signal (`None`, e.g. when governance is disabled or no rate limit is set) are demoted to last but remain reachable. Abstains only when every candidate lacks the signal (no rate limit in play), falling back to SWRR.
 
 ---
 
@@ -249,7 +247,7 @@ Rules:
 - `abstain: true` explicitly signals no preference; the `order` field is ignored if present alongside it.
 - Any non-2xx response, malformed JSON, or timeout applies `on_error` (same as abstain for the default `on_error: weighted`).
 
-**Transparency.** Every response carries an `x-busbar-route` header recording which policy was used, which candidate was chosen, and why — for example `webhook/claude-sonnet/prefer` or `webhook/claude-sonnet/fallback-timeout`.
+**Transparency.** Every response with a non-default routing policy carries two headers: `x-busbar-route-policy` (the policy name) and `x-busbar-route-target` (the chosen lane model) — for example `x-busbar-route-policy: webhook` and `x-busbar-route-target: claude-sonnet`.
 
 ### script (Rhai)
 
@@ -464,14 +462,15 @@ pools:
 
 ## Observability
 
-**Response header.** Every request with a non-default routing policy emits `x-busbar-route: <policy>/<lane>[/<reason>]`:
+**Response headers.** Every request with a non-default routing policy emits two headers (`src/forward.rs` constants `HDR_ROUTE_POLICY` and `HDR_ROUTE_TARGET`):
 
-| Example | Meaning |
+- `x-busbar-route-policy: <policy>` — the policy name that made the decision (e.g. `webhook`, `native:cheapest`)
+- `x-busbar-route-target: <chosen-lane-model>` — the model of the chosen lane (e.g. `claude-sonnet`, `gpt-4o-mini`)
+
+| Example headers | Meaning |
 |---|---|
-| `webhook/claude-sonnet/prefer` | Webhook policy chose `claude-sonnet` explicitly |
-| `native:cheapest/gpt-4o-mini/prefer` | Native cheapest policy chose `gpt-4o-mini` |
-| `webhook/claude-sonnet/fallback-timeout` | Webhook timed out; SWRR chose `claude-sonnet` |
-| `weighted/claude-sonnet/abstain` | Default SWRR (no policy or policy abstained) |
+| `x-busbar-route-policy: webhook` / `x-busbar-route-target: claude-sonnet` | Webhook policy chose `claude-sonnet` |
+| `x-busbar-route-policy: native:cheapest` / `x-busbar-route-target: gpt-4o-mini` | Native cheapest policy chose `gpt-4o-mini` |
 
 **Prometheus metrics:**
 

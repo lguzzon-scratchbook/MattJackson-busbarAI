@@ -96,7 +96,7 @@ There is no Python environment to manage, no Node runtime, no database to provis
 
 **The request body cap is 32 MiB** (`DefaultBodyLimit`), enforced before handler code runs, with protocol-native 413 responses (not bare text).
 
-One auth caveat to plan around: Busbar signs outbound Bedrock requests with AWS SigV4 but does not verify inbound SigV4. Bedrock ingress therefore cannot be used under `token` auth mode — it must use `passthrough`, where the caller's own credentials are forwarded upstream.
+One auth note for Bedrock: Busbar signs outbound Bedrock requests with AWS SigV4 AND verifies inbound SigV4 (when governance is enabled). Under governance, a Bedrock-SDK client authenticates with a minted `aws_access_key_id` + `aws_secret_access_key` pair — Busbar verifies the signature and enforces budgets / rate limits exactly like a bearer-token client. Without governance, Bedrock ingress requires `auth.mode: passthrough` (credentials forwarded upstream) or `none`.
 
 ---
 
@@ -121,6 +121,6 @@ One auth caveat to plan around: Busbar signs outbound Bedrock requests with AWS 
 
 ## Current status
 
-Busbar is at **1.0.0-rc.4**, licensed AGPL-3.0-or-later. The wire protocol translation, circuit breaker model, governance layer, and admin API are stable at this release candidate. The test suite covers approximately 1,334 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
+Busbar is at **1.0.0-rc.5**, licensed AGPL-3.0-or-later. The wire protocol translation, circuit breaker model, governance layer, and admin API are stable at this release candidate. The test suite covers over 1,500 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
 
 The AGPL license means that if you modify Busbar and run it as a networked service, you must make the modified source available. Read the LICENSE file before deploying in a commercial context.
