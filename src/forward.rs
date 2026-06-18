@@ -415,7 +415,8 @@ pub(crate) fn translate_request_cross_protocol(
     if ingress_protocol == egress_name {
         strip_same_protocol_model_shim(&mut body, ingress_protocol);
     }
-    match serde_json::to_vec(&body) {
+    // sonic-rs: SIMD serialize of the (large, string-heavy) upstream body — the request-path hot spot.
+    match crate::json::to_vec(&body) {
         Ok(p) => Ok(p),
         // Re-serializing a Value parsed from valid JSON and rewritten only with serde_json values is
         // effectively infallible; return a shaped 500 rather than panic a worker on the request path
@@ -2350,14 +2351,11 @@ fn coerce_on_error(
 }
 
 /// Forward with pool name context for on_exhausted config lookup.
-// Plumbing function: each parameter is an independent request input (state, candidates, body,
-// caller token, pool name, affinity key, ingress protocol, usage sink) with no natural grouping.
+/// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
+/// delegate. The ingress hot path (`route::forward_resolved`) instead calls
+/// [`forward_with_pool_parsed`] directly with the `Value` it ALREADY parsed to resolve the model —
+/// so a normal request parses the body once across the route+forward layers, not twice.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(
-    name = "forward",
-    skip_all,
-    fields(pool = %pool_name, ingress = %ingress_protocol)
-)]
 pub(crate) async fn forward_with_pool(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
@@ -2368,18 +2366,9 @@ pub(crate) async fn forward_with_pool(
     ingress_protocol: &str,
     usage_sink: Option<UsageSink>,
 ) -> Response {
-    // The PRISTINE parsed request body. Never mutated after this point: each failover hop derives a
-    // fresh per-hop `hop_v` from this clone before translating/rewriting, so a cross-protocol hop
-    // never re-translates a body already rewritten into a previous egress lane's shape (the bug:
-    // mutating a shared `v` in place made hop N+1 read hop N's egress-shaped body with the ingress
-    // reader, misparsing or skipping translation entirely on a mixed-protocol pool).
-    let v: Value = match serde_json::from_slice(&body) {
+    let v: Value = match crate::json::parse(&body) {
         Ok(v) => v,
         Err(e) => {
-            // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
-            // into the client-facing 400 body: the serde_json Display detail is a busbar-internal tell
-            // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
-            // gets the generic, vendor-plausible message only.
             tracing::debug!(error = %e, "request body JSON parse failed");
             return ingress_error(
                 ingress_protocol,
@@ -2389,6 +2378,50 @@ pub(crate) async fn forward_with_pool(
             );
         }
     };
+    forward_with_pool_parsed(
+        app,
+        cands,
+        body,
+        v,
+        caller_token,
+        pool_name,
+        affinity_key,
+        ingress_protocol,
+        usage_sink,
+    )
+    .await
+}
+
+/// The forward implementation. `v` is the request body ALREADY parsed by the caller (the ingress
+/// layer parses it to resolve the model; tests/ad-hoc go through [`forward_with_pool`] which parses).
+/// The retained `body` bytes are re-parsed only on failover hops 2+, preserving the per-hop pristine
+/// re-parse the mixed-protocol-pool correctness depends on.
+//
+// Plumbing function: each parameter is an independent request input (state, candidates, body, parsed
+// body, caller token, pool name, affinity key, ingress protocol, usage sink) with no natural grouping.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "forward",
+    skip_all,
+    fields(pool = %pool_name, ingress = %ingress_protocol)
+)]
+pub(crate) async fn forward_with_pool_parsed(
+    app: Arc<App>,
+    cands: Vec<WeightedLane>,
+    body: Bytes,
+    v: Value,
+    caller_token: Option<&str>,
+    pool_name: &str,
+    affinity_key: Option<&str>,
+    ingress_protocol: &str,
+    usage_sink: Option<UsageSink>,
+) -> Response {
+    // `v` is the PRISTINE parsed request body (parsed once by the caller). Never mutated after this
+    // point: each failover hop derives a fresh per-hop `hop_v` (the first hop consumes `v`; hops 2+
+    // re-parse the retained `body` bytes) before translating/rewriting, so a cross-protocol hop never
+    // re-translates a body already rewritten into a previous egress lane's shape (the bug: mutating a
+    // shared `v` in place made hop N+1 read hop N's egress-shaped body with the ingress reader,
+    // misparsing or skipping translation entirely on a mixed-protocol pool).
 
     // capture the caller's stream intent from the ingress body BEFORE any cross-protocol
     // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
@@ -2529,6 +2562,11 @@ pub(crate) async fn forward_with_pool(
         }
     };
 
+    // The pristine `v` is consumed by the FIRST hop (it is unmutated after the field reads above), so
+    // the common no-failover path parses the body ONCE, not twice. Failover hops (2+) re-parse from
+    // the retained `body` bytes — never from a previous hop's egress-shaped Value — preserving the
+    // mixed-protocol-pool correctness the per-hop re-parse was introduced for.
+    let mut first_hop_v = Some(v);
     for _attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
         if request_ctx.expired(now()) {
@@ -2607,23 +2645,28 @@ pub(crate) async fn forward_with_pool(
         // parsed `Value` tree per hop: a single JSON parse is far cheaper in time and peak heap than
         // an O(n) `Value::clone` of a large request (long histories / base64 images / big tool
         // schemas), which under sustained failover compounded to O(n × max_cap) allocations.
-        let hop_v: Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
-            // `body` already parsed once successfully into `v` above; this re-parse is infallible.
-            Err(_) => {
-                // Probe class guard: this lane may have CAS-won the single-flight recovery probe in
-                // `pick_among`. We bail BEFORE dispatching any request, so no outcome will be
-                // recorded to clear `probe_in_flight` — release it here or the recovering lane stays
-                // wedged HalfOpen until the slow out-of-band prober resets it.
-                app.store.release_probe_in(pool_name, i);
-                drop(permit);
-                return ingress_error(
-                    ingress_protocol,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "We received an unexpected internal error. Please try again.",
-                );
-            }
+        let hop_v: Value = match first_hop_v.take() {
+            // First hop: reuse the pristine parse from above (no second parse on the common path).
+            Some(v) => v,
+            // Failover hops: re-parse from the retained pristine bytes (sonic-rs: SIMD parse).
+            None => match crate::json::parse(&body) {
+                Ok(v) => v,
+                // `body` already parsed once successfully above; this re-parse is infallible.
+                Err(_) => {
+                    // Probe class guard: this lane may have CAS-won the single-flight recovery probe in
+                    // `pick_among`. We bail BEFORE dispatching any request, so no outcome will be
+                    // recorded to clear `probe_in_flight` — release it here or the recovering lane stays
+                    // wedged HalfOpen until the slow out-of-band prober resets it.
+                    app.store.release_probe_in(pool_name, i);
+                    drop(permit);
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "api_error",
+                        "We received an unexpected internal error. Please try again.",
+                    );
+                }
+            },
         };
         // SINGLE shared cross-protocol request-shaping seam (shared verbatim with `forward_once`'s
         // degraded path): read→clear-extra→write, shim-key strip, model rewrite, serialize. Both
@@ -3242,7 +3285,7 @@ pub(crate) async fn forward_with_pool(
                     // completion the client never receives, exactly the inconsistency the Truncated
                     // and TransportError branches above deliberately avoid. So tap usage ONLY once we
                     // are inside the block that actually mints and returns a translated response.
-                    if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
                         if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
@@ -3399,8 +3442,13 @@ pub(crate) async fn forward_with_pool(
                                     chosen_policy_name,
                                     &app.lanes[i].model,
                                 );
+                                // sonic-rs: SIMD serialize of the translated client body (the
+                                // response-path hot spot); fall back to serde_json on the
+                                // effectively-impossible serialize error.
+                                let body_bytes = crate::json::to_vec(&translated)
+                                    .unwrap_or_else(|_| translated.to_string().into_bytes());
                                 return rb
-                                    .body(Body::from(translated.to_string()))
+                                    .body(Body::from(body_bytes))
                                     .unwrap_or_else(|_| status.into_response());
                             }
                         }
@@ -3666,7 +3714,7 @@ async fn forward_once(
     usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
-    let v: Value = match serde_json::from_slice(body) {
+    let v: Value = match crate::json::parse(body) {
         Ok(v) => v,
         Err(e) => {
             // See the main forward path: log the parser cause for operators, never leak the
@@ -3974,7 +4022,7 @@ async fn forward_once(
                 // whose ingress protocol fails `protocol_for`) falls through to the ingress-native
                 // 500 below with NO completion delivered, so charging before translation is proven
                 // would bill the key for a body the client never receives.
-                if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
+                if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
                     if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
                             // Token accounting: committed to translating and delivering this body
@@ -4054,8 +4102,10 @@ async fn forward_once(
                             // Cross-protocol degraded translate (ingress != egress): no upstream
                             // anthropic id to forward — synthesize the `request-id` header.
                             let rb = maybe_attach_anthropic_request_id(rb, ingress_protocol, None);
+                            let body_bytes = crate::json::to_vec(&translated)
+                                .unwrap_or_else(|_| translated.to_string().into_bytes());
                             return Ok(rb
-                                .body(Body::from(translated.to_string()))
+                                .body(Body::from(body_bytes))
                                 .unwrap_or_else(|_| status.into_response()));
                         }
                     }

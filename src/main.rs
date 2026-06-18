@@ -43,6 +43,7 @@ mod governance;
 mod handlers;
 mod health;
 mod ir;
+mod json;
 mod metrics;
 mod net_guard;
 mod observability;

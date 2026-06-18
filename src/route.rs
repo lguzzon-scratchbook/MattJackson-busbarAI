@@ -12,7 +12,7 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::forward::forward_with_pool;
+use crate::forward::{forward_with_pool, forward_with_pool_parsed};
 use crate::state::{App, WeightedLane};
 
 /// enforce a virtual key's allowed-pools list against the resolved target pool. No-op
@@ -467,7 +467,7 @@ async fn ingress_body_model(
     // (`budget_check` → `try_charge_request_within_budget`) and the token fee (`UsageSink::charged_at` → `record_tokens`) so
     // a streaming request's two charges share one rate-limit/budget window (#29).
     let charged_at = crate::store::now();
-    let v: Value = match serde_json::from_slice(&body) {
+    let v: Value = match crate::json::parse(&body) {
         Ok(v) => v,
         Err(e) => {
             // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
@@ -527,6 +527,7 @@ async fn ingress_body_model(
         &model,
         headers,
         body,
+        v,
         caller_token,
         started,
         charged_at,
@@ -565,7 +566,7 @@ async fn ingress_path_model(
     let started = Instant::now();
     // Header-arrival epoch pinned once and reused for both the per-request and token fees (#29).
     let charged_at = crate::store::now();
-    let mut v: Value = match serde_json::from_slice(&body) {
+    let mut v: Value = match crate::json::parse(&body) {
         Ok(v) => v,
         Err(e) => {
             // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
@@ -637,7 +638,7 @@ async fn ingress_path_model(
     // `Err` arm is kept as a non-panicking, protocol-shaped guard (never `unwrap`) so the request
     // path stays panic-free even if a future change introduces a non-serializable injected value;
     // it is effectively unreachable today, hence not exercised by a dedicated test.
-    let injected: Bytes = match serde_json::to_vec(&v) {
+    let injected: Bytes = match crate::json::to_vec(&v) {
         Ok(b) => b.into(),
         Err(e) => {
             // Same leak class as the parse arms above: the serde_json Display detail is a
@@ -671,6 +672,7 @@ async fn ingress_path_model(
         model,
         headers,
         injected,
+        v,
         caller_token,
         started,
         charged_at,
@@ -695,6 +697,7 @@ async fn forward_resolved(
     model: &str,
     headers: &HeaderMap,
     body: Bytes,
+    v: Value,
     caller_token: Option<&str>,
     started: Instant,
     charged_at: u64,
@@ -710,10 +713,11 @@ async fn forward_resolved(
         let affinity_key = headers
             .get(affinity_header_for(app, model))
             .and_then(|v| v.to_str().ok());
-        let resp = forward_with_pool(
+        let resp = forward_with_pool_parsed(
             app.clone(),
             cands.clone(),
             body,
+            v,
             caller_token,
             model,
             affinity_key,
@@ -738,10 +742,11 @@ async fn forward_resolved(
         // one lane across two cells purely by route shape. The bounded `pool` metric LABEL still
         // resolves to the model name for the "" cell (forward.rs `metric_pool_label`), so the
         // request/upstream metric correlation is unaffected — only the cell key is unified.
-        let resp = forward_with_pool(
+        let resp = forward_with_pool_parsed(
             app.clone(),
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
+            v,
             caller_token,
             "",
             None,
