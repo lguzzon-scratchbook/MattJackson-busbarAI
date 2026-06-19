@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct IrRequest {
     pub(crate) system: Vec<IrBlock>,
     pub(crate) messages: Vec<IrMessage>,
@@ -31,6 +31,30 @@ pub(crate) struct IrRequest {
     /// NO top_k knob, so the OpenAI writer omits it (and its reader never sets it) — a lossy-by-target
     /// omission, not a leak. `u32`: top_k is a non-negative integer count. `None` when omitted.
     pub(crate) top_k: Option<u32>,
+    /// Repetition penalty by token frequency (`frequency_penalty`). A cross-protocol-preserved
+    /// sampling control: written only by protocols that natively model it (OpenAI/Responses/Cohere).
+    /// `f64` for the same lossless-number reason as `temperature`. `None` == absent — never emitted.
+    pub(crate) frequency_penalty: Option<f64>,
+    /// Repetition penalty by token presence (`presence_penalty`). A cross-protocol-preserved
+    /// sampling control: written only by protocols that natively model it (OpenAI/Responses/Cohere).
+    /// `f64` for the same lossless-number reason as `temperature`. `None` == absent — never emitted.
+    pub(crate) presence_penalty: Option<f64>,
+    /// Deterministic-sampling seed (`seed`). A cross-protocol-preserved sampling control: written
+    /// only by protocols that natively model it (OpenAI/Responses, Gemini, Mistral). `i64` to carry
+    /// the full JSON integer range losslessly. `None` == absent — never emitted.
+    pub(crate) seed: Option<i64>,
+    /// Number of candidate completions to generate (`n`). A cross-protocol-preserved output control:
+    /// written only by protocols that natively model it (OpenAI `n`, Gemini `candidateCount`). NOT
+    /// Cohere: the v2 `/v2/chat` API has NO `num_generations`/`n` parameter (it was a v1 Generate-API
+    /// field, removed in v2 — the documented way to get N candidates is to call chat N times), so the
+    /// Cohere reader/writer correctly omit `n` (like Anthropic/Bedrock/Responses). `u32`: a
+    /// non-negative count. `None` == absent — never emitted.
+    pub(crate) n: Option<u32>,
+    /// Structured-output / response-format directive (`response_format`). A cross-protocol-preserved
+    /// output control carrying the raw response_format / structured-output object verbatim; mapped
+    /// per-protocol later. Written only by protocols that natively model it. `None` == absent —
+    /// never emitted.
+    pub(crate) response_format: Option<serde_json::Value>,
     /// Stop sequences (`stop`). First-class because every protocol models it (OpenAI `stop` —
     /// string OR array; Anthropic `stop_sequences`; Gemini `generationConfig.stopSequences`; Bedrock
     /// `inferenceConfig.stopSequences`; Cohere `stop_sequences`). Normalized to a `Vec<String>` (the

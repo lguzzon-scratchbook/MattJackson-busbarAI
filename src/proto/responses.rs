@@ -426,13 +426,19 @@ impl ProtocolReader for ResponsesReader {
                             });
                         }
                         Some("input_image") => {
-                            let image_url =
-                                item.get("image_url").and_then(|u| u.as_str()).unwrap_or("");
-                            let (media_type, data) = super::parse_image_url(image_url);
-                            messages.push(crate::ir::IrMessage {
-                                role: crate::ir::IrRole::User,
-                                content: vec![crate::ir::IrBlock::Image { media_type, data }],
-                            });
+                            // L5: a Responses `input_image` can reference an uploaded file by
+                            // `file_id` INSTEAD of carrying an inline `image_url`. The prior code only
+                            // read `image_url`, so a file_id-only image produced an EMPTY Image block
+                            // (media_type/data both ""), a lossy degradation. Carry the file_id
+                            // faithfully under a distinct `file_id` sentinel (mirroring the `image_url`
+                            // sentinel) so the writer reconstructs `{type:input_image,file_id}` and the
+                            // round-trip is lossless. Prefer `image_url` when present (the inline form).
+                            if let Some(block) = responses_input_image_block(item) {
+                                messages.push(crate::ir::IrMessage {
+                                    role: crate::ir::IrRole::User,
+                                    content: vec![block],
+                                });
+                            }
                         }
                         Some("output_text") => {
                             let text = item
@@ -644,6 +650,20 @@ impl ProtocolReader for ResponsesReader {
         // keys below so it does not also linger in `extra`.
         let tool_choice = read_responses_tool_choice(obj.get("tool_choice"));
 
+        // M1 response_format: the Responses API carries structured-output config under `text.format`
+        // (NOT a top-level `response_format` as Chat Completions does). Read `text.format` and
+        // normalize it into the IR's canonical `response_format` shape (the Chat-Completions shape the
+        // OpenAI reader stores), so a Responses structured-output request reaches an OpenAI/Anthropic
+        // backend faithfully and a same-protocol round-trip is lossless. `text` is added to the modeled
+        // keys below so it does not also linger in `extra` (which would double-emit it on write).
+        // SAMPLING (Phase 0): the Responses create API does NOT model `frequency_penalty`,
+        // `presence_penalty`, `seed`, or `n` (verified against the official openai-python
+        // `ResponseCreateParamsBase` — only `temperature`/`top_p`/`top_logprobs`/`text` are present),
+        // so none are promoted here (they stay None) and none are added to the modeled-keys exclusion.
+        // STOP (M5): the Responses create API has NO `stop`/`stop_sequences` param either, so `stop`
+        // stays empty and is not read.
+        let response_format = read_text_format(obj.get("text"));
+
         // NOTE: `metadata` is deliberately NOT in this exclusion set. The Responses API accepts a
         // top-level `metadata` object (user-defined key/value tagging used for audit logging and
         // billing attribution); busbar does not model it on `IrRequest`, so it must flow through
@@ -663,11 +683,36 @@ impl ProtocolReader for ResponsesReader {
         .iter()
         .cloned()
         .collect();
+        // NOTE: `text` is NOT in this set — it is intercepted by its own branch in the loop below
+        // (its `format` sub-key → IR `response_format` per M1, the remainder preserved in `extra`).
 
         for (key, value) in obj.iter() {
-            if !modeled_keys.contains(key.as_str()) {
-                extra.insert(key.clone(), value.clone());
+            // `text` is partially modeled: its `format` sub-key is promoted to the IR
+            // `response_format` (M1) and MUST NOT also linger in `extra` (the writer rebuilds `text`
+            // from `response_format`, so a leftover `extra["text"]["format"]` would double-emit /
+            // conflict). But `text` may carry OTHER sub-keys (e.g. `verbosity`) that busbar does not
+            // model — those must survive via `extra`. So when `text` carries non-`format` keys, route a
+            // `format`-stripped copy into `extra`; when `text` is format-only, drop it from `extra`
+            // entirely (the writer re-synthesizes it from `response_format`). Checked BEFORE the
+            // modeled-keys short-circuit so the format-stripped remainder is preserved even though
+            // `text` is listed as modeled.
+            if key == "text" {
+                if let Some(text_obj) = value.as_object() {
+                    let remainder: serde_json::Map<String, serde_json::Value> = text_obj
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "format")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    if !remainder.is_empty() {
+                        extra.insert("text".to_string(), serde_json::Value::Object(remainder));
+                    }
+                }
+                continue;
             }
+            if modeled_keys.contains(key.as_str()) {
+                continue;
+            }
+            extra.insert(key.clone(), value.clone());
         }
 
         if let Some(model_val) = obj.get("model") {
@@ -685,6 +730,11 @@ impl ProtocolReader for ResponsesReader {
             stop: vec![],
             tool_choice,
             stream,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format,
             extra,
         })
     }
@@ -786,8 +836,73 @@ impl ProtocolReader for ResponsesReader {
                                 });
                             }
                         }
+                    } else if item_obj.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                        // H1 REASONING (stream): a native Responses stream opens a chain-of-thought
+                        // item with `output_item.added` typed `reasoning`. The prior `_`/`message`
+                        // no-op DROPPED it, so a reasoning stream lost its thinking on any
+                        // cross-protocol hop. Open a Thinking block at this `output_index`, tracked in
+                        // `open_tools` at the RAW idx (like a tool item — closed once by the single
+                        // `output_item.done` this index receives). Same cardinality cap and
+                        // already-open guard as the tool arm so a malformed stream cannot double-open
+                        // or grow the set without bound.
+                        if let Some(output_index) =
+                            data.get("output_index").and_then(|i| i.as_u64())
+                        {
+                            let idx = (output_index as usize).min(MAX_OUTPUT_INDEX);
+                            let already_open = state.open_tools.contains(&idx)
+                                || state.open_tools.contains(&(idx + TEXT_INDEX_KEY_OFFSET));
+                            if !already_open && state.open_tools.len() < MAX_OPEN_TOOLS {
+                                state.open_tools.insert(idx);
+                                out.push(IrStreamEvent::BlockStart {
+                                    index: idx,
+                                    block: crate::ir::IrBlockMeta::Thinking,
+                                });
+                            }
+                        }
                     } else if item_obj.get("type").and_then(|t| t.as_str()) == Some("message") {
                     }
+                }
+            }
+
+            // H1 REASONING (stream): native reasoning text arrives as `response.reasoning_text.delta`
+            // (the full reasoning) and `response.reasoning_summary_text.delta` (a summarized form),
+            // both carrying an `output_index` and a `delta` string. The prior `_ => {}` DROPPED these,
+            // so a streamed reasoning response lost its chain-of-thought. Route each as an
+            // `IrDelta::ThinkingDelta` against the reasoning block at this `output_index`, lazily
+            // opening the Thinking BlockStart if the `output_item.added` was absent (some backends emit
+            // reasoning deltas with no preceding `added`). The block is tracked at the RAW idx in
+            // `open_tools`, closed once by the terminal `output_item.done`/stream end.
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                let delta = data
+                    .get("delta")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !delta.is_empty() {
+                    let idx = data
+                        .get("output_index")
+                        .and_then(|i| i.as_u64())
+                        .map_or(0, |v| (v as usize).min(MAX_OUTPUT_INDEX));
+                    // Lazily open the Thinking block if `output_item.added` did not already. Guard the
+                    // open against a TEXT key collision at the same index (a reasoning index and a text
+                    // index should never share a wire index, but stay defensive) and the cardinality
+                    // cap; beyond the cap suppress the delta rather than emit an orphan.
+                    if !state.open_tools.contains(&idx)
+                        && !state.open_tools.contains(&(idx + TEXT_INDEX_KEY_OFFSET))
+                    {
+                        if state.open_tools.len() >= MAX_OPEN_TOOLS {
+                            return out;
+                        }
+                        state.open_tools.insert(idx);
+                        out.push(IrStreamEvent::BlockStart {
+                            index: idx,
+                            block: crate::ir::IrBlockMeta::Thinking,
+                        });
+                    }
+                    out.push(IrStreamEvent::BlockDelta {
+                        index: idx,
+                        delta: crate::ir::IrDelta::ThinkingDelta(delta),
+                    });
                 }
             }
 
@@ -1061,7 +1176,10 @@ impl ProtocolReader for ResponsesReader {
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0),
                             cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
+                            // H6: carry the streamed prompt-cache hit count
+                            // (`usage.input_tokens_details.cached_tokens`) into the IR's read-side
+                            // cache field so a streaming Responses terminal preserves the cache saving.
+                            cache_read_input_tokens: read_cached_tokens(u),
                         })
                         .unwrap_or(crate::ir::IrUsage {
                             input_tokens: 0,
@@ -1263,6 +1381,41 @@ impl ProtocolReader for ResponsesReader {
                         });
                     }
 
+                    // H1 REASONING: a native Responses `reasoning` output item carries the model's
+                    // chain-of-thought. The prior `_ => {}` DROPPED it, so a reasoning response lost
+                    // its thinking entirely on any cross-protocol hop (Responses → Anthropic/Bedrock,
+                    // which DO carry thinking). Read it into an `IrBlock::Thinking` so it survives the
+                    // seam. The reasoning text lives in `content[].text` (`reasoning_text` parts) and/or
+                    // `summary[].text` (`summary_text` parts); concatenate whichever is present (a real
+                    // reasoning item carries one or the other). Responses has no `signature`, but it
+                    // carries an opaque `encrypted_content` blob for multi-turn reasoning reuse — map it
+                    // into the IR `signature` slot so a same-protocol round-trip preserves it (and a
+                    // cross-protocol hop to a signature-carrying protocol keeps the opaque token).
+                    //
+                    // LOW (accepted, non-portable by nature): the IR `signature` slot is a single
+                    // opaque token shared across protocols (Anthropic `thinking.signature`, Responses
+                    // `encrypted_content`, Gemini `thoughtSignature`). These are each PROTOCOL-OPAQUE
+                    // and vendor-scoped: an Anthropic signature carried into a Responses
+                    // `encrypted_content` (or vice-versa) preserves the BYTES, but the blob is NOT
+                    // re-feedable to the OTHER vendor's API — each vendor only accepts its own. So the
+                    // token round-trips faithfully same-protocol and survives the seam as an opaque
+                    // value, but cross-vendor reasoning-reuse (replaying a foreign vendor's signature)
+                    // is inherently unsupported. No behavior change; documented so the limitation is
+                    // explicit rather than an implied promise of cross-vendor reasoning continuation.
+                    "reasoning" => {
+                        let text = read_reasoning_text(item);
+                        let signature = item
+                            .get("encrypted_content")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        // Skip a wholly-empty reasoning item (no text and no encrypted_content)
+                        // rather than emitting a blank Thinking block.
+                        if !text.is_empty() || signature.is_some() {
+                            content.push(crate::ir::IrBlock::Thinking { text, signature });
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -1307,7 +1460,11 @@ impl ProtocolReader for ResponsesReader {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            // H6: the Responses API reports prompt-cache hits under
+            // `usage.input_tokens_details.cached_tokens`. Map it into the IR's
+            // `cache_read_input_tokens` (the read-side cache field Bedrock already uses) so the cache
+            // saving survives a cross-protocol hop instead of being dropped. No new IR field is added.
+            cache_read_input_tokens: read_cached_tokens(usage_val),
         };
 
         let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
@@ -1358,9 +1515,13 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
             })
         }
         "input_image" => {
-            let image_url = obj.get("image_url").and_then(|v| v.as_str()).unwrap_or("");
-            let (media_type, data) = super::parse_image_url(image_url);
-            Ok(crate::ir::IrBlock::Image { media_type, data })
+            // L5: handle a file_id-referenced image (no inline `image_url`) faithfully rather than
+            // emitting an empty Image block. Shared with the request-input reader.
+            responses_input_image_block(block_val).ok_or(IrError {
+                class: StatusClass::ClientError,
+                provider_signal: Some("ir_parse".to_string()),
+                retry_after: None,
+            })
         }
         _ => Err(IrError {
             class: StatusClass::ClientError,
@@ -1368,6 +1529,150 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
             retry_after: None,
         }),
     }
+}
+
+/// Sentinel `media_type` marking an IR `Image` block that carries a Responses `file_id` reference
+/// (L5) rather than inline image bytes or a URL. The `image_url` sentinel is already taken by
+/// `parse_image_url` for verbatim URL strings, so a DISTINCT sentinel is needed to round-trip a
+/// `file_id` image without an `image_url`: the writer keys on this value to re-emit
+/// `{type:"input_image","file_id":<data>}` instead of an `image_url`. A real image MIME type
+/// (`image/png`, …) and a non-data URL can never equal this literal, so the dispatch is unambiguous.
+///
+/// Re-exported from the shared [`super::FILE_ID_IMAGE_SENTINEL`] so every NON-Responses writer keys
+/// on the SAME literal to SKIP an unresolvable file_id image (see `super::is_unresolvable_image_ref`)
+/// rather than emit a corrupt block — a file_id is an OpenAI-Responses-scoped reference with no
+/// cross-vendor projection. The Responses writer (same-protocol) still decodes it to the native form.
+use super::FILE_ID_IMAGE_SENTINEL;
+
+/// Build an IR `Image` block from a Responses `input_image` content object (L5). Prefers an inline
+/// `image_url` when present (parsed via the shared `parse_image_url` into the base64-or-URL-sentinel
+/// pair). Otherwise, if the image references an uploaded file by `file_id`, carry that id verbatim
+/// under the `FILE_ID_IMAGE_SENTINEL` media_type so the writer reconstructs the `file_id` form and the
+/// round-trip is lossless — instead of the prior behavior of emitting an EMPTY Image block (both
+/// fields `""`), which silently corrupted a file_id image on the cross-protocol/round-trip path.
+/// Returns `None` when the block carries NEITHER an `image_url` NOR a `file_id` (a degenerate image
+/// reference), so the caller skips it cleanly rather than emitting an empty block.
+fn responses_input_image_block(item: &serde_json::Value) -> Option<crate::ir::IrBlock> {
+    let image_url = item.get("image_url").and_then(|u| u.as_str());
+    if let Some(url) = image_url.filter(|u| !u.is_empty()) {
+        let (media_type, data) = super::parse_image_url(url);
+        return Some(crate::ir::IrBlock::Image { media_type, data });
+    }
+    if let Some(file_id) = item
+        .get("file_id")
+        .and_then(|f| f.as_str())
+        .filter(|f| !f.is_empty())
+    {
+        return Some(crate::ir::IrBlock::Image {
+            media_type: FILE_ID_IMAGE_SENTINEL.to_string(),
+            data: file_id.to_string(),
+        });
+    }
+    None
+}
+
+/// Extract the chain-of-thought text from a Responses `reasoning` output item (H1). A reasoning item
+/// carries its text in two possible arrays: `content[]` entries of type `reasoning_text` (the full
+/// reasoning text) and/or `summary[]` entries of type `summary_text` (a summarized form). Concatenate
+/// every `text` found in BOTH arrays WITHOUT a separator (mirrors the no-separator concat the rest of
+/// this module uses for fragment reassembly), preferring nothing — a real item carries one or the
+/// other, and concatenating both is lossless when only one is present (the other contributes nothing).
+/// Returns an empty string when neither array carries text, so the caller can skip an empty item.
+fn read_reasoning_text(item: &serde_json::Value) -> String {
+    let mut text = String::new();
+    for (arr_key, type_key) in [("content", "reasoning_text"), ("summary", "summary_text")] {
+        if let Some(arr) = item.get(arr_key).and_then(|c| c.as_array()) {
+            for part in arr {
+                // Accept the part whether or not it carries the exact `type` literal — a missing or
+                // unexpected `type` should not silently drop reasoning text — but only when a `text`
+                // string is present. The `type_key` is checked only to skip a non-matching typed part
+                // (e.g. a future part kind) while still accepting an untyped `{text}` shorthand.
+                let type_ok = part
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_none_or(|t| t == type_key);
+                if type_ok {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    text
+}
+
+/// Normalize a Responses `text` object's `format` into the IR's canonical `response_format` shape
+/// (M1). The Responses API carries structured-output config at `text.format` with a FLAT json_schema
+/// shape (`{"type":"json_schema","name":...,"schema":...,"strict":...,"description":...}`), whereas
+/// the IR's canonical `response_format` (the shape the OpenAI Chat-Completions reader stores) NESTS
+/// those under a `json_schema` key (`{"type":"json_schema","json_schema":{name,schema,strict,...}}`).
+/// This converts the flat Responses form into the nested canonical form so a Responses structured-
+/// output request reaches an OpenAI/Anthropic backend faithfully. `text`/`json_object` formats carry
+/// no extra fields and pass through as `{"type":...}`. Returns `None` when `text.format` is absent so
+/// the IR field stays unset (no spurious response_format on a request that carried none). An
+/// unrecognized `type` is passed through verbatim rather than dropped.
+fn read_text_format(text_val: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let format = text_val.and_then(|t| t.get("format"))?;
+    let format_obj = format.as_object()?;
+    let kind = format_obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if kind == "json_schema" {
+        // Re-nest the flat Responses fields under `json_schema` to match the canonical IR shape.
+        let mut inner = serde_json::Map::new();
+        for key in ["name", "schema", "strict", "description"] {
+            if let Some(v) = format_obj.get(key) {
+                inner.insert(key.to_string(), v.clone());
+            }
+        }
+        Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": serde_json::Value::Object(inner),
+        }))
+    } else {
+        // `text` / `json_object` (or any future/unknown type): carry the object through verbatim —
+        // its shape is already identical between the two surfaces.
+        Some(format.clone())
+    }
+}
+
+/// Inverse of [`read_text_format`] (M1): convert the IR's canonical `response_format` into a Responses
+/// `text.format` object. The canonical json_schema form NESTS `{name,schema,strict,description}` under
+/// a `json_schema` key; the Responses `text.format` form is FLAT (those fields sit beside `type`), so
+/// this flattens them. `text`/`json_object` formats pass through verbatim. Returns the `format` value
+/// to place under `text.format`; the caller wraps it in `{"text":{"format":...}}`.
+fn text_format_from_response_format(rf: &serde_json::Value) -> serde_json::Value {
+    let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if kind == "json_schema" {
+        let mut flat = serde_json::Map::new();
+        flat.insert("type".to_string(), serde_json::json!("json_schema"));
+        // The canonical shape nests the schema fields under `json_schema`; flatten them up beside
+        // `type`. Fall back to reading them at the top level too, so a response_format that ALREADY
+        // arrived flat (e.g. from a Responses-native read) still flattens correctly.
+        let inner = rf.get("json_schema");
+        for key in ["name", "schema", "strict", "description"] {
+            if let Some(v) = inner.and_then(|i| i.get(key)).or_else(|| rf.get(key)) {
+                flat.insert(key.to_string(), v.clone());
+            }
+        }
+        serde_json::Value::Object(flat)
+    } else {
+        // `text` / `json_object` / unknown: already in the right (flat) shape; emit verbatim.
+        rf.clone()
+    }
+}
+
+/// Read the Responses prompt-cache hit count from a `usage` object (H6):
+/// `usage.input_tokens_details.cached_tokens`. Returns `None` when the nested field is absent (so a
+/// usage object without cache details does not gain a spurious `Some(0)`), mapping into the IR's
+/// `cache_read_input_tokens`. Shared by the non-streaming `read_response` and the streaming terminal.
+fn read_cached_tokens(usage_val: &serde_json::Value) -> Option<u64> {
+    usage_val
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
 }
 
 /// OpenAI Responses streaming writer.
@@ -1498,6 +1803,18 @@ pub(crate) struct ResponsesWriter {
     /// the completed event. Per-stream INSTANCE state for the same reason as the other fields; a
     /// poisoned lock degrades to an empty array (the prior behavior) rather than panicking.
     output_items: std::sync::Mutex<std::collections::BTreeMap<usize, serde_json::Value>>,
+    /// Output indices for which this writer opened a REASONING item (H1) — emitted the
+    /// `output_item.added` typed "reasoning". Tracked separately from text/tool opens so the matching
+    /// `BlockStop` (which carries only the index) emits the `output_item.done` typed "reasoning" for
+    /// THIS index, and so a reasoning BlockStop is never mistaken for a text/tool close. Per-stream
+    /// INSTANCE state for the same reason as the other open-index sets; a poisoned lock degrades safely.
+    open_reasoning_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    /// Per-stream accumulator of streamed reasoning TEXT (H1), keyed by `output_index`. The terminal
+    /// `response.output[]` reasoning item carries the COMPLETE reasoning text the stream delivered via
+    /// `reasoning_text.delta`; the IR streams it as `ThinkingDelta` fragments, so the writer
+    /// concatenates them here and drains the joined text into the finalized reasoning item at
+    /// BlockStop. A poisoned lock degrades to empty text rather than panicking.
+    reasoning_accum: std::sync::Mutex<std::collections::BTreeMap<usize, String>>,
 }
 
 /// Accumulated function-call item fields for one open `output_index`, finalized into the
@@ -1536,6 +1853,8 @@ pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     tool_calls: std::sync::Mutex::new(std::collections::BTreeMap::new()),
     text_accum: std::sync::Mutex::new(std::collections::BTreeMap::new()),
     output_items: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+    open_reasoning_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+    reasoning_accum: std::sync::Mutex::new(std::collections::BTreeMap::new()),
 };
 
 impl Clone for ResponsesWriter {
@@ -1604,6 +1923,21 @@ impl Clone for ResponsesWriter {
                     .map(|m| m.clone())
                     .unwrap_or_default(),
             ),
+            // Carry the in-flight reasoning open-set and text accumulator across a mid-stream
+            // `Protocol::clone` so the cloned writer's reasoning `output_item.done` still emits the
+            // assembled reasoning item; poisoned locks degrade to empty.
+            open_reasoning_indices: std::sync::Mutex::new(
+                self.open_reasoning_indices
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
+            ),
+            reasoning_accum: std::sync::Mutex::new(
+                self.reasoning_accum
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -1638,6 +1972,14 @@ impl ResponsesWriter {
             map.clear();
         }
         if let Ok(mut map) = self.output_items.lock() {
+            map.clear();
+        }
+        // Clear the per-stream reasoning open-set and text accumulator so a reused/cloned writer does
+        // not leak a previous stream's reasoning into a new stream's output.
+        if let Ok(mut set) = self.open_reasoning_indices.lock() {
+            set.clear();
+        }
+        if let Ok(mut map) = self.reasoning_accum.lock() {
             map.clear();
         }
         // Clear the carried `response.id` alongside the sequence counter: a reused/cloned writer
@@ -1861,6 +2203,50 @@ impl ResponsesWriter {
             .unwrap_or(false)
     }
 
+    /// Mark a REASONING item open at `index` (H1) IF not already open and under the cardinality cap,
+    /// returning true when this call performed the open (so the caller emits the `output_item.added`
+    /// typed "reasoning" exactly once). Mirrors `open_text_item`'s discipline. Lock poisoning → false.
+    fn open_reasoning_item(&self, index: usize) -> bool {
+        self.open_reasoning_indices
+            .lock()
+            .map(|mut set| {
+                if set.contains(&index) || set.len() >= MAX_OPEN_TOOLS {
+                    return false;
+                }
+                set.insert(index);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Return true and forget `index` if a REASONING item was open at it (so the matching `BlockStop`
+    /// emits the reasoning terminal frame for THIS index only). False for a non-reasoning index. Lock
+    /// poisoning degrades to false.
+    fn take_reasoning_open(&self, index: usize) -> bool {
+        self.open_reasoning_indices
+            .lock()
+            .map(|mut set| set.remove(&index))
+            .unwrap_or(false)
+    }
+
+    /// Append a streamed reasoning-text fragment for the reasoning item at `index` (H1). Lock
+    /// poisoning degrades to a no-op (the terminal item then carries empty reasoning text).
+    fn append_reasoning(&self, index: usize, fragment: &str) {
+        if let Ok(mut map) = self.reasoning_accum.lock() {
+            map.entry(index).or_default().push_str(fragment);
+        }
+    }
+
+    /// Remove and return the accumulated reasoning text for the item at `index`, or an empty string
+    /// if none was accumulated (a poisoned lock or a signature-only Thinking block).
+    fn take_reasoning_accum(&self, index: usize) -> String {
+        self.reasoning_accum
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&index))
+            .unwrap_or_default()
+    }
+
     /// Return the stream-stable opaque `item_id` for the output item identified by
     /// `(prefix, index)`, minting a fresh CSPRNG-backed token on first reference and returning the
     /// cached one thereafter. This is what keeps the `output_item.added → delta* → output_item.done`
@@ -1940,15 +2326,25 @@ impl ProtocolWriter for ResponsesWriter {
                                 }));
                             }
                             crate::ir::IrBlock::Image { media_type, data } => {
-                                // Reconstruct the original `image_url`: a URL-sentinel image is
-                                // emitted verbatim, a base64 image is re-wrapped as a data URI. This
-                                // is the inverse of `parse_image_url` so a same-protocol round-trip
-                                // is lossless.
-                                let image_url = super::image_url_from_ir(media_type, data);
-                                content_arr.push(serde_json::json!({
-                                    "type": "input_image",
-                                    "image_url": image_url
-                                }));
+                                // L5: an Image carrying a `file_id` reference (the
+                                // FILE_ID_IMAGE_SENTINEL media_type) re-emits the native `file_id`
+                                // form, NOT an `image_url` — wrapping a file_id into a data URI would
+                                // corrupt it. Otherwise reconstruct the original `image_url`: a
+                                // URL-sentinel image is emitted verbatim, a base64 image is re-wrapped
+                                // as a data URI (the inverse of `parse_image_url`, so a same-protocol
+                                // round-trip is lossless).
+                                if media_type == FILE_ID_IMAGE_SENTINEL {
+                                    content_arr.push(serde_json::json!({
+                                        "type": "input_image",
+                                        "file_id": data
+                                    }));
+                                } else {
+                                    let image_url = super::image_url_from_ir(media_type, data);
+                                    content_arr.push(serde_json::json!({
+                                        "type": "input_image",
+                                        "image_url": image_url
+                                    }));
+                                }
                             }
                             crate::ir::IrBlock::ToolUse {
                                 id, name, input, ..
@@ -1986,6 +2382,11 @@ impl ProtocolWriter for ResponsesWriter {
                                     "output": output_text
                                 }));
                             }
+                            // Lossy-by-necessity: the Responses REQUEST `input` surface has no
+                            // reasoning content-block (a `reasoning` item is OUTPUT-only), so a
+                            // Thinking block on a prior assistant turn is dropped from request input
+                            // (mirrors the OpenAI writer). Reasoning on the RESPONSE side IS preserved
+                            // (see `read_response`/`write_response` H1).
                             crate::ir::IrBlock::Thinking { .. } => {}
                         }
                     }
@@ -2089,12 +2490,62 @@ impl ProtocolWriter for ResponsesWriter {
             out.insert("top_p".to_string(), serde_json::json!(top_p));
         }
 
+        // SAMPLING (Phase 0): the Responses create API does NOT model `frequency_penalty`,
+        // `presence_penalty`, `seed`, or `n` (verified against the official openai-python
+        // `ResponseCreateParamsBase`: only `temperature`/`top_p`/`top_logprobs`/`text` are present).
+        // They are lossy-by-target on this surface, so they are intentionally NOT emitted — emitting an
+        // unsupported param would 400 a real `/v1/responses` call. A cross-protocol source that carried
+        // them simply loses them here (a target-capability omission, not a leak).
+
+        // M5 STOP: the Responses create API has NO `stop`/`stop_sequences` param (same verification as
+        // sampling above — no stop field exists on `ResponseCreateParamsBase`). So stop sequences
+        // cannot be expressed on this surface. Rather than silently dropping them, emit a `warn!` so
+        // the lossy-by-target omission is observable in logs (mirrors the anthropic/bedrock writers'
+        // drop-with-warn contract). Nothing is written to `out`.
+        if !req.stop.is_empty() {
+            tracing::warn!(
+                stop_count = req.stop.len(),
+                "responses writer: the /v1/responses API models no `stop` parameter; \
+                 dropping {} stop sequence(s) (lossy-by-target)",
+                req.stop.len()
+            );
+        }
+
+        // M1 response_format → Responses `text.format`. The Responses surface carries structured-output
+        // config under `text.format` (flat json_schema shape), NOT a top-level `response_format`. Build
+        // the `format` value from the canonical IR shape and MERGE it into any `text` object already
+        // forwarded via `extra` (e.g. one carrying `verbosity`), so a request that pairs a structured
+        // output with another `text` knob keeps both. `extra` is applied FIRST (below) so this merge
+        // sees the forwarded remainder; then this overwrites `text` with the merged object.
+        if let Some(rf) = &req.response_format {
+            let format = text_format_from_response_format(rf);
+            // Start from any `text` object forwarded through extra (the format-stripped remainder the
+            // reader preserved), so non-`format` sub-keys like `verbosity` survive alongside `format`.
+            let mut text_obj = req
+                .extra
+                .get("text")
+                .and_then(|t| t.as_object())
+                .cloned()
+                .unwrap_or_default();
+            text_obj.insert("format".to_string(), format);
+            out.insert("text".to_string(), serde_json::Value::Object(text_obj));
+            // The extra-forwarding loop below SKIPS `text` when `response_format` is Some (see its
+            // guard), so the bare extra `text` cannot clobber this merged object back to format-less.
+        }
+
         // `stream` is a modeled key (excluded from `extra`), so it must be emitted explicitly or it
         // is silently dropped — a `stream: true` request would otherwise be answered non-streaming,
         // stalling the SSE translation loop. Mirrors the OpenAI writer.
         out.insert("stream".to_string(), serde_json::json!(req.stream));
 
         for (key, value) in &req.extra {
+            // `text` from extra carries only the non-`format` remainder (verbosity, etc.). When the IR
+            // carried a `response_format`, the merged `text` (remainder + format) was already inserted
+            // above; do NOT let the bare extra `text` clobber it back to format-less. When the IR
+            // carried NO response_format, fall through and forward the extra `text` verbatim.
+            if key == "text" && req.response_format.is_some() {
+                continue;
+            }
             out.insert(key.clone(), value.clone());
         }
 
@@ -2223,7 +2674,32 @@ impl ProtocolWriter for ResponsesWriter {
                         }),
                     ))
                 }
-                crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
+                crate::ir::IrBlockMeta::Thinking => {
+                    // H1 REASONING (stream): open a native Responses `reasoning` output item. The IR
+                    // Thinking BlockStart carries only the index; emit `output_item.added` typed
+                    // "reasoning" with a stable `rs_…` item_id (so the matching `.done` reconstructs
+                    // it), tracking the open index so BlockStop closes it as a reasoning item. The
+                    // prior `None` DROPPED the reasoning lifecycle entirely.
+                    if !self.open_reasoning_item(*index) {
+                        return None;
+                    }
+                    let item_id = self.item_id_for("rs", *index);
+                    Some((
+                        "response.output_item.added".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_item.added",
+                            "output_index": index,
+                            "item_id": item_id,
+                            "item": {
+                                "type": "reasoning",
+                                "id": item_id,
+                                "summary": [],
+                                "content": []
+                            }
+                        }),
+                    ))
+                }
+                crate::ir::IrBlockMeta::Image => None,
             },
 
             IrStreamEvent::BlockDelta { index, delta } => match delta {
@@ -2264,7 +2740,28 @@ impl ProtocolWriter for ResponsesWriter {
                     ))
                 }
                 &crate::ir::IrDelta::TextDelta(_) => None,
-                crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
+                crate::ir::IrDelta::ThinkingDelta(text) if !text.is_empty() => {
+                    // H1 REASONING (stream): emit the native `response.reasoning_text.delta` for the
+                    // reasoning item at this index, accumulating the fragment so the matching
+                    // BlockStop assembles the complete reasoning item. The prior `None` DROPPED the
+                    // streamed chain-of-thought. `content_index: 0` — the single reasoning content
+                    // part of the item.
+                    self.append_reasoning(*index, text);
+                    Some((
+                        "response.reasoning_text.delta".to_string(),
+                        serde_json::json!({
+                            "type": "response.reasoning_text.delta",
+                            "output_index": index,
+                            "item_id": self.item_id_for("rs", *index),
+                            "content_index": 0,
+                            "delta": text
+                        }),
+                    ))
+                }
+                // An empty ThinkingDelta carries no content (drop it), and Responses has no streaming
+                // analog for a thinking `SignatureDelta` (the signature rides on the item's
+                // `encrypted_content`, not a stream delta) — so both emit no frame.
+                &crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
                     None
                 }
             },
@@ -2291,7 +2788,34 @@ impl ProtocolWriter for ResponsesWriter {
                 // NOTE: this arm must YIELD its `Option` as the match value (never `return` it), so
                 // the closing `emitted.map(...)` tail injects the top-level `sequence_number` every
                 // native Responses event carries — an early `return Some(..)` would skip it.
-                if self.take_tool_open(*index) {
+                if self.take_reasoning_open(*index) {
+                    // H1 REASONING (stream): close the reasoning item opened by the Thinking
+                    // BlockStart. Emit `output_item.done` typed "reasoning" with the SAME `rs_…`
+                    // item_id and the assembled reasoning text under a `content[]` `reasoning_text`
+                    // part. Record the finalized item so the terminal `response.completed` emits it in
+                    // `output[]`. The prior writer dropped reasoning entirely, so a reasoning stream
+                    // reassembled to an OpenAI/Anthropic client lost the chain-of-thought.
+                    let item_id = self.item_id_for("rs", *index);
+                    let text = self.take_reasoning_accum(*index);
+                    let item = serde_json::json!({
+                        "type": "reasoning",
+                        "id": item_id,
+                        "summary": [],
+                        "content": [
+                            { "type": "reasoning_text", "text": text }
+                        ]
+                    });
+                    self.record_output_item(*index, item.clone());
+                    Some((
+                        "response.output_item.done".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "output_index": index,
+                            "item_id": item_id,
+                            "item": item,
+                        }),
+                    ))
+                } else if self.take_tool_open(*index) {
                     // Native `response.output_item.done` carries the SAME stable `item_id` as the
                     // matching `output_item.added` (so a client correlates the `added → done`
                     // lifecycle) plus the FULLY finalized `item` object: a typed SDK reads
@@ -2438,6 +2962,16 @@ impl ProtocolWriter for ResponsesWriter {
                     "output_tokens".to_string(),
                     serde_json::json!(usage.output_tokens),
                 );
+                // H6: surface the IR read-side cache count on the streaming terminal as the
+                // Responses-native `usage.input_tokens_details.cached_tokens` (only when present), so a
+                // cross-protocol stream carrying a cache hit reports it to a Responses client just as
+                // the non-stream body does. Omitted when absent (no `cached_tokens: 0`).
+                if let Some(cached) = usage.cache_read_input_tokens {
+                    usage_map.insert(
+                        "input_tokens_details".to_string(),
+                        serde_json::json!({ "cached_tokens": cached }),
+                    );
+                }
                 resp_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
                 // The native terminal `response.completed`/`response.incomplete` event carries the
                 // FULLY assembled inner `response` object: the official Python/Node SDK reads
@@ -2628,7 +3162,33 @@ impl ProtocolWriter for ResponsesWriter {
                         "arguments": args_str
                     }));
                 }
-                crate::ir::IrBlock::Thinking { .. } => {}
+                // H1 REASONING: write an IR Thinking block back as a native Responses `reasoning`
+                // output item. The prior `_ => {}`-equivalent DROPPED it, so a thinking-carrying
+                // response translated from Anthropic/Bedrock lost its reasoning on the Responses
+                // surface. Emit the text under a `content[]` `reasoning_text` part (the full-reasoning
+                // location); when the IR carries a signature, round-trip it into Responses'
+                // `encrypted_content` slot (the opaque reasoning-reuse blob) so a same-protocol hop is
+                // lossless. A purely-empty Thinking block emits no item.
+                crate::ir::IrBlock::Thinking { text, signature } => {
+                    if text.is_empty() && signature.is_none() {
+                        continue;
+                    }
+                    let mut item = serde_json::Map::new();
+                    item.insert("type".to_string(), serde_json::json!("reasoning"));
+                    item.insert(
+                        "id".to_string(),
+                        serde_json::json!(synthesize_item_id("rs")),
+                    );
+                    item.insert("summary".to_string(), serde_json::Value::Array(Vec::new()));
+                    item.insert(
+                        "content".to_string(),
+                        serde_json::json!([{ "type": "reasoning_text", "text": text }]),
+                    );
+                    if let Some(sig) = signature {
+                        item.insert("encrypted_content".to_string(), serde_json::json!(sig));
+                    }
+                    output_arr.push(serde_json::Value::Object(item));
+                }
                 // ToolResult and Image have no representation in a Responses API `output` array
                 // (output carries assistant `message`/`function_call` items only), so they are
                 // intentionally dropped here. Enumerated explicitly rather than swallowed by a
@@ -2648,6 +3208,17 @@ impl ProtocolWriter for ResponsesWriter {
             "output_tokens".to_string(),
             serde_json::json!(resp.usage.output_tokens),
         );
+        // H6: write the IR read-side cache count back as the Responses-native
+        // `usage.input_tokens_details.cached_tokens` (ONLY when present), so a cross-protocol response
+        // that carried a cache hit (e.g. from a Bedrock backend) surfaces it to a Responses client.
+        // Omitted entirely when the IR carries no cache-read value — a real Responses body without
+        // cache hits omits the details object rather than emitting `cached_tokens: 0`.
+        if let Some(cached) = resp.usage.cache_read_input_tokens {
+            usage_map.insert(
+                "input_tokens_details".to_string(),
+                serde_json::json!({ "cached_tokens": cached }),
+            );
+        }
 
         let mut obj = serde_json::Map::new();
         // Emit the SDK-required top-level identity. Same-protocol passthrough carries the captured
@@ -2826,6 +3397,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -3044,6 +3620,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -4114,6 +4695,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = ResponsesWriter;
@@ -4175,6 +4761,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = ResponsesWriter;
@@ -4478,6 +5069,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&req);
@@ -4506,6 +5102,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&req);
@@ -4723,6 +5324,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = ResponsesWriter;
@@ -4777,6 +5383,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = ResponsesWriter;
@@ -4809,6 +5420,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = ResponsesWriter;
@@ -7807,5 +8423,425 @@ mod tests {
         let writer = ResponsesWriter;
         let out = writer.write_request(&ir);
         assert!(out.get("tool_choice").is_none());
+    }
+
+    /// Build a minimal IR request for writer tests, with every Phase-0 / sampling field None/empty so
+    /// individual tests can set just the one knob under test.
+    fn empty_ir_request() -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: Vec::new(),
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    // H1 REASONING: a non-stream Responses `reasoning` output item must read into an IR Thinking block
+    // (text from `content[].reasoning_text`, signature from `encrypted_content`) AND write back as a
+    // `reasoning` item — a full round-trip, so reasoning survives both directions of the seam.
+    #[test]
+    fn test_reasoning_item_thinking_round_trip() {
+        let body = serde_json::json!({
+            "id": "resp_r",
+            "status": "completed",
+            "model": "o3",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "let me think step by step"}],
+                    "encrypted_content": "ENC_BLOB_123"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "the answer"}]
+                }
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 7}
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_response(&body).expect("read_response");
+        // The reasoning item became a Thinking block carrying both text and the encrypted_content
+        // mapped into the signature slot.
+        let thinking = ir
+            .content
+            .iter()
+            .find_map(|b| match b {
+                crate::ir::IrBlock::Thinking { text, signature } => Some((text, signature)),
+                _ => None,
+            })
+            .expect("a Thinking block read from the reasoning item");
+        assert_eq!(thinking.0, "let me think step by step");
+        assert_eq!(thinking.1.as_deref(), Some("ENC_BLOB_123"));
+
+        // Write back: the Thinking block must re-emit a native `reasoning` output item with the text
+        // under `content[].reasoning_text` and the signature back in `encrypted_content`.
+        let writer = ResponsesWriter;
+        let out = writer.write_response(&ir);
+        let reasoning = out["output"]
+            .as_array()
+            .and_then(|a| a.iter().find(|i| i["type"] == "reasoning"))
+            .expect("a reasoning output item written back");
+        assert_eq!(
+            reasoning["content"][0]["type"], "reasoning_text",
+            "reasoning text part typed reasoning_text"
+        );
+        assert_eq!(
+            reasoning["content"][0]["text"], "let me think step by step",
+            "reasoning text round-trips"
+        );
+        assert_eq!(
+            reasoning["encrypted_content"], "ENC_BLOB_123",
+            "signature round-trips into encrypted_content"
+        );
+    }
+
+    // H6: `usage.input_tokens_details.cached_tokens` must read into the IR `cache_read_input_tokens`
+    // and write back to the same nested Responses location (the Bedrock-shared cache-read field).
+    #[test]
+    fn test_cached_tokens_mapping() {
+        let body = serde_json::json!({
+            "id": "resp_c",
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 64}
+            }
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_response(&body).expect("read_response");
+        assert_eq!(
+            ir.usage.cache_read_input_tokens,
+            Some(64),
+            "cached_tokens read into cache_read_input_tokens"
+        );
+
+        // Write back: the cache count re-emits under usage.input_tokens_details.cached_tokens.
+        let writer = ResponsesWriter;
+        let out = writer.write_response(&ir);
+        assert_eq!(
+            out["usage"]["input_tokens_details"]["cached_tokens"], 64,
+            "cache_read_input_tokens written back to cached_tokens"
+        );
+
+        // A response with NO cache details must NOT gain a spurious cached_tokens (None stays absent).
+        let no_cache = serde_json::json!({
+            "id": "resp_n", "status": "completed", "model": "gpt-4o",
+            "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let ir2 = reader.read_response(&no_cache).expect("read_response");
+        assert_eq!(ir2.usage.cache_read_input_tokens, None);
+        let out2 = writer.write_response(&ir2);
+        assert!(
+            out2["usage"].get("input_tokens_details").is_none(),
+            "no cache details => no input_tokens_details emitted"
+        );
+    }
+
+    // M5 STOP: the Responses create API models no `stop` param, so the writer must NOT emit one even
+    // when the IR carries stop sequences (they are warned-and-dropped, not silently leaked).
+    #[test]
+    fn test_stop_not_emitted_on_responses() {
+        let mut req = empty_ir_request();
+        req.messages.push(crate::ir::IrMessage {
+            role: crate::ir::IrRole::User,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+        });
+        req.stop = vec!["STOP".to_string(), "END".to_string()];
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&req);
+        assert!(
+            out.get("stop").is_none(),
+            "/v1/responses models no stop param; it must not be emitted: {out}"
+        );
+        assert!(
+            out.get("stop_sequences").is_none(),
+            "no stop_sequences either"
+        );
+    }
+
+    // SAMPLING: frequency_penalty / presence_penalty / seed / n are NOT modeled by the Responses
+    // create API, so the writer must omit them even when the IR carries values (lossy-by-target).
+    #[test]
+    fn test_unsupported_sampling_params_omitted() {
+        let mut req = empty_ir_request();
+        req.messages.push(crate::ir::IrMessage {
+            role: crate::ir::IrRole::User,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+        });
+        req.frequency_penalty = Some(0.5);
+        req.presence_penalty = Some(0.3);
+        req.seed = Some(42);
+        req.n = Some(3);
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&req);
+        for key in ["frequency_penalty", "presence_penalty", "seed", "n"] {
+            assert!(
+                out.get(key).is_none(),
+                "{key} is unsupported on /v1/responses and must be omitted: {out}"
+            );
+        }
+    }
+
+    // M1 response_format <-> text.format. A Responses `text.format` json_schema (FLAT) must read into
+    // the canonical nested IR shape, and the writer must re-flatten it back under `text.format`.
+    #[test]
+    fn test_response_format_text_format_round_trip() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "hi"}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "out",
+                    "schema": {"type": "object"},
+                    "strict": true
+                },
+                "verbosity": "low"
+            }
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&body).expect("read_request");
+        // Canonical IR shape NESTS the schema fields under `json_schema`.
+        let rf = ir
+            .response_format
+            .as_ref()
+            .expect("response_format promoted");
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["name"], "out");
+        assert_eq!(rf["json_schema"]["schema"]["type"], "object");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        // The non-format `text` sub-key (verbosity) survives via extra.
+        assert_eq!(
+            ir.extra.get("text").and_then(|t| t.get("verbosity")),
+            Some(&serde_json::json!("low")),
+            "text.verbosity preserved in extra"
+        );
+        // `text` must NOT leak its format into extra (the writer rebuilds it).
+        assert!(
+            ir.extra.get("text").and_then(|t| t.get("format")).is_none(),
+            "text.format must be promoted, not left in extra"
+        );
+
+        // Write back: text.format flat shape, merged with the preserved verbosity.
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        let fmt = &out["text"]["format"];
+        assert_eq!(fmt["type"], "json_schema", "flat text.format type");
+        assert_eq!(fmt["name"], "out", "name flattened beside type");
+        assert_eq!(fmt["schema"]["type"], "object");
+        assert_eq!(fmt["strict"], true);
+        assert!(
+            fmt.get("json_schema").is_none(),
+            "Responses text.format is FLAT, no nested json_schema key: {fmt}"
+        );
+        assert_eq!(
+            out["text"]["verbosity"], "low",
+            "verbosity merged alongside format"
+        );
+    }
+
+    // L5: a Responses `input_image` given by `file_id` (no image_url) must NOT become an empty Image
+    // block — it carries the file_id faithfully and round-trips back to the `file_id` form.
+    #[test]
+    fn test_input_image_file_id_round_trip() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "input_image",
+                "file_id": "file-abc123"
+            }]
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&body).expect("read_request");
+        let img = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                crate::ir::IrBlock::Image { media_type, data } => Some((media_type, data)),
+                _ => None,
+            })
+            .expect("an Image block from the file_id image");
+        assert_eq!(
+            img.0, FILE_ID_IMAGE_SENTINEL,
+            "file_id carried via sentinel"
+        );
+        assert_eq!(img.1, "file-abc123", "file_id preserved");
+        assert!(!img.1.is_empty(), "file_id image is NOT an empty block");
+
+        // Write back: re-emits the native file_id form, not an image_url. The writer emits the
+        // CANONICAL message-wrapped form (`{type:message, role, content:[{type:input_image,...}]}`),
+        // so the input_image lives inside a message's `content`, not at the top of `input[]`.
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        let image_item = out["input"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("content").and_then(|c| c.as_array()))
+            .flatten()
+            .find(|c| c["type"] == "input_image")
+            .expect("an input_image content block written back");
+        assert_eq!(image_item["file_id"], "file-abc123", "file_id round-trips");
+        assert!(
+            image_item.get("image_url").is_none(),
+            "a file_id image must not gain a spurious image_url: {image_item}"
+        );
+    }
+
+    // H1 REASONING (stream): a reasoning output-item lifecycle (added/delta/done) must read into a
+    // Thinking BlockStart + ThinkingDelta + BlockStop, and the writer must re-emit native reasoning
+    // stream events from those IR events (`output_item.added`/`reasoning_text.delta`/`.done`).
+    #[test]
+    fn test_streaming_reasoning_round_trip() {
+        let reader = ResponsesReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // output_item.added (reasoning) at index 0 opens a Thinking BlockStart.
+        let added = reader.read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            }),
+            &mut state,
+        );
+        assert!(
+            added.iter().any(|e| matches!(
+                e,
+                crate::ir::IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: crate::ir::IrBlockMeta::Thinking
+                }
+            )),
+            "reasoning item.added opens a Thinking block at index 0: {added:?}"
+        );
+
+        // reasoning_text.delta carries a ThinkingDelta.
+        let delta = reader.read_response_events(
+            "response.reasoning_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "pondering"}),
+            &mut state,
+        );
+        assert!(
+            delta.iter().any(|e| matches!(
+                e,
+                crate::ir::IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: crate::ir::IrDelta::ThinkingDelta(t)
+                } if t == "pondering"
+            )),
+            "reasoning_text.delta yields a ThinkingDelta: {delta:?}"
+        );
+
+        // Writer side: a Thinking BlockStart emits a native reasoning output_item.added.
+        let writer = ResponsesWriter;
+        let (etype, payload) = writer
+            .write_response_event(&crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Thinking,
+            })
+            .expect("Thinking BlockStart emits a frame");
+        assert_eq!(etype, "response.output_item.added");
+        assert_eq!(payload["item"]["type"], "reasoning");
+
+        // A ThinkingDelta emits a native reasoning_text.delta.
+        let (etype2, payload2) = writer
+            .write_response_event(&crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::ThinkingDelta("pondering".to_string()),
+            })
+            .expect("ThinkingDelta emits a frame");
+        assert_eq!(etype2, "response.reasoning_text.delta");
+        assert_eq!(payload2["delta"], "pondering");
+
+        // BlockStop closes it as a reasoning output_item.done carrying the assembled text.
+        let (etype3, payload3) = writer
+            .write_response_event(&crate::ir::IrStreamEvent::BlockStop { index: 0 })
+            .expect("Thinking BlockStop emits a frame");
+        assert_eq!(etype3, "response.output_item.done");
+        assert_eq!(payload3["item"]["type"], "reasoning");
+        assert_eq!(payload3["item"]["content"][0]["text"], "pondering");
+    }
+
+    // H6 (stream): a streamed terminal `response.completed` carrying
+    // usage.input_tokens_details.cached_tokens must surface it on the IR MessageDelta usage, and the
+    // writer's MessageDelta must re-emit it on the terminal event.
+    #[test]
+    fn test_streaming_cached_tokens_round_trip() {
+        let reader = ResponsesReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader.read_response_events(
+            "response.completed",
+            &serde_json::json!({
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 50,
+                        "output_tokens": 5,
+                        "input_tokens_details": {"cached_tokens": 32}
+                    }
+                }
+            }),
+            &mut state,
+        );
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::IrStreamEvent::MessageDelta { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .expect("a MessageDelta with usage");
+        assert_eq!(usage.cache_read_input_tokens, Some(32));
+
+        // Writer re-emits cached_tokens on the terminal event's inner response.usage.
+        let writer = ResponsesWriter;
+        let (_etype, payload) = writer
+            .write_response_event(&crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: crate::ir::IrUsage {
+                    input_tokens: 50,
+                    output_tokens: 5,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: Some(32),
+                },
+            })
+            .expect("MessageDelta emits a terminal frame");
+        assert_eq!(
+            payload["response"]["usage"]["input_tokens_details"]["cached_tokens"], 32,
+            "streamed terminal re-emits cached_tokens: {payload}"
+        );
     }
 }

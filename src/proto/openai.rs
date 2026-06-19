@@ -233,6 +233,18 @@ impl ProtocolReader for OpenAiReader {
             !obj.contains_key("max_tokens") && obj.contains_key("max_completion_tokens");
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
+        // Phase 0 first-class sampling/output controls now promoted out of `extra` to first-class IR
+        // fields (read in OpenAI's native top-level shape). `frequency_penalty`/`presence_penalty` are
+        // floats; `seed`/`n` are integers; `response_format` is the raw object (json_object / json_schema),
+        // stored verbatim so the writer can re-emit it unchanged.
+        let frequency_penalty = obj.get("frequency_penalty").and_then(|v| v.as_f64());
+        let presence_penalty = obj.get("presence_penalty").and_then(|v| v.as_f64());
+        let seed = obj.get("seed").and_then(|v| v.as_i64());
+        let n = obj
+            .get("n")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        let response_format = obj.get("response_format").cloned();
         // OpenAI's `stop` is a string OR an array of strings; normalize to the IR's Vec<String>.
         // OpenAI has NO top_k knob, so `top_k` stays None (its writer omits it too).
         let stop = crate::ir::read_stop_sequences(obj.get("stop"));
@@ -428,21 +440,16 @@ impl ProtocolReader for OpenAiReader {
         }
 
         // Collect unmodeled top-level keys into extra (excluding modeled ones). The fields the IR
-        // models as first-class — model, messages, tools, max_tokens, temperature, top_p, stop,
-        // stream — are excluded; everything else (frequency_penalty, presence_penalty, n, logit_bias,
-        // seed, …) flows through `extra` verbatim so a SAME-protocol OpenAI passthrough reaches the
-        // upstream unchanged. NOTE: the penalties stay in `extra` (and are therefore stripped on a
-        // cross-protocol hop) ON PURPOSE — Anthropic and the Bedrock `inferenceConfig` have no penalty
-        // knob, so they lack a clean universal mapping; only the universally-modeled controls (top_p,
-        // stop) are promoted. top_p and stop are pulled out here so they survive the cross-protocol
-        // seam as first-class IR fields rather than being cleared with the rest of `extra`.
+        // models as first-class — model, messages, tools, max_tokens, temperature, top_p, stop, stream,
+        // tool_choice, and (Phase 0) frequency_penalty, presence_penalty, seed, n, response_format — are
+        // excluded; everything else (logit_bias, …) flows through `extra` verbatim so a SAME-protocol
+        // OpenAI passthrough reaches the upstream unchanged.
         //
-        // PF-M4: `response_format` (json_object / json_schema / structured output) is DELIBERATELY left
-        // in `extra` (not in `modeled_keys`), so it survives a SAME-protocol OpenAI->OpenAI passthrough
-        // verbatim — it is NOT dropped on that path. On a CROSS-protocol hop it is cleared with the rest
-        // of `extra`; rather than dropping it silently, the translate seam (`forward.rs`) emits a warn
-        // (full cross-protocol mapping to Gemini `responseSchema` / Anthropic tool-forcing / Bedrock is
-        // deferred). See the matching note at `forward.rs::translate_request_cross_protocol`.
+        // Phase 0: frequency_penalty / presence_penalty / seed / n / response_format are now promoted to
+        // first-class IR fields (read above) and excluded here, so they no longer linger in `extra` —
+        // otherwise the writer would double-emit them (once from the typed field, once from the extra
+        // sweep). Cross-protocol mapping of these to Gemini/Anthropic/Bedrock analogs is handled by the
+        // translate seam (`forward.rs`).
         let modeled_keys: std::collections::HashSet<&str> = [
             "model",
             "messages",
@@ -459,6 +466,14 @@ impl ProtocolReader for OpenAiReader {
             "stop",
             "stream",
             "tool_choice",
+            // Phase 0: these are now promoted to first-class IR fields (read above), so they must be
+            // excluded from `extra` — otherwise the writer would emit BOTH the promoted field AND a
+            // verbatim copy from `extra`, and the cross-protocol seam would clear the `extra` copy.
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "n",
+            "response_format",
         ]
         .iter()
         .cloned()
@@ -495,6 +510,11 @@ impl ProtocolReader for OpenAiReader {
             stop,
             tool_choice,
             stream,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            n,
+            response_format,
             extra,
         })
     }
@@ -1213,6 +1233,18 @@ impl ProtocolWriter for OpenAiWriter {
                             content_arr.push(serde_json::json!({ "type": "text", "text": text }));
                         }
                         crate::ir::IrBlock::Image { media_type, data } => {
+                            // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is an
+                            // unresolvable cross-vendor reference: emitting it as an `image_url` would
+                            // produce a corrupt `data:file_id;base64,<id>` URI. SKIP it with a warn
+                            // rather than corrupt the block (no lossless cross-vendor projection).
+                            if super::is_unresolvable_image_ref(media_type) {
+                                tracing::warn!(
+                                    "dropping unresolvable file_id image on OpenAI egress: a \
+                                     Responses input_image.file_id has no cross-vendor analog and \
+                                     would corrupt an image_url; the block is NOT emitted"
+                                );
+                                continue;
+                            }
                             // Reconstruct the original `image_url` from the IR pair: a URL-sentinel
                             // image is emitted verbatim, a base64 image is re-wrapped as a data URI.
                             let url = super::image_url_from_ir(media_type, data);
@@ -1408,6 +1440,30 @@ impl ProtocolWriter for OpenAiWriter {
         }
         if !req.stop.is_empty() {
             out.insert("stop".to_string(), serde_json::json!(req.stop));
+        }
+
+        // Phase 0 first-class sampling/output controls. Emitted in OpenAI's native top-level shape and
+        // omitted entirely when None. `response_format` is written back verbatim (the raw Value read in).
+        if let Some(frequency_penalty) = req.frequency_penalty {
+            out.insert(
+                "frequency_penalty".to_string(),
+                serde_json::json!(frequency_penalty),
+            );
+        }
+        if let Some(presence_penalty) = req.presence_penalty {
+            out.insert(
+                "presence_penalty".to_string(),
+                serde_json::json!(presence_penalty),
+            );
+        }
+        if let Some(seed) = req.seed {
+            out.insert("seed".to_string(), serde_json::json!(seed));
+        }
+        if let Some(n) = req.n {
+            out.insert("n".to_string(), serde_json::json!(n));
+        }
+        if let Some(response_format) = &req.response_format {
+            out.insert("response_format".to_string(), response_format.clone());
         }
 
         out.insert("stream".to_string(), serde_json::json!(req.stream));
@@ -2146,6 +2202,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2176,6 +2237,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2245,10 +2311,9 @@ mod tests {
 
     #[test]
     fn response_format_survives_same_protocol_roundtrip() {
-        // PF-M4: `response_format` (json_object / json_schema / structured output) is NOT a modeled
-        // key, so it rides `extra` and must survive a SAME-protocol OpenAI->OpenAI passthrough verbatim
-        // (it is NOT dropped on that path). On a cross-protocol hop the translate seam clears extra and
-        // warns (full mapping to Gemini/Anthropic/Bedrock analogs is deferred).
+        // Phase 0: `response_format` (json_object / json_schema / structured output) is now a first-class
+        // IR field (read verbatim into `ir.response_format`), so it leaves `extra` and survives both a
+        // same-protocol OpenAI->OpenAI passthrough AND the cross-protocol seam (which clears `extra`).
         let body = serde_json::json!({
             "messages": [{ "role": "user", "content": "hi" }],
             "response_format": {
@@ -2257,10 +2322,17 @@ mod tests {
             }
         });
         let ir = OpenAiReader.read_request(&body).expect("parses");
-        // It lands in extra (not silently dropped at read time).
+        // It is promoted to the typed field, NOT left lingering in extra.
         assert!(
-            ir.extra.contains_key("response_format"),
-            "response_format must be preserved in extra for same-protocol passthrough"
+            !ir.extra.contains_key("response_format"),
+            "response_format must be promoted to the typed IR field, not left in extra"
+        );
+        assert_eq!(
+            ir.response_format,
+            Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "out", "schema": {"type": "object"}}
+            }))
         );
         let out = OpenAiWriter.write_request(&ir);
         assert_eq!(
@@ -2289,6 +2361,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2320,6 +2397,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2361,6 +2443,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2409,6 +2496,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2471,6 +2563,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -2916,17 +3013,15 @@ mod tests {
         assert!(!ir.extra.contains_key("stop"));
         assert_eq!(ir.top_p, Some(0.9_f64));
         assert_eq!(ir.stop, vec!["\n\n".to_string()]);
-        // The penalties / n / logit_bias have no clean universal cross-protocol mapping and stay in
+        // Phase 0: penalties / seed / n / response_format are now PROMOTED to first-class IR fields too,
+        // so they leave `extra` and land in the typed fields. Only `logit_bias` (no IR field) stays in
         // `extra` (still re-emitted on a same-protocol passthrough, still stripped cross-protocol).
-        assert_eq!(
-            ir.extra.get("frequency_penalty"),
-            Some(&serde_json::json!(0.5))
-        );
-        assert_eq!(
-            ir.extra.get("presence_penalty"),
-            Some(&serde_json::json!(0.25))
-        );
-        assert_eq!(ir.extra.get("n"), Some(&serde_json::json!(2)));
+        assert!(!ir.extra.contains_key("frequency_penalty"));
+        assert!(!ir.extra.contains_key("presence_penalty"));
+        assert!(!ir.extra.contains_key("n"));
+        assert_eq!(ir.frequency_penalty, Some(0.5_f64));
+        assert_eq!(ir.presence_penalty, Some(0.25_f64));
+        assert_eq!(ir.n, Some(2));
         assert_eq!(
             ir.extra.get("logit_bias"),
             Some(&serde_json::json!({ "50256": -100 }))
@@ -2963,6 +3058,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -3186,6 +3286,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -3370,6 +3475,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -3416,6 +3526,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -4437,6 +4552,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -4817,6 +4937,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = OpenAiWriter.write_request(&req);
@@ -5106,6 +5231,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -5194,5 +5324,163 @@ mod tests {
         });
         let ir = OpenAiReader.read_request(&body).expect("parses");
         assert_eq!(ir.tool_choice, None);
+    }
+
+    // --- Phase 0: frequency_penalty / presence_penalty / seed / n / response_format as first-class
+    // IR fields. Each proves: OpenAI body -> IR carries it; IR -> OpenAI body re-emits it; and that
+    // they leave `extra` (promoted, not lingering). ---
+
+    #[test]
+    fn phase0_sampling_fields_read_into_ir() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 0.5,
+            "presence_penalty": -0.25,
+            "seed": 42,
+            "n": 3,
+            "response_format": { "type": "json_object" }
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.frequency_penalty, Some(0.5_f64));
+        assert_eq!(ir.presence_penalty, Some(-0.25_f64));
+        assert_eq!(ir.seed, Some(42_i64));
+        assert_eq!(ir.n, Some(3_u32));
+        assert_eq!(
+            ir.response_format,
+            Some(serde_json::json!({ "type": "json_object" }))
+        );
+        // Promoted out of `extra` — none should linger (else they'd double-emit on write).
+        assert!(!ir.extra.contains_key("frequency_penalty"));
+        assert!(!ir.extra.contains_key("presence_penalty"));
+        assert!(!ir.extra.contains_key("seed"));
+        assert!(!ir.extra.contains_key("n"));
+        assert!(!ir.extra.contains_key("response_format"));
+    }
+
+    #[test]
+    fn phase0_sampling_fields_written_from_ir() {
+        let ir = crate::ir::IrRequest {
+            frequency_penalty: Some(1.5),
+            presence_penalty: Some(-2.0),
+            seed: Some(1234),
+            n: Some(4),
+            response_format: Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "out", "schema": {"type": "object"}}
+            })),
+            ..test_ir_request()
+        };
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["frequency_penalty"], serde_json::json!(1.5));
+        assert_eq!(out["presence_penalty"], serde_json::json!(-2.0));
+        assert_eq!(out["seed"], serde_json::json!(1234));
+        assert_eq!(out["n"], serde_json::json!(4));
+        assert_eq!(
+            out["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "out", "schema": {"type": "object"}}
+            }),
+            "response_format must be re-emitted verbatim"
+        );
+    }
+
+    #[test]
+    fn phase0_sampling_fields_omitted_when_absent() {
+        // None on every Phase 0 field => the writer emits none of the keys.
+        let out = OpenAiWriter.write_request(&test_ir_request());
+        let obj = out.as_object().expect("object");
+        assert!(obj.get("frequency_penalty").is_none());
+        assert!(obj.get("presence_penalty").is_none());
+        assert!(obj.get("seed").is_none());
+        assert!(obj.get("n").is_none());
+        assert!(obj.get("response_format").is_none());
+    }
+
+    #[test]
+    fn phase0_sampling_fields_roundtrip_same_protocol() {
+        // OpenAI -> IR -> OpenAI preserves every Phase 0 field byte-for-byte.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 0.75,
+            "presence_penalty": 0.1,
+            "seed": -7,
+            "n": 2,
+            "response_format": { "type": "json_object" }
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["frequency_penalty"], serde_json::json!(0.75));
+        assert_eq!(out["presence_penalty"], serde_json::json!(0.1));
+        assert_eq!(out["seed"], serde_json::json!(-7));
+        assert_eq!(out["n"], serde_json::json!(2));
+        assert_eq!(
+            out["response_format"],
+            serde_json::json!({ "type": "json_object" })
+        );
+    }
+
+    /// D2: a Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) reaching the OpenAI
+    /// egress is an unresolvable cross-vendor reference. It must be SKIPPED — NOT emitted as a corrupt
+    /// `data:file_id;base64,<id>` image_url. The user message's content must carry no image part.
+    #[test]
+    fn test_write_request_file_id_image_dropped_not_corrupted() {
+        let writer = OpenAiWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "describe this".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Image {
+                        media_type: crate::proto::FILE_ID_IMAGE_SENTINEL.to_string(),
+                        data: "file-abc123".to_string(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("file-abc123") && !wire.contains("file_id"),
+            "a file_id image must not leak onto the OpenAI wire (no corrupt image_url); got {wire}"
+        );
+        // The text part still survives; no image part is present.
+        let content = out
+            .pointer("/messages/0/content")
+            .and_then(|c| c.as_array())
+            .expect("user message content array");
+        assert!(
+            content
+                .iter()
+                .all(|p| p.get("type").and_then(|t| t.as_str()) != Some("image_url")),
+            "no image_url part may be emitted for a file_id image; got {out}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("text")),
+            "the text part must still survive; got {out}"
+        );
     }
 }

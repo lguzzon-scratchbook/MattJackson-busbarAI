@@ -332,19 +332,84 @@ fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value
         );
         return None;
     }
+    if super::is_unresolvable_image_ref(media_type) {
+        // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is an unresolvable
+        // cross-vendor reference. Emitting it as base64 `bytes` would shove the file_id string into
+        // the bytes field — a corrupt block. There is no lossless cross-vendor projection of an
+        // uploaded-file id onto Converse, so DROP it with a trace (mirroring the URL-image drop).
+        tracing::warn!(
+            "dropping unresolvable file_id image on Bedrock egress: a Responses \
+             input_image.file_id has no cross-vendor analog and would corrupt a base64 `bytes` \
+             source; the block is NOT emitted"
+        );
+        return None;
+    }
     // `strip_prefix("image/")` returns `Some("")` for the exact MIME prefix `"image/"` (an empty
     // subtype), and `Some(format)` for a real subtype. `unwrap_or("png")` only fires on `None`, so
     // without the `filter` an empty subtype would flow through as `format: ""` — not a member of
     // Bedrock Converse's `ImageFormat` union, which the SDK rejects with a `ValidationException`.
     // Treat an empty subtype the same as a missing prefix and fall back to `png`.
-    let format_str = media_type
-        .strip_prefix("image/")
-        .filter(|s| !s.is_empty())
-        .unwrap_or("png");
+    let format_str = match media_type.strip_prefix("image/").filter(|s| !s.is_empty()) {
+        Some(subtype) => subtype,
+        None => {
+            // L4: a media_type that is not a well-formed `image/<subtype>` (a bare label, the exact
+            // `image/` prefix with an empty subtype, or any unprefixed string) cannot name a Converse
+            // `ImageFormat`, so we coerce it to `png` to keep the block valid rather than emit a
+            // `format: ""` the SDK rejects. That coercion mutates the caller's declared type and was
+            // previously SILENT; warn so the degradation is observable (mirrors the temperature clamp
+            // and the URL-image drop above).
+            tracing::warn!(
+                media_type = %media_type,
+                "coercing malformed image media_type to format=png: it is not a well-formed \
+                 'image/<subtype>', and an empty/invalid format would be rejected by Bedrock"
+            );
+            "png"
+        }
+    };
     Some(serde_json::json!({
         "format": format_str,
         "source": { "bytes": data }
     }))
+}
+
+/// Build a native Bedrock Converse prompt-cache marker block (`{"cachePoint": {"type": "default"}}`).
+///
+/// This is the Converse content-block / tool-list element AWS uses to mark a prompt-cache boundary:
+/// everything BEFORE the marker (in the same `system` / message `content` / `toolConfig.tools` array)
+/// is cached as a prefix. The IR carries the equivalent boundary as a first-class `cache_control`
+/// field ON a block / tool (set by e.g. the Anthropic reader); the Bedrock writer projects that field
+/// to this marker emitted IMMEDIATELY AFTER the block / tool it applies to, which is the position
+/// Bedrock expects (the breakpoint sits after the content it closes). Factored out so the one marker
+/// shape has a single definition and the cross-protocol write path is unit-testable.
+fn bedrock_cache_point() -> serde_json::Value {
+    serde_json::json!({ "cachePoint": { "type": "default" } })
+}
+
+/// Read the `cache_control` off the LAST block pushed onto an IR content vector, used by the Bedrock
+/// reader to map a native `cachePoint` adjacency back onto the preceding block's first-class IR
+/// `cache_control` field (so a Bedrock->Bedrock and Bedrock->Anthropic round-trip preserves the
+/// prompt-cache boundary cross-protocol, not only via the positional `CACHE_POINTS_SENTINEL` stash
+/// which is dropped on the cross-protocol seam). Only the block kinds that carry a `cache_control`
+/// field (Text / ToolUse / ToolResult) can hold the boundary; a `cachePoint` following a block kind
+/// with no such field (Thinking / Image) is left to the positional stash alone. Setting the field is
+/// idempotent and additive: it does NOT disable the same-protocol stash, so byte-identical
+/// same-protocol round-trips are unaffected (the writer suppresses the inline emission whenever the
+/// stash is present — see `write_request`).
+fn set_preceding_block_cache_control(blocks: &mut [crate::ir::IrBlock]) {
+    if let Some(last) = blocks.last_mut() {
+        let cc = Some(crate::ir::CacheControl {
+            kind: crate::ir::CacheKind::Ephemeral,
+        });
+        match last {
+            crate::ir::IrBlock::Text { cache_control, .. }
+            | crate::ir::IrBlock::ToolUse { cache_control, .. }
+            | crate::ir::IrBlock::ToolResult { cache_control, .. } => {
+                *cache_control = cc;
+            }
+            // Thinking / Image have no `cache_control` field; the positional stash carries the marker.
+            crate::ir::IrBlock::Thinking { .. } | crate::ir::IrBlock::Image { .. } => {}
+        }
+    }
 }
 
 /// Splice captured `cachePoint` blocks back into a freshly-written content array at the ORIGINAL
@@ -868,6 +933,13 @@ impl ProtocolReader for BedrockReader {
                         "i": idx,
                         "block": { "cachePoint": cache_point.clone() },
                     }));
+                    // ALSO map the marker onto the preceding block's first-class IR `cache_control`
+                    // (H3 cross-protocol): the positional stash above is dropped on the cross-protocol
+                    // seam, so without this a Bedrock->Anthropic hop would lose the prompt-cache
+                    // boundary. Additive — the stash still drives the byte-identical same-protocol
+                    // round-trip; the writer suppresses the inline `cache_control` emission whenever
+                    // the stash is present, so the two never double-emit.
+                    set_preceding_block_cache_control(&mut system_blocks);
                 } else if let Some(guard_content) = sys_val.get("guardContent") {
                     // No IR counterpart for an inline Guardrails marker; stash it with its original
                     // index so the writer re-emits it verbatim at the same position (a same-protocol
@@ -1038,6 +1110,12 @@ impl ProtocolReader for BedrockReader {
                                 "i": block_idx,
                                 "block": { "cachePoint": cache_point.clone() },
                             }));
+                            // ALSO map the marker onto the preceding block's first-class IR
+                            // `cache_control` (H3 cross-protocol) so the prompt-cache boundary
+                            // survives a Bedrock->Anthropic hop where the positional stash is dropped.
+                            // Additive — see `set_preceding_block_cache_control`; the writer suppresses
+                            // the inline emission while the stash is present, so no double-emit.
+                            set_preceding_block_cache_control(&mut msg_content);
                         } else if let Some(guard_content) = content_val.get("guardContent") {
                             // No IR counterpart for an inline Guardrails marker; stash it with its
                             // (message, block) index so the writer re-emits it verbatim at the same
@@ -1090,6 +1168,28 @@ impl ProtocolReader for BedrockReader {
                             input_schema,
                             cache_control: None,
                         });
+                    } else if tool_val.get("cachePoint").is_some() {
+                        // A `cachePoint` entry in the `toolConfig.tools` array marks the prompt-cache
+                        // boundary for the tool DEFINITIONS preceding it (Anthropic places the same
+                        // breakpoint on a tool). Map it onto the preceding tool's first-class IR
+                        // `cache_control` (H3) so the boundary survives the cross-protocol seam. There
+                        // is no positional tool-cachePoint stash, so this is the sole carrier; on
+                        // same-protocol egress the writer re-emits the marker from this field. A
+                        // leading cachePoint with no preceding tool has nothing to attach to and is
+                        // dropped (a tool-list prefix boundary with an empty prefix is a no-op).
+                        //
+                        // LOW (accepted): degenerate tools-array cachePoint shapes — a LEADING
+                        // cachePoint (no preceding tool) or DOUBLED adjacent cachePoints — do not
+                        // byte-round-trip (the leading one is dropped; doubled ones collapse onto the
+                        // one preceding tool's single boolean field). This is a no-op only on inputs
+                        // AWS itself REJECTS (a tool-cache breakpoint with an empty/duplicate prefix is
+                        // not a valid Converse `toolConfig`), so there is no valid request whose
+                        // fidelity it harms; not worth a positional stash to preserve invalid shapes.
+                        if let Some(last) = tools.last_mut() {
+                            last.cache_control = Some(crate::ir::CacheControl {
+                                kind: crate::ir::CacheKind::Ephemeral,
+                            });
+                        }
                     }
                 }
             }
@@ -1236,6 +1336,11 @@ impl ProtocolReader for BedrockReader {
             // (a native Bedrock egress reads the flag from the endpoint, not the body, so this is
             // a no-op for the same-protocol path).
             stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra,
         })
     }
@@ -1908,18 +2013,32 @@ impl ProtocolWriter for BedrockWriter {
             .and_then(|gc| gc.get("messages"))
             .and_then(|v| v.as_array());
 
+        // When the positional cachePoint stash is present (same-protocol Bedrock passthrough) it is
+        // the authority for cachePoint placement (spliced below at the recorded indices for a
+        // byte-identical round-trip), so the inline `cache_control`-driven emission is SUPPRESSED to
+        // avoid emitting the same marker twice. On the cross-protocol seam `extra` is cleared, so the
+        // stash is absent and the inline emission (from the first-class IR `cache_control`) is the
+        // sole carrier — projecting an Anthropic cache breakpoint onto a native Bedrock cachePoint.
+        let emit_inline_system_cache = system_cache_points.is_none();
         if !req.system.is_empty() || system_cache_points.is_some() || system_guard_content.is_some()
         {
-            let mut text_arr: Vec<serde_json::Value> = req
-                .system
-                .iter()
-                .filter_map(|block| match block {
-                    crate::ir::IrBlock::Text { text, .. } => {
-                        Some(serde_json::json!({ "text": text }))
+            let mut text_arr: Vec<serde_json::Value> = Vec::new();
+            for block in &req.system {
+                if let crate::ir::IrBlock::Text {
+                    text,
+                    cache_control,
+                    ..
+                } = block
+                {
+                    text_arr.push(serde_json::json!({ "text": text }));
+                    // H3: emit a Bedrock `cachePoint` AFTER the block that carries the IR
+                    // `cache_control` boundary (the position Bedrock expects — the breakpoint closes
+                    // the prefix before it). Suppressed when the positional stash owns placement.
+                    if emit_inline_system_cache && cache_control.is_some() {
+                        text_arr.push(bedrock_cache_point());
                     }
-                    _ => None,
-                })
-                .collect();
+                }
+            }
 
             // Re-emit any captured `cachePoint` / `guardContent` markers at their original
             // positions so prompt caching and inline guardrails survive a same-protocol round-trip
@@ -1936,6 +2055,11 @@ impl ProtocolWriter for BedrockWriter {
             }
         }
 
+        // Same suppression gate as the system array (above): when the positional message-cachePoint
+        // stash is present it owns placement (byte-identical same-protocol round-trip), so inline
+        // `cache_control`-driven emission is suppressed; cross-protocol (stash cleared) it is the sole
+        // carrier of the prompt-cache boundary.
+        let emit_inline_message_cache = message_cache_points.is_none();
         let mut msgs_arr: Vec<serde_json::Value> = Vec::new();
         for (msg_idx, msg) in req.messages.iter().enumerate() {
             let role_str = match msg.role {
@@ -1955,6 +2079,17 @@ impl ProtocolWriter for BedrockWriter {
 
             let mut content_arr: Vec<serde_json::Value> = Vec::new();
             for block in &msg.content {
+                // H3: the prompt-cache boundary carried on this block, if any. Emitted as a
+                // `cachePoint` block IMMEDIATELY AFTER the block below (the position Bedrock expects).
+                // Suppressed when the positional stash owns placement (same-protocol passthrough).
+                let block_cache_control = match block {
+                    crate::ir::IrBlock::Text { cache_control, .. }
+                    | crate::ir::IrBlock::ToolUse { cache_control, .. }
+                    | crate::ir::IrBlock::ToolResult { cache_control, .. } => {
+                        cache_control.as_ref()
+                    }
+                    crate::ir::IrBlock::Thinking { .. } | crate::ir::IrBlock::Image { .. } => None,
+                };
                 match block {
                     crate::ir::IrBlock::Text { text, .. } => {
                         content_arr.push(serde_json::json!({ "text": text }));
@@ -2058,6 +2193,14 @@ impl ProtocolWriter for BedrockWriter {
                         content_arr.push(bedrock_reasoning_block(text, signature));
                     }
                 }
+                // H3: emit the prompt-cache boundary as a `cachePoint` block right after the block it
+                // applies to. Only Text/ToolUse/ToolResult carry `cache_control` (see
+                // `block_cache_control`); a block whose write produced nothing (e.g. a dropped Image)
+                // still emits no cachePoint here because such kinds carry no `cache_control` field.
+                // Suppressed when the positional stash owns placement (same-protocol round-trip).
+                if emit_inline_message_cache && block_cache_control.is_some() {
+                    content_arr.push(bedrock_cache_point());
+                }
             }
 
             // Re-emit any captured `cachePoint` / `guardContent` markers for THIS message at their
@@ -2153,6 +2296,24 @@ impl ProtocolWriter for BedrockWriter {
             );
         }
 
+        // response_format (D3): Bedrock Converse has NO native top-level `response_format` /
+        // structured-output field (structured output is model-specific and rides in
+        // `additionalModelRequestFields`, which we do not synthesize here). The reader never sets
+        // `response_format` on the same-protocol (Bedrock→Bedrock) path — same-protocol relays the raw
+        // upstream body and never reaches this writer — so this only fires for a CROSS-PROTOCOL IR
+        // (e.g. an OpenAI/Responses request carrying `response_format`) reaching the Bedrock egress.
+        // Dropping it silently is exactly the lossy mutation busbar exists to avoid, so emit a `warn!`
+        // so the divergence is observable rather than invisible (mirrors the Anthropic egress). The
+        // directive is dropped, not forwarded: there is no native key to carry it on Converse.
+        if req.response_format.is_some() {
+            tracing::warn!(
+                parameter = "response_format",
+                "dropping response_format on Bedrock egress: Converse has no native \
+                 response_format field, so the structured-output directive from a cross-protocol \
+                 request is NOT forwarded"
+            );
+        }
+
         // Rebuild `toolConfig` by OVERLAYING the typed `tools` array onto the RAW `toolConfig` object
         // the reader captured into `extra`. This preserves every sub-field the reader does not model —
         // notably `toolChoice` (`{auto:{}}` / `{any:{}}` / `{tool:{name:...}}`, the force-tool-use
@@ -2191,6 +2352,16 @@ impl ProtocolWriter for BedrockWriter {
                 let mut tool_obj = serde_json::Map::new();
                 tool_obj.insert("toolSpec".to_string(), serde_json::Value::Object(tool_spec));
                 tools_arr.push(serde_json::Value::Object(tool_obj));
+
+                // H3: a tool-definition prompt-cache boundary is emitted as a `cachePoint` element in
+                // the `toolConfig.tools` array right after the tool it closes (the prefix of tool
+                // schemas up to here is cached). Unlike the system/message arrays there is no
+                // positional tools-cachePoint stash, so the typed `cache_control` field is the SOLE
+                // carrier on BOTH the same-protocol path (the raw `toolConfig.tools` is clobbered by
+                // this typed rebuild) and the cross-protocol path — no suppression gate needed.
+                if tool.cache_control.is_some() {
+                    tools_arr.push(bedrock_cache_point());
+                }
             }
 
             tool_config.insert("tools".to_string(), serde_json::Value::Array(tools_arr));
@@ -2203,8 +2374,20 @@ impl ProtocolWriter for BedrockWriter {
         // `toolChoice` is emitted in that case.
         tool_config.remove("toolChoice");
         if let Some(tc) = &req.tool_choice {
-            if let Some(v) = write_bedrock_tool_choice(tc) {
-                tool_config.insert("toolChoice".to_string(), v);
+            match write_bedrock_tool_choice(tc) {
+                Some(v) => {
+                    tool_config.insert("toolChoice".to_string(), v);
+                }
+                // L4: `IrToolChoice::None` ("do NOT call a tool") has no native Converse directive, so
+                // it degrades to omitting `toolChoice` (the backend applies its own default, which may
+                // still call a tool). That divergence from the caller's explicit intent was previously
+                // SILENT; warn so it is observable in logs (mirrors the non-silent temperature clamp).
+                None => {
+                    tracing::warn!(
+                        "dropping tool_choice=None: Bedrock Converse has no 'do not call a tool' \
+                         directive, so toolChoice is omitted and the backend may still call a tool"
+                    );
+                }
             }
         }
         // Emit only when the resulting `toolConfig` actually carries a tools array OR a toolChoice.
@@ -3040,6 +3223,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -4096,6 +4284,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -4150,6 +4343,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -4399,6 +4597,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&ir_tools);
@@ -4427,6 +4630,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out_empty = writer.write_request(&ir_empty);
@@ -4949,6 +5157,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&ir);
@@ -5093,6 +5306,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra,
         };
         let out = writer.write_request(&ir);
@@ -5128,6 +5346,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out2 = writer.write_request(&ir2);
@@ -5277,6 +5500,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&req);
@@ -5369,6 +5597,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&req);
@@ -5673,6 +5906,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = writer.write_request(&req);
@@ -7161,6 +7399,11 @@ mod tests {
             stop: vec![],
             tool_choice: tc,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -7277,6 +7520,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = BedrockWriter.write_request(&ir);
@@ -7285,6 +7533,376 @@ mod tests {
                 .and_then(|v| v.as_f64()),
             Some(1.0),
             "an OpenAI-ingress temperature of 1.8 must clamp to 1.0 on the Bedrock writer; got {out}"
+        );
+    }
+
+    // --- H3: cross-protocol cache_control <-> Bedrock cachePoint -------------------------------
+
+    /// Helper: a bare IR request with the given system / messages / tools and an EMPTY `extra`
+    /// (cross-protocol shape — the positional cachePoint stash is absent, so the writer drives
+    /// cachePoint emission from the first-class `cache_control` field, not the stash).
+    fn cache_ctrl_req(
+        system: Vec<crate::ir::IrBlock>,
+        messages: Vec<crate::ir::IrMessage>,
+        tools: Vec<crate::ir::IrTool>,
+    ) -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            system,
+            messages,
+            tools,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn ephemeral() -> Option<crate::ir::CacheControl> {
+        Some(crate::ir::CacheControl {
+            kind: crate::ir::CacheKind::Ephemeral,
+        })
+    }
+
+    /// H3 (write): an IR message Text block carrying `cache_control` must emit a Bedrock `cachePoint`
+    /// block IMMEDIATELY AFTER it (the position Bedrock expects). With an empty `extra` (cross-protocol
+    /// shape) the first-class field is the sole driver — the old writer dropped it entirely.
+    #[test]
+    fn test_cache_control_on_message_block_emits_cache_point() {
+        let req = cache_ctrl_req(
+            vec![],
+            vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "cache me".to_string(),
+                        cache_control: ephemeral(),
+                        citations: vec![],
+                    },
+                    crate::ir::IrBlock::Text {
+                        text: "but not this".to_string(),
+                        cache_control: None,
+                        citations: vec![],
+                    },
+                ],
+            }],
+            vec![],
+        );
+        let out = BedrockWriter.write_request(&req);
+        // The cachePoint sits AFTER the first text block (index 1), before the second text (index 2).
+        assert_eq!(
+            out.pointer("/messages/0/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some("cache me"),
+        );
+        assert_eq!(
+            out.pointer("/messages/0/content/1/cachePoint"),
+            Some(&serde_json::json!({"type": "default"})),
+            "a cache_control block must emit a trailing cachePoint; got {out}"
+        );
+        assert_eq!(
+            out.pointer("/messages/0/content/2/text")
+                .and_then(|v| v.as_str()),
+            Some("but not this"),
+            "the non-cached block must follow, with no extra cachePoint; got {out}"
+        );
+        // Exactly one cachePoint (the second, uncached block emits none).
+        let count = out
+            .pointer("/messages/0/content")
+            .and_then(|c| c.as_array())
+            .map(|a| a.iter().filter(|b| b.get("cachePoint").is_some()).count())
+            .unwrap_or(0);
+        assert_eq!(count, 1, "exactly one cachePoint expected; got {out}");
+    }
+
+    /// H3 (write): a system Text block carrying `cache_control` emits a trailing cachePoint in the
+    /// `system` array (the system prefix is the canonical prompt-cache target).
+    #[test]
+    fn test_cache_control_on_system_block_emits_cache_point() {
+        let req = cache_ctrl_req(
+            vec![crate::ir::IrBlock::Text {
+                text: "long static preamble".to_string(),
+                cache_control: ephemeral(),
+                citations: vec![],
+            }],
+            vec![],
+            vec![],
+        );
+        let out = BedrockWriter.write_request(&req);
+        assert_eq!(
+            out.pointer("/system/0/text").and_then(|v| v.as_str()),
+            Some("long static preamble"),
+        );
+        assert_eq!(
+            out.pointer("/system/1/cachePoint"),
+            Some(&serde_json::json!({"type": "default"})),
+            "a system cache_control block must emit a trailing cachePoint; got {out}"
+        );
+    }
+
+    /// H3 (write): a tool definition carrying `cache_control` emits a `cachePoint` element in the
+    /// `toolConfig.tools` array right after the tool (caching the tool-schema prefix).
+    #[test]
+    fn test_cache_control_on_tool_emits_cache_point() {
+        let req = cache_ctrl_req(
+            vec![],
+            vec![],
+            vec![crate::ir::IrTool {
+                name: "get_weather".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: ephemeral(),
+            }],
+        );
+        let out = BedrockWriter.write_request(&req);
+        assert_eq!(
+            out.pointer("/toolConfig/tools/0/toolSpec/name")
+                .and_then(|v| v.as_str()),
+            Some("get_weather"),
+        );
+        assert_eq!(
+            out.pointer("/toolConfig/tools/1/cachePoint"),
+            Some(&serde_json::json!({"type": "default"})),
+            "a tool cache_control must emit a trailing cachePoint in toolConfig.tools; got {out}"
+        );
+    }
+
+    /// H3 (read): a Bedrock `cachePoint` following a content block must map onto the preceding IR
+    /// block's first-class `cache_control` (so a Bedrock->Anthropic hop, where the positional stash is
+    /// dropped, still preserves the boundary). The adjacency targets the immediately-preceding block.
+    #[test]
+    fn test_cache_point_maps_onto_preceding_block_cache_control() {
+        let reader = BedrockReader;
+        let wire = serde_json::json!({
+            "system": [
+                {"text": "preamble"},
+                {"cachePoint": {"type": "default"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"text": "doc"},
+                    {"cachePoint": {"type": "default"}},
+                    {"text": "tail"}
+                ]}
+            ],
+            "toolConfig": {
+                "tools": [
+                    {"toolSpec": {"name": "t", "inputSchema": {"json": {}}}},
+                    {"cachePoint": {"type": "default"}}
+                ]
+            }
+        });
+        let ir = reader.read_request(&wire).expect("read_request");
+        // System: the first (and only) text block carries cache_control.
+        match &ir.system[0] {
+            crate::ir::IrBlock::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "system block must carry cache_control"
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // Message: the FIRST text ("doc") carries cache_control; the second ("tail") does not.
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Text {
+                text,
+                cache_control,
+                ..
+            } => {
+                assert_eq!(text, "doc");
+                assert!(
+                    cache_control.is_some(),
+                    "preceding block must carry cache_control"
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &ir.messages[0].content[1] {
+            crate::ir::IrBlock::Text {
+                text,
+                cache_control,
+                ..
+            } => {
+                assert_eq!(text, "tail");
+                assert!(
+                    cache_control.is_none(),
+                    "trailing block must NOT carry cache_control"
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // Tool: the preceding tool carries cache_control.
+        assert!(
+            ir.tools[0].cache_control.is_some(),
+            "the tool preceding a tools-array cachePoint must carry cache_control"
+        );
+    }
+
+    /// H3 (round-trip, cross-protocol shape): reading a cachePoint-bearing body into the IR and then
+    /// writing it back with `extra` CLEARED (the cross-protocol seam) re-derives the cachePoint purely
+    /// from the first-class `cache_control` field — the boundary survives even when the positional
+    /// stash is gone.
+    #[test]
+    fn test_cache_control_round_trip_via_field_only() {
+        let reader = BedrockReader;
+        let wire = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"text": "doc"},
+                    {"cachePoint": {"type": "default"}}
+                ]}
+            ]
+        });
+        let mut ir = reader.read_request(&wire).expect("read_request");
+        // Simulate the cross-protocol seam: drop the busbar-internal positional stash so only the
+        // first-class `cache_control` field remains to drive emission.
+        ir.extra.clear();
+        let out = BedrockWriter.write_request(&ir);
+        assert_eq!(
+            out.pointer("/messages/0/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some("doc"),
+        );
+        assert_eq!(
+            out.pointer("/messages/0/content/1/cachePoint"),
+            Some(&serde_json::json!({"type": "default"})),
+            "the cachePoint must be re-derived from cache_control after the stash is cleared; got {out}"
+        );
+    }
+
+    /// H3 (no double-emit): on the SAME-protocol path the positional stash AND the first-class
+    /// `cache_control` field are both populated by the reader, but the writer must emit EXACTLY ONE
+    /// cachePoint (the stash drives placement; the inline field emission is suppressed). Guards against
+    /// a regression that would double-bill the cache boundary.
+    #[test]
+    fn test_same_protocol_cache_point_no_double_emit() {
+        let reader = BedrockReader;
+        let wire = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"text": "doc"},
+                    {"cachePoint": {"type": "default"}},
+                    {"text": "tail"}
+                ]}
+            ]
+        });
+        let ir = reader.read_request(&wire).expect("read_request");
+        let out = BedrockWriter.write_request(&ir);
+        let count = out
+            .pointer("/messages/0/content")
+            .and_then(|c| c.as_array())
+            .map(|a| a.iter().filter(|b| b.get("cachePoint").is_some()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "same-protocol path must emit exactly one cachePoint; got {out}"
+        );
+        assert_eq!(
+            out, wire,
+            "same-protocol body must round-trip byte-identically; got {out}"
+        );
+    }
+
+    // --- L4: degradations are now observable (warn paths) --------------------------------------
+
+    /// L4 (warn path): `tool_choice = None` has no native Converse directive, so it degrades to an
+    /// omitted `toolChoice` and a `tracing::warn!`. The observable degradation (no `toolChoice` key,
+    /// tools still emitted) is asserted here; the warn fires on the same branch.
+    #[test]
+    fn test_tool_choice_none_warns_and_omits() {
+        let req = tool_choice_req(Some(crate::ir::IrToolChoice::None));
+        let out = BedrockWriter.write_request(&req);
+        let tool_config = out.get("toolConfig").expect("toolConfig emitted");
+        assert!(
+            tool_config.get("toolChoice").is_none(),
+            "tool_choice=None must omit toolChoice (warn-and-degrade); got {tool_config:?}"
+        );
+        assert!(
+            tool_config.get("tools").is_some(),
+            "the tools array must still be emitted; got {tool_config:?}"
+        );
+    }
+
+    /// L4 (warn path): a malformed image media_type (an empty subtype) is coerced to `format: "png"`
+    /// and a `tracing::warn!` fires. The observable coercion is asserted here; the warn rides the same
+    /// fallback branch.
+    #[test]
+    fn test_malformed_media_type_warns_and_falls_back_to_png() {
+        // Empty subtype (`image/`) takes the fallback branch that warns.
+        let block = bedrock_image_block("image/", "QQ==").expect("base64 image must emit a block");
+        assert_eq!(
+            block.pointer("/format").and_then(|v| v.as_str()),
+            Some("png"),
+            "an empty subtype must coerce to png (warn-and-degrade); got {block}"
+        );
+        // A bare, unprefixed media_type also takes the warning fallback.
+        let bare =
+            bedrock_image_block("garbage", "QQ==").expect("bare media_type must emit a block");
+        assert_eq!(
+            bare.pointer("/format").and_then(|v| v.as_str()),
+            Some("png"),
+        );
+        // A well-formed subtype does NOT take the fallback (no coercion, no warn).
+        let jpeg = bedrock_image_block("image/jpeg", "QQ==").expect("jpeg must emit a block");
+        assert_eq!(
+            jpeg.pointer("/format").and_then(|v| v.as_str()),
+            Some("jpeg")
+        );
+    }
+
+    /// D3: a cross-protocol IR carrying `response_format` reaching the Bedrock egress must be DROPPED
+    /// (Converse has no native response_format field) — and the wire must contain NO `response_format`
+    /// key (it would 400 the upstream). Mirrors the Anthropic-egress drop. The `warn!` itself is not
+    /// asserted here (tracing capture is out of scope); the contract is "emits nothing".
+    #[test]
+    fn test_write_request_response_format_dropped() {
+        let writer = BedrockWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "s", "schema": {"type": "object"}}
+            })),
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("response_format") && !wire.contains("json_schema"),
+            "response_format must not be emitted on the Bedrock wire; got {wire}"
+        );
+        assert!(
+            out.get("response_format").is_none(),
+            "no top-level response_format key may be present; got {out}"
         );
     }
 }

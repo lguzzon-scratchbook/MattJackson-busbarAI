@@ -315,8 +315,24 @@ impl ProtocolReader for GeminiReader {
                 let mut msg_content = Vec::new();
                 if let Some(parts_arr) = content_val.get("parts").and_then(|p| p.as_array()) {
                     for part in parts_arr {
+                        // Thinking part (H2): a `thought: true` part carries reasoning text + an
+                        // opaque `thoughtSignature`; read it as IrBlock::Thinking (not plain Text) so
+                        // a prior-turn reasoning block in the request survives with its signature.
+                        // Checked first because a thought part also carries a `text` field.
+                        if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                            let text = part
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let signature = part
+                                .get("thoughtSignature")
+                                .and_then(|s| s.as_str())
+                                .map(String::from);
+                            msg_content.push(crate::ir::IrBlock::Thinking { text, signature });
+                        }
                         // Text part
-                        if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
+                        else if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
                             msg_content.push(crate::ir::IrBlock::Text {
                                 text: text_val.to_string(),
                                 cache_control: None,
@@ -410,8 +426,21 @@ impl ProtocolReader for GeminiReader {
                                 .and_then(|u| u.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            // L1: preserve the part's REAL `mimeType` when Gemini supplied one (it is
+                            // optional on `fileData` but commonly present, e.g. `image/png`) instead
+                            // of flattening every `fileData` to the `"image_url"` sentinel. Carrying
+                            // the true MIME type lets cross-protocol egress (and the writer) emit a
+                            // faithful media reference. When `mimeType` is ABSENT — a bare remote URI,
+                            // the OpenAI/Responses-equivalent case — fall back to the `"image_url"`
+                            // sentinel so a URL-only `fileData` still round-trips as before.
+                            let media_type = file_data
+                                .get("mimeType")
+                                .and_then(|m| m.as_str())
+                                .filter(|m| !m.is_empty())
+                                .map(String::from)
+                                .unwrap_or_else(|| "image_url".to_string());
                             msg_content.push(crate::ir::IrBlock::Image {
-                                media_type: "image_url".to_string(),
+                                media_type,
                                 data: uri,
                             });
                         }
@@ -489,6 +518,39 @@ impl ProtocolReader for GeminiReader {
             obj.get("generationConfig")
                 .and_then(|gc| gc.get("stopSequences")),
         );
+        // Promoted sampling controls under `generationConfig` (cross-protocol survival): Gemini
+        // models `frequencyPenalty`/`presencePenalty`/`seed`/`candidateCount` natively. Promote them
+        // into the typed IR fields so they survive the cross-protocol seam (where `extra` — which
+        // still holds the raw `generationConfig` for same-protocol byte-identity — is cleared)
+        // instead of degrading to the target's default. `candidateCount` → `n` (Gemini's name for the
+        // OpenAI `n` / Cohere `num_generations` candidate count). Each is bounds-checked the same way
+        // `topK`/`maxOutputTokens` are: an out-of-range value drops to `None` rather than truncating.
+        let frequency_penalty = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("frequencyPenalty"))
+            .and_then(|v| v.as_f64());
+        let presence_penalty = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("presencePenalty"))
+            .and_then(|v| v.as_f64());
+        let seed = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("seed"))
+            .and_then(|v| v.as_i64());
+        let n = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("candidateCount"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        // response_format (M1): Gemini expresses structured output as
+        // `generationConfig.responseMimeType` (+ optional `responseSchema`). There is no single
+        // native key, so the IR carries a NORMALIZED object `{responseMimeType, responseSchema?}`
+        // preserving each present sub-field verbatim. This is best-effort and INTENTIONALLY lossy in
+        // shape (the cross-protocol writers map it to their own structured-output shape — OpenAI's
+        // `response_format`, etc.); the raw sub-fields ALSO survive same-protocol via the preserved
+        // `generationConfig` in `extra`, so Gemini→Gemini stays byte-identical regardless. `None`
+        // when neither sub-field is present so a plain request gains no spurious response_format.
+        let response_format = read_gemini_response_format(obj.get("generationConfig"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
         // Promote Gemini's native `toolConfig.functionCallingConfig` into the IR `tool_choice` union
         // (PF-H1) so a forced / targeted directive survives the cross-protocol seam instead of
@@ -552,6 +614,11 @@ impl ProtocolReader for GeminiReader {
             stop,
             tool_choice,
             stream,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            n,
+            response_format,
             extra,
         })
     }
@@ -932,8 +999,28 @@ impl ProtocolReader for GeminiReader {
             .and_then(|p| p.as_array())
         {
             for part in parts_arr {
+                // Thinking part (H2) → IrBlock::Thinking. Gemini DOES surface reasoning: a content
+                // part flagged `thought: true` carries the model's chain-of-thought `text` plus an
+                // opaque `thoughtSignature` (the resumable-reasoning token the google-genai SDK
+                // exposes as `Part.thought_signature`). Read it into the IR Thinking block (with its
+                // signature) rather than as plain Text, so reasoning survives the cross-protocol seam
+                // (Anthropic `thinking` / OpenAI reasoning) and the signature round-trips on
+                // same-protocol Gemini→Gemini. Checked BEFORE the plain-text arm because a thought
+                // part also has a `text` field.
+                if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                    let text = part
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = part
+                        .get("thoughtSignature")
+                        .and_then(|s| s.as_str())
+                        .map(String::from);
+                    content.push(crate::ir::IrBlock::Thinking { text, signature });
+                }
                 // Text part → IrBlock::Text
-                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                     if !text.is_empty() {
                         content.push(crate::ir::IrBlock::Text {
                             text: text.to_string(),
@@ -1297,9 +1384,148 @@ fn prompt_block_stop_reason(block_reason: &str) -> String {
     }
 }
 
+/// Read Gemini's structured-output directive out of `generationConfig` into the IR's normalized
+/// `response_format` object (M1). Gemini has no single `response_format` key: structured output is
+/// `generationConfig.responseMimeType` (e.g. `"application/json"`) plus an optional
+/// `responseSchema`. We collect whichever sub-fields are present into a normalized object
+/// `{"responseMimeType": …, "responseSchema": …}` (each verbatim) so the value survives the
+/// cross-protocol seam where `extra` is cleared. Best-effort + lossy in SHAPE by design: the IR keeps
+/// the Gemini-native sub-fields and the writer reproduces them; cross-protocol writers map this
+/// normalized object into their own structured-output shape. Returns `None` when NEITHER sub-field
+/// is present, so a plain request never gains a spurious `response_format`.
+fn read_gemini_response_format(
+    gen_config: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let gc = gen_config?;
+    let mime = gc.get("responseMimeType");
+    let schema = gc.get("responseSchema");
+    if mime.is_none() && schema.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if let Some(m) = mime {
+        obj.insert("responseMimeType".to_string(), m.clone());
+    }
+    if let Some(s) = schema {
+        obj.insert("responseSchema".to_string(), s.clone());
+    }
+    Some(serde_json::Value::Object(obj))
+}
+
+/// Write the IR `response_format` back into a Gemini `generationConfig` map (M1), inverse of
+/// `read_gemini_response_format`. The normalized IR object may carry `responseMimeType` and/or
+/// `responseSchema` (the Gemini-native round-trip shape this writer produced), so when those keys are
+/// present they are copied straight through. As a best-effort accommodation for a CROSS-protocol
+/// `response_format` that arrived in a foreign shape (e.g. OpenAI's
+/// `{"type":"json_object"}` / `{"type":"json_schema","json_schema":{"schema":…}}`), map the foreign
+/// `type` onto `responseMimeType` and lift an embedded JSON-Schema into `responseSchema`. Anything we
+/// cannot interpret is ignored rather than emitted verbatim (an unknown key in `generationConfig`
+/// risks a 400) — the raw value still survives same-protocol via the preserved `generationConfig` in
+/// `extra`. Mutates `gen_config` in place; emits nothing when there is nothing interpretable.
+fn write_gemini_response_format(
+    gen_config: &mut serde_json::Map<String, serde_json::Value>,
+    rf: &serde_json::Value,
+) {
+    let Some(obj) = rf.as_object() else { return };
+    // Native round-trip shape (this writer's own output, or a same-protocol Gemini value).
+    if let Some(mime) = obj.get("responseMimeType") {
+        gen_config.insert("responseMimeType".to_string(), mime.clone());
+    }
+    if let Some(schema) = obj.get("responseSchema") {
+        gen_config.insert("responseSchema".to_string(), sanitize_gemini_schema(schema));
+    }
+    // Best-effort foreign (OpenAI-style) mapping when no native key was present.
+    if !obj.contains_key("responseMimeType") && !obj.contains_key("responseSchema") {
+        match obj.get("type").and_then(|t| t.as_str()) {
+            Some("json_object") => {
+                gen_config.insert(
+                    "responseMimeType".to_string(),
+                    serde_json::json!("application/json"),
+                );
+            }
+            Some("json_schema") => {
+                gen_config.insert(
+                    "responseMimeType".to_string(),
+                    serde_json::json!("application/json"),
+                );
+                // OpenAI nests the schema under `json_schema.schema`.
+                if let Some(schema) = obj
+                    .get("json_schema")
+                    .and_then(|js| js.get("schema"))
+                    .or_else(|| obj.get("schema"))
+                {
+                    gen_config.insert("responseSchema".to_string(), sanitize_gemini_schema(schema));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// JSON-Schema keywords Gemini's `OpenAPI`-subset schema validator REJECTS with a 400 when present in
+/// a `responseSchema` or a tool's `parameters`. Gemini accepts a strict OpenAPI 3.0 `Schema` subset,
+/// NOT full JSON Schema, so draft keywords a foreign protocol (OpenAI/Anthropic) routinely emits on a
+/// tool/structured-output schema hard-fail the request. Stripping them (recursively) lets a
+/// cross-protocol tool/structured-output definition survive instead of 400-ing (L3 / M1). Kept as one
+/// list so both `responseSchema` and tool `parameters` sanitize identically.
+const GEMINI_SCHEMA_REJECTED_KEYS: &[&str] = &[
+    "$schema",
+    "$id",
+    "$ref",
+    "$defs",
+    "definitions",
+    "additionalProperties",
+    "additionalItems",
+    "patternProperties",
+    "unevaluatedProperties",
+    "const",
+    "examples",
+    "$comment",
+];
+
+/// Recursively strip the JSON-Schema keywords Gemini rejects (`GEMINI_SCHEMA_REJECTED_KEYS`) from a
+/// schema value so a cross-protocol tool / `responseSchema` definition does not hard-fail with a 400
+/// (L3). Walks objects and arrays; non-container values are returned unchanged. Returns a cleaned
+/// clone — the source IR value is left intact (only the egress wire copy is sanitized), so the
+/// stripped keys still round-trip same-protocol via the preserved raw object in `extra` where
+/// applicable.
+fn sanitize_gemini_schema(schema: &serde_json::Value) -> serde_json::Value {
+    match schema {
+        serde_json::Value::Object(map) => {
+            let mut cleaned = serde_json::Map::new();
+            for (k, v) in map {
+                if GEMINI_SCHEMA_REJECTED_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
+                cleaned.insert(k.clone(), sanitize_gemini_schema(v));
+            }
+            serde_json::Value::Object(cleaned)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sanitize_gemini_schema).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Heuristic: is this Image `data` a URI REFERENCE (a `fileData.fileUri`) rather than base64
+/// `inlineData`? (L1.) Base64 image payloads never contain a `://` scheme separator and never start
+/// with a `gs:` / `http` scheme, whereas every Gemini `fileData` URI does (`gs://…`,
+/// `https://…`, a Files-API `https://generativelanguage.googleapis.com/…`). Used by the writer to
+/// route a real-MIME-typed image back to `fileData` vs `inlineData`.
+fn is_uri_reference(data: &str) -> bool {
+    data.contains("://")
+}
+
 /// Parse a Gemini `usageMetadata` block into `IrUsage`, defaulting every counter to 0 when the
 /// field (or an individual counter) is absent. Shared by the streaming and prompt-block paths so
 /// usage accounting stays identical regardless of how a response terminates.
+///
+/// H6 cache tokens: Gemini reports context-cache hits as `usageMetadata.cachedContentTokenCount`
+/// (the google-genai SDK's `cached_content_token_count`). Map it into the IR's
+/// `cache_read_input_tokens` — the SAME field Bedrock's `cacheReadInputTokens` and Anthropic's
+/// `cache_read_input_tokens` populate — so cached-prompt accounting survives the cross-protocol seam
+/// instead of being dropped. `None` when absent (no cache hit / older response).
 fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
     let u = data.get("usageMetadata");
     crate::ir::IrUsage {
@@ -1312,7 +1538,9 @@ fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        cache_read_input_tokens: u
+            .and_then(|u| u.get("cachedContentTokenCount"))
+            .and_then(|v| v.as_u64()),
     }
 }
 
@@ -1662,9 +1890,28 @@ impl ProtocolWriter for GeminiWriter {
                         // reference an image by URI is `fileData{fileUri, mimeType}`, so route the
                         // sentinel there (URL natively, not base64). `mimeType` is omitted: it is
                         // unknown for a remote URL and is optional on `fileData`.
-                        if media_type == "image_url" {
+                        if super::is_unresolvable_image_ref(media_type) {
+                            // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is
+                            // an unresolvable cross-vendor reference: emitting it as inlineData/
+                            // fileData would corrupt the part (a file_id is not a URI or base64).
+                            // SKIP it (no lossless cross-vendor projection of an uploaded-file id).
+                            tracing::warn!(
+                                "dropping unresolvable file_id image on Gemini egress: a Responses \
+                                 input_image.file_id has no cross-vendor analog and would corrupt \
+                                 an inlineData/fileData part; the block is NOT emitted"
+                            );
+                        } else if media_type == "image_url" {
                             parts_arr.push(serde_json::json!({
                                 "fileData": { "fileUri": data }
+                            }))
+                        } else if is_uri_reference(data) {
+                            // L1: an Image whose `data` is a URI (not base64) — e.g. a Gemini
+                            // `fileData` part the reader preserved WITH its real `mimeType` — must
+                            // re-emit as `fileData{fileUri, mimeType}`, NOT `inlineData` (which would
+                            // shove the URI into the base64 `data` field). Carry the real `mimeType`
+                            // back so the native fileData reference round-trips faithfully.
+                            parts_arr.push(serde_json::json!({
+                                "fileData": { "fileUri": data, "mimeType": media_type }
                             }))
                         } else {
                             parts_arr.push(serde_json::json!({
@@ -1672,12 +1919,24 @@ impl ProtocolWriter for GeminiWriter {
                             }))
                         }
                     }
-                    _ => {} // Drop unsupported blocks (thinking, etc.)
+                    crate::ir::IrBlock::Thinking { text, signature } => {
+                        // Thinking → Gemini `{text, thought:true, thoughtSignature?}` (H2). Gemini
+                        // DOES carry reasoning parts; round-trip the text and the opaque resumable
+                        // `thoughtSignature` so a prior-turn reasoning block survives both
+                        // same-protocol Gemini→Gemini and cross-protocol ingress instead of being
+                        // dropped. `thoughtSignature` is emitted only when present.
+                        let mut part = serde_json::Map::new();
+                        part.insert("text".to_string(), serde_json::json!(text));
+                        part.insert("thought".to_string(), serde_json::json!(true));
+                        if let Some(sig) = signature {
+                            part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                        }
+                        parts_arr.push(serde_json::Value::Object(part));
+                    }
                 }
             }
 
-            // A turn whose IR blocks were ALL non-representable here (e.g. a thinking-only assistant
-            // turn, whose Thinking block is dropped by the `_ =>` arm above) leaves `parts_arr` empty.
+            // A turn whose IR blocks were ALL non-representable here leaves `parts_arr` empty.
             // SKIPPING the whole contents entry drops the turn and can break Gemini's strict
             // user/model alternation — two same-role turns then land adjacent and the API rejects the
             // request with 400 INVALID_ARGUMENT. Mirror the Bedrock writer (bedrock.rs, empty
@@ -1712,7 +1971,16 @@ impl ProtocolWriter for GeminiWriter {
                     if let Some(desc) = &tool.description {
                         obj.insert("description".to_string(), serde_json::json!(desc));
                     }
-                    obj.insert("parameters".to_string(), tool.input_schema.clone());
+                    // L3: Gemini's tool `parameters` accept only a strict OpenAPI-3.0 Schema subset,
+                    // NOT full JSON Schema. A cross-protocol tool def (OpenAI/Anthropic) routinely
+                    // carries draft keywords (`$schema`, `additionalProperties`, `$ref`, …) that
+                    // Gemini 400-rejects. Strip them recursively so the tool def survives the seam
+                    // instead of hard-failing; same-protocol Gemini schemas (which never carry these)
+                    // are unaffected.
+                    obj.insert(
+                        "parameters".to_string(),
+                        sanitize_gemini_schema(&tool.input_schema),
+                    );
                     serde_json::Value::Object(obj)
                 })
                 .collect();
@@ -1780,6 +2048,34 @@ impl ProtocolWriter for GeminiWriter {
         }
         if !req.stop.is_empty() {
             gen_config.insert("stopSequences".to_string(), serde_json::json!(req.stop));
+        }
+        // Promoted sampling controls in Gemini's native generationConfig shape (cross-protocol
+        // survival, inverse of the reader's promotion). `n` → `candidateCount` (Gemini's name).
+        // Omitted when None so a request that never carried them gains nothing.
+        if let Some(frequency_penalty) = req.frequency_penalty {
+            gen_config.insert(
+                "frequencyPenalty".to_string(),
+                serde_json::json!(frequency_penalty),
+            );
+        }
+        if let Some(presence_penalty) = req.presence_penalty {
+            gen_config.insert(
+                "presencePenalty".to_string(),
+                serde_json::json!(presence_penalty),
+            );
+        }
+        if let Some(seed) = req.seed {
+            gen_config.insert("seed".to_string(), serde_json::json!(seed));
+        }
+        if let Some(n) = req.n {
+            gen_config.insert("candidateCount".to_string(), serde_json::json!(n));
+        }
+        // response_format (M1): map the IR's normalized object back into Gemini's
+        // `responseMimeType` / `responseSchema` (overlaying any raw copy preserved in `extra`). The
+        // schema is sanitized of JSON-Schema keywords Gemini rejects so a cross-protocol structured
+        // output definition does not 400.
+        if let Some(rf) = &req.response_format {
+            write_gemini_response_format(&mut gen_config, rf);
         }
         if !gen_config.is_empty() {
             out.insert(
@@ -2057,10 +2353,42 @@ impl ProtocolWriter for GeminiWriter {
                     None
                 }
 
-                // ThinkingDelta/SignatureDelta → None (Gemini has no thinking, lossy)
-                crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
-                    None
-                }
+                // ThinkingDelta → a streamed Gemini thought part `{text, thought:true}` (D4). Gemini
+                // models reasoning as a `thought:true` content part (see the non-stream
+                // read/write_response handling), and its stream framing carries each incremental
+                // reasoning fragment as exactly such a part in a `candidates[].content.parts[]` chunk —
+                // the same per-chunk shape used for a `TextDelta`, just flagged `thought:true`. So we
+                // emit one chunk per fragment, mirroring the non-stream `{text, thought:true}` shape.
+                // Previously this returned None, silently dropping a cross-protocol reasoning stream.
+                crate::ir::IrDelta::ThinkingDelta(thinking) => Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": thinking, "thought": true}]
+                            }
+                        }]
+                    }),
+                )),
+
+                // SignatureDelta → a streamed thought part carrying the opaque resumable
+                // `thoughtSignature` (D4). Gemini attaches the signature to a `thought:true` part
+                // (non-stream emits `{text, thought:true, thoughtSignature}`); on the stream the
+                // signature arrives as its own IR delta, so emit a minimal thought part bearing the
+                // signature (empty text, `thought:true`) — the closest faithful streamed form, since a
+                // bare signature has no accompanying incremental text. Previously dropped (None).
+                crate::ir::IrDelta::SignatureDelta(sig) => Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "", "thought": true, "thoughtSignature": sig}]
+                            }
+                        }]
+                    }),
+                )),
             },
 
             // BlockStop → FLUSH the open tool block as a single native `{name, args}` part. This is
@@ -2204,8 +2532,19 @@ impl ProtocolWriter for GeminiWriter {
                     }));
                 }
 
-                // Thinking blocks are DROPPED (Gemini has no thinking) - lossy-by-necessity
-                crate::ir::IrBlock::Thinking { .. } => {}
+                // Thinking → Gemini `{text, thought:true, thoughtSignature?}` (H2). Gemini DOES
+                // surface reasoning as a `thought:true` content part with an opaque resumable
+                // `thoughtSignature`; emit it so reasoning + signature round-trip on the response
+                // path instead of being dropped.
+                crate::ir::IrBlock::Thinking { text, signature } => {
+                    let mut part = serde_json::Map::new();
+                    part.insert("text".to_string(), serde_json::json!(text));
+                    part.insert("thought".to_string(), serde_json::json!(true));
+                    if let Some(sig) = signature {
+                        part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                    }
+                    parts_arr.push(serde_json::Value::Object(part));
+                }
 
                 // Image/ToolResult not supported in response output (lossy)
                 crate::ir::IrBlock::Image { .. } | crate::ir::IrBlock::ToolResult { .. } => {}
@@ -3583,6 +3922,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: true,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -3668,10 +4012,12 @@ mod tests {
         assert_eq!(raw.provider_code.as_deref(), Some("auth"));
     }
 
-    /// Regression (R25 MED #2): a thinking-only assistant turn — whose sole IR block is a `Thinking`
-    /// block dropped by the writer — must NOT vanish from `contents`. Dropping it would collapse
-    /// user/model alternation (two user turns adjacent) and 400 the real Gemini API. The writer must
-    /// substitute a minimal placeholder text part so the model turn survives.
+    /// Regression (R25 MED #2, updated for H2): a thinking-only assistant turn must NOT vanish from
+    /// `contents` — dropping it would collapse user/model alternation (two user turns adjacent) and
+    /// 400 the real Gemini API. Post-H2 the Thinking block is now emitted as a native `thought:true`
+    /// part (reasoning is no longer dropped), so the model turn survives by carrying that thought part
+    /// rather than the old empty-text placeholder. The alternation invariant (3 surviving turns) is
+    /// what this guards.
     #[test]
     fn test_write_request_thinking_only_turn_survives_with_placeholder() {
         let writer = GeminiWriter;
@@ -3710,6 +4056,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -3736,12 +4087,18 @@ mod tests {
         assert_eq!(
             parts.len(),
             1,
-            "placeholder turn carries exactly one part: {model_turn}"
+            "thinking-only turn carries exactly one part: {model_turn}"
         );
+        // Post-H2: the Thinking block emits a native thought part (not dropped → not a placeholder).
         assert_eq!(
             parts[0].get("text").and_then(|v| v.as_str()),
-            Some(""),
-            "the placeholder part must be an empty text part: {model_turn}"
+            Some("internal reasoning"),
+            "the thought part must carry the reasoning text: {model_turn}"
+        );
+        assert_eq!(
+            parts[0].get("thought"),
+            Some(&serde_json::json!(true)),
+            "the surviving part must be a thought part: {model_turn}"
         );
     }
 
@@ -3776,6 +4133,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -3827,6 +4189,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -3959,6 +4326,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -4004,6 +4376,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -4733,6 +5110,11 @@ mod tests {
             stop: Vec::new(),
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra,
         };
         let wire = writer.write_request(&ir);
@@ -5150,6 +5532,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -5187,6 +5574,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -5507,6 +5899,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -5555,6 +5952,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -5786,6 +6188,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -5843,6 +6250,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -6050,6 +6462,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let wire = writer.write_request(&req);
@@ -6306,6 +6723,501 @@ mod tests {
         assert_eq!(
             err.provider_code.as_deref(),
             Some("context_length_exceeded")
+        );
+    }
+
+    // ===================================================================================
+    // Integration gaps — sampling / response_format / reasoning / cache / image / schema
+    // (cross-protocol survival). Each test proves a read+write site round-trips a control
+    // that previously degraded to the target default on the cross-protocol seam.
+    // ===================================================================================
+
+    /// Minimal IR request with a single user "hi" turn and all controls defaulted. Tests mutate the
+    /// field(s) under test so the assertion targets exactly one gap.
+    fn base_ir_request() -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    // --- Gap 1: sampling controls via generationConfig ---
+
+    /// OpenAI→Gemini: an IR carrying frequency/presence penalties, seed, and n MUST emit them in
+    /// Gemini's native generationConfig shape (frequencyPenalty/presencePenalty/seed/candidateCount).
+    #[test]
+    fn test_write_request_sampling_controls_emit_generation_config() {
+        let mut req = base_ir_request();
+        req.frequency_penalty = Some(0.5);
+        req.presence_penalty = Some(-0.25);
+        req.seed = Some(42);
+        req.n = Some(3);
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&req)
+        };
+        let gc = wire
+            .get("generationConfig")
+            .expect("generationConfig must be emitted");
+        assert_eq!(gc.get("frequencyPenalty"), Some(&serde_json::json!(0.5)));
+        assert_eq!(gc.get("presencePenalty"), Some(&serde_json::json!(-0.25)));
+        assert_eq!(gc.get("seed"), Some(&serde_json::json!(42)));
+        assert_eq!(
+            gc.get("candidateCount"),
+            Some(&serde_json::json!(3)),
+            "n maps to Gemini candidateCount: {wire}"
+        );
+    }
+
+    /// None sampling controls emit NOTHING (no spurious zero penalties / seed on a plain request).
+    #[test]
+    fn test_write_request_sampling_controls_omitted_when_none() {
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&base_ir_request())
+        };
+        if let Some(gc) = wire.get("generationConfig") {
+            assert!(gc.get("frequencyPenalty").is_none());
+            assert!(gc.get("presencePenalty").is_none());
+            assert!(gc.get("seed").is_none());
+            assert!(gc.get("candidateCount").is_none());
+        }
+    }
+
+    /// Gemini→IR: native generationConfig sampling controls promote into the typed IR fields, and a
+    /// read→write round-trips them (same-protocol fidelity).
+    #[test]
+    fn test_read_request_sampling_controls_promote_and_round_trip() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "frequencyPenalty": 0.7,
+                "presencePenalty": 0.1,
+                "seed": 99,
+                "candidateCount": 2
+            }
+        });
+        let ir = GeminiReader.read_request(&body).expect("read_request");
+        assert_eq!(ir.frequency_penalty, Some(0.7));
+        assert_eq!(ir.presence_penalty, Some(0.1));
+        assert_eq!(ir.seed, Some(99));
+        assert_eq!(ir.n, Some(2), "candidateCount promotes to IR n");
+
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&ir)
+        };
+        let gc = wire.get("generationConfig").expect("generationConfig");
+        assert_eq!(gc.get("frequencyPenalty"), Some(&serde_json::json!(0.7)));
+        assert_eq!(gc.get("presencePenalty"), Some(&serde_json::json!(0.1)));
+        assert_eq!(gc.get("seed"), Some(&serde_json::json!(99)));
+        assert_eq!(gc.get("candidateCount"), Some(&serde_json::json!(2)));
+    }
+
+    // --- Gap 2 (M1): response_format ↔ responseSchema/responseMimeType ---
+
+    /// Gemini→IR→Gemini: native responseMimeType + responseSchema read into the normalized IR
+    /// response_format object and round-trip back into generationConfig.
+    #[test]
+    fn test_response_format_round_trips_native_gemini() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {"type": "object", "properties": {"x": {"type": "string"}}}
+            }
+        });
+        let ir = GeminiReader.read_request(&body).expect("read_request");
+        let rf = ir
+            .response_format
+            .as_ref()
+            .expect("response_format must be populated");
+        assert_eq!(
+            rf.get("responseMimeType"),
+            Some(&serde_json::json!("application/json"))
+        );
+        assert!(rf.get("responseSchema").is_some());
+
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&ir)
+        };
+        let gc = wire.get("generationConfig").expect("generationConfig");
+        assert_eq!(
+            gc.get("responseMimeType"),
+            Some(&serde_json::json!("application/json"))
+        );
+        assert_eq!(
+            gc.pointer("/responseSchema/properties/x/type"),
+            Some(&serde_json::json!("string")),
+            "responseSchema must round-trip: {wire}"
+        );
+    }
+
+    /// OpenAI-shaped response_format (`{type:"json_schema", json_schema:{schema:…}}`) maps
+    /// best-effort onto Gemini responseMimeType + responseSchema (cross-protocol survival).
+    #[test]
+    fn test_response_format_maps_openai_json_schema_to_gemini() {
+        let mut req = base_ir_request();
+        req.response_format = Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {"type": "object", "$schema": "http://json-schema.org/draft-07/schema#"}}
+        }));
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&req)
+        };
+        let gc = wire.get("generationConfig").expect("generationConfig");
+        assert_eq!(
+            gc.get("responseMimeType"),
+            Some(&serde_json::json!("application/json")),
+            "json_schema type maps to application/json: {wire}"
+        );
+        assert_eq!(
+            gc.pointer("/responseSchema/type"),
+            Some(&serde_json::json!("object"))
+        );
+        assert!(
+            gc.pointer("/responseSchema/$schema").is_none(),
+            "rejected JSON-Schema keyword $schema must be stripped from responseSchema: {wire}"
+        );
+    }
+
+    // --- Gap 3 (H2): reasoning thought parts ↔ IrBlock::Thinking ---
+
+    /// A Gemini response `thought:true` part with a `thoughtSignature` reads into IrBlock::Thinking
+    /// (text + signature), and write_response re-emits it as a `{text, thought:true,
+    /// thoughtSignature}` part — full round-trip with the signature preserved.
+    #[test]
+    fn test_thought_part_round_trips_through_ir_thinking() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"text": "let me reason", "thought": true, "thoughtSignature": "sig-abc"},
+                    {"text": "the answer"}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        });
+        let resp = GeminiReader.read_response(&body).expect("read_response");
+        // First block is Thinking with text + signature; second is plain Text.
+        match &resp.content[0] {
+            crate::ir::IrBlock::Thinking { text, signature } => {
+                assert_eq!(text, "let me reason");
+                assert_eq!(signature.as_deref(), Some("sig-abc"));
+            }
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
+        assert!(matches!(
+            &resp.content[1],
+            crate::ir::IrBlock::Text { text, .. } if text == "the answer"
+        ));
+
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_response(&resp)
+        };
+        let part0 = wire
+            .pointer("/candidates/0/content/parts/0")
+            .expect("first part");
+        assert_eq!(part0.get("text"), Some(&serde_json::json!("let me reason")));
+        assert_eq!(part0.get("thought"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            part0.get("thoughtSignature"),
+            Some(&serde_json::json!("sig-abc")),
+            "thoughtSignature must round-trip: {wire}"
+        );
+    }
+
+    /// A Thinking block in a REQUEST assistant turn round-trips through write_request as a thought
+    /// part with its signature (cross-protocol reasoning survives into a Gemini request).
+    #[test]
+    fn test_thinking_block_round_trips_in_write_request() {
+        let mut req = base_ir_request();
+        req.messages.push(crate::ir::IrMessage {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Thinking {
+                text: "thinking...".to_string(),
+                signature: Some("sig-1".to_string()),
+            }],
+        });
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&req)
+        };
+        // Assistant turn is the 2nd contents entry (role "model").
+        let parts = wire
+            .pointer("/contents/1/parts")
+            .and_then(|p| p.as_array())
+            .expect("model parts");
+        let thought = &parts[0];
+        assert_eq!(thought.get("text"), Some(&serde_json::json!("thinking...")));
+        assert_eq!(thought.get("thought"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            thought.get("thoughtSignature"),
+            Some(&serde_json::json!("sig-1")),
+            "request-side thought signature must round-trip: {wire}"
+        );
+    }
+
+    // --- Gap 4 (H6): cachedContentTokenCount → cache_read_input_tokens ---
+
+    /// Gemini usageMetadata.cachedContentTokenCount maps into the IR cache_read_input_tokens field
+    /// (the same field Bedrock/Anthropic cache-read map to), surviving the cross-protocol seam.
+    #[test]
+    fn test_cached_content_token_count_reads_into_cache_read() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 5,
+                "cachedContentTokenCount": 80
+            }
+        });
+        let resp = GeminiReader.read_response(&body).expect("read_response");
+        assert_eq!(
+            resp.usage.cache_read_input_tokens,
+            Some(80),
+            "cachedContentTokenCount must map to cache_read_input_tokens"
+        );
+        // Absent cache count stays None.
+        let body_no_cache = serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        });
+        let resp2 = GeminiReader
+            .read_response(&body_no_cache)
+            .expect("read_response");
+        assert_eq!(resp2.usage.cache_read_input_tokens, None);
+    }
+
+    // --- Gap 5 (L1): fileData real mimeType preserved ---
+
+    /// A Gemini fileData part WITH a real mimeType reads into the IR Image with that mimeType (not
+    /// the image_url sentinel), and write_request re-emits fileData{fileUri, mimeType}.
+    #[test]
+    fn test_file_data_real_mime_type_preserved_and_round_trips() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [
+                {"fileData": {"fileUri": "gs://bucket/img.png", "mimeType": "image/png"}}
+            ]}]
+        });
+        let ir = GeminiReader.read_request(&body).expect("read_request");
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png", "real mimeType must be preserved");
+                assert_eq!(data, "gs://bucket/img.png");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&ir)
+        };
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/fileData/fileUri"),
+            Some(&serde_json::json!("gs://bucket/img.png")),
+            "fileUri must round-trip: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/fileData/mimeType"),
+            Some(&serde_json::json!("image/png")),
+            "real mimeType must round-trip as fileData.mimeType (not inlineData): {wire}"
+        );
+    }
+
+    /// Regression guard: a fileData WITHOUT a mimeType (bare remote URI) still falls back to the
+    /// image_url sentinel and re-emits as fileData{fileUri} (no spurious mimeType).
+    #[test]
+    fn test_file_data_without_mime_type_uses_sentinel() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"fileData": {"fileUri": "https://x/i.jpg"}}]}]
+        });
+        let ir = GeminiReader.read_request(&body).expect("read_request");
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image_url");
+                assert_eq!(data, "https://x/i.jpg");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&ir)
+        };
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/fileData/fileUri"),
+            Some(&serde_json::json!("https://x/i.jpg"))
+        );
+        assert!(
+            wire.pointer("/contents/0/parts/0/fileData/mimeType")
+                .is_none(),
+            "sentinel image must not gain a bogus mimeType: {wire}"
+        );
+    }
+
+    // --- Gap 6 (L3): tool input_schema strips Gemini-rejected JSON-Schema keywords ---
+
+    /// A cross-protocol tool def carrying JSON-Schema keywords Gemini 400-rejects ($schema,
+    /// additionalProperties, $ref, …) must be stripped on write so the tool def survives instead of
+    /// hard-failing — recursively, including nested object/array schemas.
+    #[test]
+    fn test_write_request_strips_rejected_schema_keywords() {
+        let mut req = base_ir_request();
+        req.tools.push(crate::ir::IrTool {
+            name: "get_weather".to_string(),
+            description: Some("w".to_string()),
+            input_schema: serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "loc": {"type": "string"},
+                    "nested": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {"$ref": {"type": "string"}}
+                    }
+                },
+                "required": ["loc"]
+            }),
+            cache_control: None,
+        });
+        let wire = {
+            let __w = GeminiWriter;
+            __w.write_request(&req)
+        };
+        let params = wire
+            .pointer("/tools/0/functionDeclarations/0/parameters")
+            .expect("parameters");
+        assert!(
+            params.get("$schema").is_none(),
+            "$schema must be stripped: {wire}"
+        );
+        assert!(
+            params.get("additionalProperties").is_none(),
+            "top-level additionalProperties must be stripped: {wire}"
+        );
+        // Survivors preserved.
+        assert_eq!(params.get("type"), Some(&serde_json::json!("object")));
+        assert_eq!(params.get("required"), Some(&serde_json::json!(["loc"])));
+        assert_eq!(
+            params.pointer("/properties/loc/type"),
+            Some(&serde_json::json!("string"))
+        );
+        // Recursion: nested additionalProperties stripped, nested properties kept.
+        assert!(
+            params
+                .pointer("/properties/nested/additionalProperties")
+                .is_none(),
+            "nested additionalProperties must be stripped recursively: {wire}"
+        );
+        assert_eq!(
+            params.pointer("/properties/nested/type"),
+            Some(&serde_json::json!("object"))
+        );
+    }
+
+    /// `sanitize_gemini_schema` leaves a clean Gemini-native schema untouched and walks arrays.
+    #[test]
+    fn test_sanitize_gemini_schema_preserves_clean_and_walks_arrays() {
+        let clean = serde_json::json!({
+            "type": "object",
+            "anyOf": [{"type": "string"}, {"type": "number", "$comment": "drop me"}]
+        });
+        let out = sanitize_gemini_schema(&clean);
+        assert_eq!(out.get("type"), Some(&serde_json::json!("object")));
+        assert_eq!(
+            out.pointer("/anyOf/0/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert!(
+            out.pointer("/anyOf/1/$comment").is_none(),
+            "rejected keyword in an array element must be stripped: {out}"
+        );
+        assert_eq!(
+            out.pointer("/anyOf/1/type"),
+            Some(&serde_json::json!("number"))
+        );
+    }
+
+    /// D4: the Gemini stream WRITE path must emit a streamed reasoning part for a `ThinkingDelta`
+    /// (`{text, thought:true}`) and carry the signature for a `SignatureDelta`
+    /// (`{thought:true, thoughtSignature}`), mirroring the non-stream `write_response` thinking shape.
+    /// Previously both returned None, silently dropping a cross-protocol reasoning stream.
+    #[test]
+    fn test_stream_thinking_and_signature_deltas_emit_thought_parts() {
+        let writer = GeminiWriter;
+
+        // ThinkingDelta → a `thought:true` text part on a candidates chunk.
+        let think = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::ThinkingDelta("let me reason".to_string()),
+            })
+            .expect("a ThinkingDelta must emit a streamed thought chunk, not None");
+        let think_part = think
+            .1
+            .pointer("/candidates/0/content/parts/0")
+            .expect("thought chunk must carry a part");
+        assert_eq!(
+            think_part.pointer("/text").and_then(|t| t.as_str()),
+            Some("let me reason"),
+            "streamed thought part must carry the reasoning text: {think_part}"
+        );
+        assert_eq!(
+            think_part.pointer("/thought"),
+            Some(&serde_json::json!(true)),
+            "streamed thought part must be flagged thought:true: {think_part}"
+        );
+
+        // SignatureDelta → a `thought:true` part bearing the opaque `thoughtSignature`.
+        let sig = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::SignatureDelta("sig-xyz".to_string()),
+            })
+            .expect("a SignatureDelta must emit a streamed thought chunk, not None");
+        let sig_part = sig
+            .1
+            .pointer("/candidates/0/content/parts/0")
+            .expect("signature chunk must carry a part");
+        assert_eq!(
+            sig_part
+                .pointer("/thoughtSignature")
+                .and_then(|s| s.as_str()),
+            Some("sig-xyz"),
+            "streamed signature part must carry the thoughtSignature: {sig_part}"
+        );
+        assert_eq!(
+            sig_part.pointer("/thought"),
+            Some(&serde_json::json!(true)),
+            "streamed signature part must be flagged thought:true: {sig_part}"
         );
     }
 }

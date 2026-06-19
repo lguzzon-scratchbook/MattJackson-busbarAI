@@ -391,27 +391,11 @@ pub(crate) fn translate_request_cross_protocol(
                 // no individual writer can leak them and the fix cannot be missed on any one path.
                 // Same-protocol passthrough never enters this branch, so its `extra` stays intact.
                 //
-                // PF-M4 (response_format fidelity): OpenAI's `response_format` (json_object /
-                // json_schema / structured-output) rides `extra` and is therefore CLEARED here on a
-                // cross-protocol hop — silently disabling JSON/structured-output mode on the foreign
-                // backend even though Gemini (`responseSchema`/`responseMimeType`), Anthropic
-                // (tool-use forcing), and Bedrock have analogs. A full cross-protocol mapping of every
-                // structured-output dialect is large and risky, so it is DEFERRED; the minimal-safe
-                // fix is to NOT drop it SILENTLY — warn so an operator can see the divergence. The
-                // value is still preserved on a same-protocol (OpenAI->OpenAI) round-trip, which never
-                // enters this branch. (See the OpenAI reader for the same note.)
-                if ir.extra.contains_key("response_format") {
-                    tracing::warn!(
-                        from = ingress_protocol,
-                        to = egress_name,
-                        parameter = "response_format",
-                        "dropping `response_format` on cross-protocol translation: the target \
-                         protocol has a structured-output analog (Gemini responseSchema, Anthropic \
-                         tool-use forcing, Bedrock) that busbar does not yet map, so JSON/structured \
-                         output mode is NOT carried to the backend — same-protocol round-trips are \
-                         unaffected"
-                    );
-                }
+                // `response_format` is now a FIRST-CLASS IR field (not an `extra` key), so it survives
+                // this `extra.clear()` and is mapped per-protocol by each egress writer: OpenAI/Cohere
+                // emit it natively, Gemini → `responseSchema`/`responseMimeType`, Responses → `text.format`,
+                // and Anthropic/Bedrock (which lack a native analog) emit a non-silent `warn!` and drop
+                // it in their own writer. So no seam-level handling is needed here anymore.
                 ir.extra.clear();
                 body = app.lanes[i].protocol.writer().write_request(&ir);
             }
@@ -4870,14 +4854,15 @@ mod cross_protocol_extra_tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 16,
             "logprobs": true,
-            "top_logprobs": 5,
-            "n": 3
+            "top_logprobs": 5
         });
         let openai = Protocol::openai();
         let mut ir = openai.reader().read_request(&body).expect("read");
-        // Sanity: the reader DID sweep the source-only keys into extra.
+        // Sanity: the reader DID sweep the source-only keys into extra. (`n` is now a first-class IR
+        // field, not an extra key, so it is no longer covered by this extra-stripping test — its
+        // cross-protocol behavior is covered by the per-protocol sampling tests.)
         assert!(ir.extra.contains_key("logprobs"));
-        assert!(ir.extra.contains_key("n"));
+        assert!(ir.extra.contains_key("top_logprobs"));
 
         // The cross-protocol seam clears extra before handing to the foreign writer.
         ir.extra.clear();
@@ -4889,7 +4874,6 @@ mod cross_protocol_extra_tests {
             "OpenAI logprobs must not leak onto an Anthropic backend body"
         );
         assert!(!obj.contains_key("top_logprobs"));
-        assert!(!obj.contains_key("n"));
         // The modeled fields still translate across.
         assert!(obj.contains_key("messages"));
     }

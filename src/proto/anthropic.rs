@@ -424,6 +424,11 @@ impl ProtocolReader for AnthropicReader {
             stop,
             tool_choice,
             stream,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra,
         })
     }
@@ -1183,6 +1188,7 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
     // (e.g. reasoning translated from a provider that emits no signature), so drop those blocks here
     // rather than forward an egress that the upstream will 400. Other block types pass through.
     let mut dropped_unsigned_thinking = 0usize;
+    let mut dropped_file_id_image = 0usize;
     let blocks: Vec<&crate::ir::IrBlock> = msg
         .content
         .iter()
@@ -1193,6 +1199,17 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
             {
                 dropped_unsigned_thinking += 1;
                 false
+            } else if let crate::ir::IrBlock::Image { media_type, .. } = block {
+                // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is an
+                // unresolvable cross-vendor reference. Emitting it here would write an Anthropic
+                // base64 source with `media_type:"file_id"` — a corrupt block Anthropic rejects.
+                // SKIP it (no lossless cross-vendor projection of an uploaded-file id).
+                if super::is_unresolvable_image_ref(media_type) {
+                    dropped_file_id_image += 1;
+                    false
+                } else {
+                    true
+                }
             } else {
                 true
             }
@@ -1203,6 +1220,14 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
             dropped = dropped_unsigned_thinking,
             "dropped assistant thinking block(s) with no signature from anthropic request egress \
              (anthropic rejects unsigned thinking blocks with a 400)"
+        );
+    }
+    if dropped_file_id_image > 0 {
+        tracing::warn!(
+            dropped = dropped_file_id_image,
+            "dropping unresolvable file_id image(s) on Anthropic egress: a Responses \
+             input_image.file_id has no cross-vendor analog and would corrupt a base64 source; \
+             the block(s) are NOT emitted"
         );
     }
     // When no blocks survive (e.g. an all-thinking assistant message whose unsigned thinking blocks
@@ -1569,6 +1594,23 @@ impl ProtocolWriter for AnthropicWriter {
             out.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
         }
         out.insert("stream".to_string(), serde_json::json!(req.stream));
+        // response_format (M1): Anthropic's Messages API has NO native `response_format` field. The
+        // idiomatic Anthropic mapping is tool-forcing (a synthetic tool + `tool_choice:{type:"tool"}`),
+        // which is non-trivial and deliberately NOT implemented in this pass. The reader never sets
+        // `response_format` on the same-protocol (Anthropic→Anthropic) path — same-protocol relays the
+        // raw upstream body and never reaches this writer — so this only fires for a CROSS-PROTOCOL IR
+        // (e.g. an OpenAI/Responses request carrying `response_format`) reaching the Anthropic egress.
+        // Dropping it silently would be exactly the lossy mutation busbar exists to avoid; emit a
+        // `warn!` so the divergence is observable in logs rather than invisible. (The block is dropped,
+        // not forwarded: emitting an unknown `response_format` key would 400 the upstream.)
+        if req.response_format.is_some() {
+            tracing::warn!(
+                parameter = "response_format",
+                "dropping response_format on Anthropic egress: the Messages API has no native \
+                 response_format field and tool-forcing is not implemented in this pass; the \
+                 structured-output directive from a cross-protocol request is NOT forwarded"
+            );
+        }
         for (key, value) in &req.extra {
             out.insert(key.clone(), value.clone());
         }
@@ -4126,6 +4168,11 @@ mod anthropic_hardening_tests {
             stop: Vec::new(),
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let out = AnthropicWriter.write_request(&req);
@@ -4544,6 +4591,313 @@ mod anthropic_hardening_tests {
         assert_eq!(
             data2["delta"]["stop_reason"],
             serde_json::json!("max_tokens")
+        );
+    }
+
+    // ---- Phase 0 fidelity items (Anthropic egress): sampling-param OMIT, response_format-drop
+    // warn, and native thinking-block round-trip with signature. ----
+
+    /// Minimal WARN-capturing tracing layer, kept local to this test module (mirrors the helper in
+    /// auth.rs / config_validate.rs). Records each WARN event's `message` field so a test can assert
+    /// a particular `tracing::warn!` fired without a global subscriber.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Vis(String);
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut vis = Vis(String::new());
+            event.record(&mut vis);
+            if let Ok(mut msgs) = self.0.lock() {
+                msgs.push(vis.0);
+            }
+        }
+    }
+
+    /// SAMPLING (Phase 0): Anthropic's Messages API does NOT support `frequency_penalty`,
+    /// `presence_penalty`, `seed`, or `n`. A cross-protocol IR carrying every one of them (e.g. read
+    /// from an OpenAI request) must produce an egress that emits NONE of those keys — the writer never
+    /// references these fields, so they are dropped (the correct lossy-by-target behavior; emitting an
+    /// unknown key would 400 the upstream). Pins that nothing silently mis-maps them onto the wire.
+    #[test]
+    fn write_request_omits_unsupported_sampling_params() {
+        let req = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            max_tokens: Some(16),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.25),
+            seed: Some(42),
+            n: Some(3),
+            ..Default::default()
+        };
+        let out = AnthropicWriter.write_request(&req);
+        let obj = out.as_object().expect("write_request emits an object");
+        for key in ["frequency_penalty", "presence_penalty", "seed", "n"] {
+            assert!(
+                !obj.contains_key(key),
+                "Anthropic egress must NOT emit `{key}` (Messages API has no such field); got {out}"
+            );
+        }
+        // Sanity: the modeled fields it DOES support are still present, so the omission is targeted.
+        assert_eq!(obj.get("max_tokens"), Some(&serde_json::json!(16)));
+        assert!(obj.contains_key("messages"));
+    }
+
+    /// response_format (M1): a cross-protocol IR carrying `response_format` reaching the Anthropic
+    /// writer must NOT silently lose it — Anthropic has no native `response_format` and tool-forcing
+    /// is not implemented this pass, so the writer DROPS the directive but emits a `warn!` naming
+    /// response_format so the divergence is observable. Asserts (a) the warn fires and (b) no
+    /// `response_format` key leaks onto the egress (which would 400 the upstream).
+    #[test]
+    fn write_request_warns_and_drops_response_format_on_cross_protocol_egress() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let req = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "extract".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            max_tokens: Some(16),
+            response_format: Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "out", "schema": {"type": "object"}}
+            })),
+            ..Default::default()
+        };
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let out =
+            tracing::subscriber::with_default(subscriber, || AnthropicWriter.write_request(&req));
+
+        assert!(
+            !out.as_object().unwrap().contains_key("response_format"),
+            "Anthropic egress must NOT emit `response_format` (no native field); got {out}"
+        );
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("response_format")),
+            "a response_format-drop warning must fire on cross-protocol Anthropic egress; got {msgs:?}"
+        );
+    }
+
+    /// Counter-case: a request WITHOUT `response_format` must NOT emit the drop warning — the warn is
+    /// gated on the directive's presence, so a request that never carried one is silent.
+    #[test]
+    fn write_request_no_response_format_warning_when_absent() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let req = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            max_tokens: Some(16),
+            ..Default::default()
+        };
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let _ =
+            tracing::subscriber::with_default(subscriber, || AnthropicWriter.write_request(&req));
+
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.contains("response_format")),
+            "no response_format warning must fire when the directive is absent; got {msgs:?}"
+        );
+    }
+
+    /// THINKING (native Anthropic path): an extended-thinking content block with a `signature` must
+    /// round-trip through the Anthropic reader/writer LOSSLESSLY — `read_block` maps a native
+    /// `{type:"thinking", thinking, signature}` to `IrBlock::Thinking{text, signature}`, and
+    /// `write_block` re-emits exactly that native shape (with the signature preserved). This pins the
+    /// native path to the same fidelity already verified on the Bedrock reasoningContent↔Thinking
+    /// path. A read→write→read cycle must preserve both the text and the (mandatory-on-request)
+    /// signature.
+    #[test]
+    fn thinking_block_roundtrips_with_signature() {
+        let native = serde_json::json!({
+            "type": "thinking",
+            "thinking": "let me reason about this",
+            "signature": "EqoBCkgIARAB...sig-bytes"
+        });
+        // Read → IR.
+        let block = read_block(&native).expect("thinking block reads");
+        match &block {
+            crate::ir::IrBlock::Thinking { text, signature } => {
+                assert_eq!(text, "let me reason about this");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("EqoBCkgIARAB...sig-bytes"),
+                    "the extended-thinking signature must survive into the IR"
+                );
+            }
+            other => panic!("expected IrBlock::Thinking, got {other:?}"),
+        }
+        // IR → wire: native shape with the signature preserved.
+        let out = write_block(&block);
+        assert_eq!(out.get("type").and_then(|t| t.as_str()), Some("thinking"));
+        assert_eq!(
+            out.get("thinking").and_then(|t| t.as_str()),
+            Some("let me reason about this")
+        );
+        assert_eq!(
+            out.get("signature").and_then(|s| s.as_str()),
+            Some("EqoBCkgIARAB...sig-bytes"),
+            "write_block must re-emit the thinking signature, not drop it"
+        );
+        // Full round-trip: re-reading the written block yields the identical IR block.
+        let reread = read_block(&out).expect("written thinking block re-reads");
+        assert_eq!(reread, block, "thinking block must round-trip losslessly");
+    }
+
+    /// THINKING (response egress, signed): a Thinking block carried in an IR RESPONSE surfaces on the
+    /// Anthropic response egress with its signature intact — `write_response` routes content blocks
+    /// through `write_block`, which preserves the signature (the request-path `write_message` filter
+    /// that drops UNSIGNED thinking blocks does NOT apply here, so a signed reasoning block reaches the
+    /// client). Guards that native reasoning is not lost on the response writer.
+    #[test]
+    fn thinking_block_with_signature_survives_response_egress() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Thinking {
+                    text: "step-by-step".to_string(),
+                    signature: Some("sig-abc".to_string()),
+                },
+                crate::ir::IrBlock::Text {
+                    text: "answer".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("claude-opus-4-8".to_string()),
+            id: Some("msg_01abc".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        let content = out
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("response carries a content array");
+        let thinking = content
+            .iter()
+            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+            .expect("a thinking block must be present on the response egress");
+        assert_eq!(
+            thinking.get("thinking").and_then(|t| t.as_str()),
+            Some("step-by-step")
+        );
+        assert_eq!(
+            thinking.get("signature").and_then(|s| s.as_str()),
+            Some("sig-abc"),
+            "the signed thinking block must reach the client with its signature on response egress"
+        );
+    }
+
+    /// D2: a Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) reaching the Anthropic
+    /// egress is an unresolvable cross-vendor reference. It must be SKIPPED — NOT emitted as a corrupt
+    /// base64 `source` with `media_type:"file_id"` (which Anthropic rejects). The user message's
+    /// content must carry no image block; the text block still survives.
+    #[test]
+    fn test_write_request_file_id_image_dropped_not_corrupted() {
+        let writer = AnthropicWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "describe this".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Image {
+                        media_type: crate::proto::FILE_ID_IMAGE_SENTINEL.to_string(),
+                        data: "file-abc123".to_string(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: Some(64),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("file-abc123") && !wire.contains("file_id"),
+            "a file_id image must not leak onto the Anthropic wire (no corrupt base64 source); \
+             got {wire}"
+        );
+        let content = out
+            .pointer("/messages/0/content")
+            .and_then(|c| c.as_array())
+            .expect("user message content array");
+        assert!(
+            content
+                .iter()
+                .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("image")),
+            "no image block may be emitted for a file_id image; got {out}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")),
+            "the text block must still survive; got {out}"
         );
     }
 }

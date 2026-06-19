@@ -118,6 +118,26 @@ pub(crate) fn image_url_from_ir(media_type: &str, data: &str) -> String {
     }
 }
 
+/// Sentinel `media_type` marking an IR `Image` block that carries a Responses `input_image.file_id`
+/// reference (an uploaded-file id), NOT inline bytes. The Responses reader stores it as
+/// `Image { media_type: FILE_ID_IMAGE_SENTINEL, data: <file_id> }`; the Responses writer decodes it
+/// back to the native `{type:"input_image","file_id":<id>}` form. Shared from here so EVERY writer
+/// can recognize it: a file_id is an OpenAI-Responses-scoped, unresolvable cross-vendor reference, so
+/// any OTHER protocol's image-emission path must SKIP it (see [`is_unresolvable_image_ref`]) rather
+/// than treat `"file_id"` as a real MIME type and emit a corrupt block (e.g. a `data:file_id;base64,`
+/// URI, or an Anthropic base64 source with `media_type:"file_id"`).
+pub(crate) const FILE_ID_IMAGE_SENTINEL: &str = "file_id";
+
+/// True when an IR `Image` block's `media_type` is a vendor-scoped reference that CANNOT be resolved
+/// or faithfully re-encoded by a DIFFERENT protocol's writer — currently the Responses `file_id`
+/// sentinel. A non-Responses writer that sees one must skip the image with a `tracing::warn!` instead
+/// of emitting a corrupt inline/base64 block, because there is no lossless cross-vendor projection of
+/// an uploaded-file id. (The Responses writer, same-protocol, re-emits the native `file_id` form and
+/// does NOT route through here.)
+pub(crate) fn is_unresolvable_image_ref(media_type: &str) -> bool {
+    media_type == FILE_ID_IMAGE_SENTINEL
+}
+
 /// Scan an already-lowercased error text for OpenAI-family context-length-overflow prose. Holds the
 /// four phrases shared verbatim by `OpenAiReader::extract_error` and `ResponsesReader::extract_error`
 /// (the message scan was duplicated). The scan must be PRECISE: a naive OR of weak tokens
@@ -866,6 +886,11 @@ pub(crate) trait ProtocolWriter: Send + Sync {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let mut body = self.write_request(&ir);

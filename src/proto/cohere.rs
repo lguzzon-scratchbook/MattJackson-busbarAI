@@ -99,6 +99,26 @@ fn read_cohere_tool_choice(val: Option<&serde_json::Value>) -> Option<crate::ir:
     }
 }
 
+/// Clamp a temperature to Cohere v2's native `[0.0, 1.0]` range, returning `(clamped, was_clamped)`
+/// where `was_clamped` is `true` iff the clamp ACTUALLY changed the value (PF-M1 clamp + non-silent
+/// signal, mirroring `anthropic::clamp_temperature_for_anthropic` /
+/// `bedrock::clamp_temperature_for_bedrock`). OpenAI / Responses accept temperature up to 2.0, so a
+/// cross-protocol request can carry a value Cohere's API rejects with a hard 400 ValidationException;
+/// the writer forwards the closest valid value instead of bouncing a 400, and uses `was_clamped` to
+/// emit a `warn!` so the mutation is NOT silent (previously the Cohere writer clamped SILENTLY).
+/// Factored out so the non-silent-on-change contract is unit-testable without a tracing subscriber.
+fn clamp_temperature_for_cohere(temperature: f64) -> (f64, bool) {
+    // Guard against non-finite input (NaN/±Inf): `f64::clamp` panics on a NaN bound but not a NaN
+    // value, yet a NaN/Inf temperature is not a "real value clamped from range" — return it unchanged
+    // with was_clamped=false so the helper is total. This is confirmed unreachable via valid JSON
+    // (the parser rejects NaN/Inf), so it is a defensive no-op, not a behavior change.
+    if !temperature.is_finite() {
+        return (temperature, false);
+    }
+    let clamped = temperature.clamp(0.0, 1.0);
+    (clamped, clamped != temperature)
+}
+
 fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
     static MODELED_KEYS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
     MODELED_KEYS.get_or_init(|| {
@@ -113,6 +133,13 @@ fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
             "k",
             "stop_sequences",
             "stream",
+            // Phase 0 sampling/output controls now modeled into the IR (so they translate the
+            // cross-protocol seam) — must be excluded from `extra` or a same-protocol passthrough
+            // would double-emit them (once from the modeled writer path, once echoed via extra).
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "response_format",
         ]
         .into_iter()
         .collect()
@@ -496,18 +523,45 @@ impl ProtocolReader for CohereReader {
                         } else if let Some(arr) = content_val.as_array() {
                             for block_val in arr {
                                 if let Some(block_obj) = block_val.as_object() {
-                                    if block_obj.get("type").and_then(|t| t.as_str())
-                                        == Some("text")
-                                    {
-                                        if let Some(text) =
-                                            block_obj.get("text").and_then(|t| t.as_str())
-                                        {
-                                            msg_content.push(crate::ir::IrBlock::Text {
-                                                text: text.to_string(),
-                                                cache_control: None,
-                                                citations: Vec::new(),
-                                            });
+                                    match block_obj.get("type").and_then(|t| t.as_str()) {
+                                        Some("text") => {
+                                            if let Some(text) =
+                                                block_obj.get("text").and_then(|t| t.as_str())
+                                            {
+                                                msg_content.push(crate::ir::IrBlock::Text {
+                                                    text: text.to_string(),
+                                                    cache_control: None,
+                                                    citations: Vec::new(),
+                                                });
+                                            }
                                         }
+                                        // Cohere v2 multimodal input: an image content part is
+                                        // `{"type":"image_url","image_url":{"url":"<data-uri|https>"}}`
+                                        // — the SAME shape OpenAI v1 chat uses (Cohere adopted the
+                                        // OpenAI-compatible part for its vision models). Decode it into
+                                        // `IrBlock::Image` via the shared `parse_image_url` seam, which
+                                        // splits a `data:<mime>;base64,<payload>` URI into
+                                        // (media_type, data) and otherwise preserves the raw URL under
+                                        // the "image_url" sentinel — the SAME (media_type, data) IR
+                                        // contract the Anthropic/OpenAI readers populate, so a Cohere
+                                        // image round-trips and translates losslessly. ASSUMPTION (see
+                                        // report): the wire shape is OpenAI-style `image_url`; no
+                                        // Cohere v2 image fixture exists in-repo to confirm it.
+                                        Some("image_url") => {
+                                            if let Some(url) = block_obj
+                                                .get("image_url")
+                                                .and_then(|iu| iu.get("url"))
+                                                .and_then(|u| u.as_str())
+                                            {
+                                                let (media_type, data) =
+                                                    super::parse_image_url(url);
+                                                msg_content.push(crate::ir::IrBlock::Image {
+                                                    media_type,
+                                                    data,
+                                                });
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -673,6 +727,38 @@ impl ProtocolReader for CohereReader {
         let tool_choice = read_cohere_tool_choice(obj.get("tool_choice"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        // Cohere v2 chat models `frequency_penalty`/`presence_penalty` (top-level floats) natively,
+        // with the SAME names/shape as OpenAI — promote them to the IR so a forced penalty survives
+        // the cross-protocol seam instead of being dropped (they are modeled keys, so they are NOT
+        // re-echoed via `extra`).
+        let frequency_penalty = obj.get("frequency_penalty").and_then(|v| v.as_f64());
+        let presence_penalty = obj.get("presence_penalty").and_then(|v| v.as_f64());
+        // Cohere v2 chat supports a top-level integer `seed` for reproducible sampling (same name as
+        // OpenAI/Responses), so promote it to the IR. `i64` to carry the full JSON integer range
+        // losslessly, matching the IR field type. (If a future Cohere API revision drops `seed`, this
+        // read is a harmless no-op when the key is absent.)
+        let seed = obj.get("seed").and_then(|v| v.as_i64());
+        // Cohere v2 chat models `response_format` (json_object / json_schema structured output) at the
+        // top level. Carry the raw object verbatim into the IR so it round-trips and translates.
+        let response_format = obj.get("response_format").cloned();
+
+        // M4: Cohere-native `documents` (RAG grounding) has NO cross-protocol analog and is NOT
+        // modeled in the IR — it stays in `extra`. On a SAME-protocol Cohere->Cohere hop it survives
+        // byte-exact (it is echoed through `extra`). On a CROSS-protocol hop, `extra` is CLEARED at
+        // the translation seam, so the `documents` grounding is silently DROPPED — and the Cohere
+        // writer never runs to observe the loss. So warn HERE, at the reader, where the inbound
+        // `documents` is still visible, whenever the request carries one. We intentionally do NOT
+        // invent an IR field for it (no faithful target mapping exists); the warn makes the
+        // potential cross-protocol loss non-silent so an operator can detect grounding that will not
+        // reach a non-Cohere backend.
+        if obj.contains_key("documents") {
+            tracing::warn!(
+                "cohere: request carries native `documents` (RAG grounding) with no cross-protocol \
+                 analog; it survives a same-protocol Cohere->Cohere hop but is DROPPED when this \
+                 request is translated to a non-Cohere backend (extra is cleared at the seam)"
+            );
+        }
+
         // Built once per process and reused across every request rather than rebuilt on each
         // read_request call (the per-request allocation/hashing was wasted work on the ingress hot
         // path — same fix the Gemini/Bedrock readers want). The set is immutable, so a OnceLock is
@@ -694,6 +780,16 @@ impl ProtocolReader for CohereReader {
             stop,
             tool_choice,
             stream,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            // `n` (candidate count) is intentionally omitted: the Cohere v2 `/v2/chat` API has NO
+            // `num_generations`/`n` parameter (it was a v1 Generate-API field, removed in v2 — the
+            // documented way to get N candidates is to call chat N times). So there is nothing native
+            // to read here, and the writer emits nothing — same as Anthropic/Bedrock/Responses. (An
+            // earlier ir.rs docstring wrongly claimed Cohere `num_generations` support; corrected.)
+            n: None,
+            response_format,
             extra,
         })
     }
@@ -1299,14 +1395,60 @@ impl ProtocolWriter for CohereWriter {
                 })
                 .collect();
 
-            let content_val: Option<serde_json::Value> = match text_blocks.as_slice() {
-                [] => None,
-                [single] => Some(serde_json::Value::String((*single).clone())),
-                many => Some(serde_json::Value::Array(
-                    many.iter()
-                        .map(|text| serde_json::json!({ "type": "text", "text": text }))
-                        .collect(),
-                )),
+            // Cohere v2 multimodal output: an image block is written as an
+            // `{"type":"image_url","image_url":{"url":"<data-uri|https>"}}` content part — the SAME
+            // shape OpenAI v1 chat uses and this file's reader consumes. `image_url_from_ir` re-wraps
+            // the IR (media_type, data) pair into the original URL (a base64 image becomes a
+            // `data:<mime>;base64,<payload>` URI; an "image_url"-sentinel image emits its raw URL
+            // verbatim). When ANY image is present the message MUST use the array content shape (a
+            // bare string cannot carry an image part). ASSUMPTION (see report): the wire shape is
+            // OpenAI-style `image_url`; no Cohere v2 image fixture exists in-repo to confirm it.
+            let image_parts: Vec<serde_json::Value> = msg
+                .content
+                .iter()
+                .filter_map(|b| {
+                    if let crate::ir::IrBlock::Image { media_type, data } = b {
+                        if super::is_unresolvable_image_ref(media_type) {
+                            // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is
+                            // an unresolvable cross-vendor reference: emitting it as an `image_url`
+                            // would produce a corrupt `data:file_id;base64,<id>` URI. SKIP it (no
+                            // lossless cross-vendor projection of an uploaded-file id).
+                            tracing::warn!(
+                                "dropping unresolvable file_id image on Cohere egress: a Responses \
+                                 input_image.file_id has no cross-vendor analog and would corrupt \
+                                 an image_url; the block is NOT emitted"
+                            );
+                            return None;
+                        }
+                        let url = super::image_url_from_ir(media_type, data);
+                        Some(
+                            serde_json::json!({ "type": "image_url", "image_url": { "url": url } }),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let content_val: Option<serde_json::Value> = if image_parts.is_empty() {
+                match text_blocks.as_slice() {
+                    [] => None,
+                    [single] => Some(serde_json::Value::String((*single).clone())),
+                    many => Some(serde_json::Value::Array(
+                        many.iter()
+                            .map(|text| serde_json::json!({ "type": "text", "text": text }))
+                            .collect(),
+                    )),
+                }
+            } else {
+                // Mixed/image content: emit a parts array with text parts first (preserving the
+                // existing ordering of text before media), then the image parts.
+                let mut parts: Vec<serde_json::Value> = text_blocks
+                    .iter()
+                    .map(|text| serde_json::json!({ "type": "text", "text": text }))
+                    .collect();
+                parts.extend(image_parts);
+                Some(serde_json::Value::Array(parts))
             };
 
             if msg.role == crate::ir::IrRole::Tool {
@@ -1460,10 +1602,22 @@ impl ProtocolWriter for CohereWriter {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
-            // Clamp to Cohere's native [0.0, 1.0] (PF-M1). OpenAI / Responses accept temperature up to
-            // 2.0, so a cross-protocol request can carry a value Cohere's API rejects with a hard 400
-            // ValidationException; clamping forwards the closest valid value instead.
-            let clamped = temperature.clamp(0.0, 1.0);
+            // Clamp to Cohere's native [0.0, 1.0] (PF-M1) — see `clamp_temperature_for_cohere`.
+            // NON-SILENT clamp (the M2 fidelity fix): the writer previously clamped SILENTLY, exactly
+            // the lossy mutation busbar exists to avoid. We keep the clamp (Cohere 400s on >1.0) but
+            // emit a `warn!` whenever it ACTUALLY changes the value so an operator can detect the
+            // divergence in logs. Mirrors the anthropic/bedrock writers' non-silent clamp.
+            let (clamped, was_clamped) = clamp_temperature_for_cohere(temperature);
+            if was_clamped {
+                tracing::warn!(
+                    requested_temperature = temperature,
+                    clamped_temperature = clamped,
+                    parameter = "temperature",
+                    "clamping temperature to Cohere's [0.0, 1.0] range; the requested value was \
+                     outside it (e.g. an OpenAI/Responses value up to 2.0) and would 400 — the \
+                     forwarded value diverges from the caller's request"
+                );
+            }
             out.insert("temperature".to_string(), serde_json::json!(clamped));
         }
         // Promoted sampling controls in Cohere v2's native names: `p` (top_p), `k` (top_k),
@@ -1478,6 +1632,35 @@ impl ProtocolWriter for CohereWriter {
         if !req.stop.is_empty() {
             out.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
         }
+        // Phase 0 sampling/output controls in Cohere v2's native (OpenAI-shaped) names. Emitted
+        // before the `extra` overlay (the reader pulled these keys out of extra, so there is no
+        // double-emit on a same-protocol passthrough).
+        if let Some(frequency_penalty) = req.frequency_penalty {
+            out.insert(
+                "frequency_penalty".to_string(),
+                serde_json::json!(frequency_penalty),
+            );
+        }
+        if let Some(presence_penalty) = req.presence_penalty {
+            out.insert(
+                "presence_penalty".to_string(),
+                serde_json::json!(presence_penalty),
+            );
+        }
+        // Cohere v2 chat supports a top-level integer `seed`. Emit it when present so deterministic
+        // sampling survives the seam (the reader models it as a modeled key, so no double-emit).
+        if let Some(seed) = req.seed {
+            out.insert("seed".to_string(), serde_json::json!(seed));
+        }
+        // `response_format` (structured output) is written back verbatim — the raw Value the reader
+        // captured. Cohere v2 accepts the same json_object / json_schema shape.
+        if let Some(response_format) = &req.response_format {
+            out.insert("response_format".to_string(), response_format.clone());
+        }
+        // M4: Cohere-native `documents` (RAG grounding) has no cross-protocol analog and is not
+        // modeled in the IR; on a same-protocol hop it flows through `extra` byte-exact below. The
+        // non-silent loss warn for the cross-protocol case lives in `read_request` (the only Cohere
+        // site that still sees an inbound `documents` before `extra` is cleared at the seam).
         // Only emit `stream` when streaming is requested. A native Cohere client omitting `stream`
         // (relying on the `false` default) produces a body WITHOUT the field; always injecting
         // `"stream": false` is a proxy tell and a same-protocol passthrough fidelity break (the
@@ -1916,6 +2099,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -1985,6 +2173,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: true,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -2267,6 +2460,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -2306,6 +2504,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = CohereWriter;
@@ -3603,6 +3806,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
 
@@ -3782,6 +3990,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = CohereWriter;
@@ -3821,6 +4034,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = CohereWriter;
@@ -3869,6 +4087,11 @@ mod tests {
             stop: vec![],
             tool_choice: None,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         };
         let writer = CohereWriter;
@@ -5353,6 +5576,11 @@ mod tests {
             stop: vec![],
             tool_choice: tc,
             stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -5453,6 +5681,138 @@ mod tests {
             out.get("temperature").and_then(|v| v.as_f64()),
             Some(1.0),
             "an OpenAI-ingress temperature of 1.8 must clamp to 1.0 on the Cohere writer; got {out}"
+        );
+    }
+
+    // M2: the temperature clamp must be NON-SILENT — `clamp_temperature_for_cohere` returns
+    // `(clamped, was_clamped)` and `was_clamped` is true IFF the value actually changed, so the
+    // writer can `warn!` only on a real mutation. Unit-tested without a tracing subscriber.
+    #[test]
+    fn test_clamp_temperature_for_cohere_signals_on_change() {
+        // Above range: clamped to 1.0 and flagged.
+        assert_eq!(clamp_temperature_for_cohere(1.8), (1.0, true));
+        assert_eq!(clamp_temperature_for_cohere(2.0), (1.0, true));
+        // Below range: clamped to 0.0 and flagged.
+        assert_eq!(clamp_temperature_for_cohere(-0.5), (0.0, true));
+        // In range: untouched and NOT flagged (no spurious warn on a valid value).
+        assert_eq!(clamp_temperature_for_cohere(0.7), (0.7, false));
+        assert_eq!(clamp_temperature_for_cohere(0.0), (0.0, false));
+        assert_eq!(clamp_temperature_for_cohere(1.0), (1.0, false));
+        // Non-finite is total + passthrough (defensive; unreachable via valid JSON).
+        let (nan_out, nan_flag) = clamp_temperature_for_cohere(f64::NAN);
+        assert!(nan_out.is_nan() && !nan_flag);
+    }
+
+    // SAMPLING: frequency_penalty / presence_penalty / seed / response_format survive a
+    // same-protocol Cohere->Cohere read->write round-trip in their native top-level shapes, and are
+    // pulled out of `extra` (modeled keys) so they do NOT double-emit.
+    #[test]
+    fn test_cohere_sampling_controls_survive_roundtrip() {
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.25,
+            "seed": 42,
+            "response_format": {"type": "json_object"}
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        assert_eq!(ir.frequency_penalty, Some(0.5));
+        assert_eq!(ir.presence_penalty, Some(0.25));
+        assert_eq!(ir.seed, Some(42));
+        assert_eq!(
+            ir.response_format,
+            Some(serde_json::json!({"type": "json_object"}))
+        );
+        // Modeled keys must NOT linger in `extra` (or the writer would double-emit them).
+        assert!(!ir.extra.contains_key("frequency_penalty"));
+        assert!(!ir.extra.contains_key("presence_penalty"));
+        assert!(!ir.extra.contains_key("seed"));
+        assert!(!ir.extra.contains_key("response_format"));
+
+        let out = {
+            let __w = CohereWriter;
+            __w.write_request(&ir)
+        };
+        assert_eq!(out.get("frequency_penalty"), Some(&serde_json::json!(0.5)));
+        assert_eq!(out.get("presence_penalty"), Some(&serde_json::json!(0.25)));
+        assert_eq!(out.get("seed"), Some(&serde_json::json!(42)));
+        assert_eq!(
+            out.get("response_format"),
+            Some(&serde_json::json!({"type": "json_object"}))
+        );
+    }
+
+    // H7: a Cohere v2 image content part (`{"type":"image_url","image_url":{"url":...}}`) reads into
+    // `IrBlock::Image` and writes back as the same native part — both a base64 data-URI image (split
+    // into a real MIME media_type + base64 data) and a bare https URL (preserved under the
+    // "image_url" sentinel).
+    #[test]
+    fn test_cohere_image_content_part_read_write_roundtrip() {
+        let data_uri = "data:image/png;base64,aGVsbG8=";
+        let body = serde_json::json!({
+            "model": "command-a-vision",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+                ]
+            }]
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        let content = &ir.messages[0].content;
+        // Text + 2 images, in order.
+        assert!(matches!(content[0], crate::ir::IrBlock::Text { .. }));
+        match &content[1] {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "aGVsbG8=");
+            }
+            other => panic!("expected base64 Image, got {other:?}"),
+        }
+        match &content[2] {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                // A non-data URL is preserved verbatim under the sentinel.
+                assert_eq!(media_type, "image_url");
+                assert_eq!(data, "https://example.com/cat.jpg");
+            }
+            other => panic!("expected url Image, got {other:?}"),
+        }
+
+        // Write back: the user message content must be an array carrying the text part then both
+        // image parts in native `image_url` shape, reconstructing the original URLs.
+        let out = {
+            let __w = CohereWriter;
+            __w.write_request(&ir)
+        };
+        let msgs = out.get("messages").and_then(|m| m.as_array()).unwrap();
+        let parts = msgs[0].get("content").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(parts[0].get("type").and_then(|t| t.as_str()), Some("text"));
+        assert_eq!(
+            parts[1].get("type").and_then(|t| t.as_str()),
+            Some("image_url")
+        );
+        assert_eq!(
+            parts[1]
+                .get("image_url")
+                .and_then(|iu| iu.get("url"))
+                .and_then(|u| u.as_str()),
+            Some(data_uri),
+            "base64 image must reconstruct its original data URI"
+        );
+        assert_eq!(
+            parts[2]
+                .get("image_url")
+                .and_then(|iu| iu.get("url"))
+                .and_then(|u| u.as_str()),
+            Some("https://example.com/cat.jpg"),
+            "url image must emit its raw URL verbatim"
         );
     }
 }
