@@ -9,9 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0-rc.6] — 2026-06-19
 
-Performance and observability. Busbar now reports its own added latency in-band, and the hot
-translate path is ~2× faster on large payloads via SIMD JSON. The request path, wire protocols,
-breaker FSM, governance contract, and lossless translation semantics are unchanged.
+Performance, observability, a security fix, and cross-protocol losslessness completeness. Busbar now
+reports its own added latency in-band, the hot translate path is ~2× faster on large payloads via SIMD
+JSON, a remotely-triggerable parser DoS is closed, and a fidelity audit closed a class of cross-protocol
+silent-loss gaps so native provider features survive translation. The request path, wire protocols,
+breaker FSM, and governance contract are unchanged.
+
+### Security
+
+- **Nested-JSON stack-overflow DoS closed.** A small (~20 KB) deeply-nested request body could overflow
+  the worker stack and abort the whole process — an uncatchable crash that killed every in-flight
+  request for all tenants. The JSON seam now rejects bodies past a 128-level nesting depth before any
+  value is constructed. (Introduced by this release's SIMD-JSON parser, which — unlike `serde_json` —
+  does not bound recursion depth; found and fixed pre-release by a multi-tier audit.)
 
 ### Added
 
@@ -19,6 +29,14 @@ breaker FSM, governance contract, and lossless translation semantics are unchang
   time — total request time minus the upstream round-trip — on every response. A W3C-standard,
   per-request measurement of exactly the latency Busbar adds (not the network, not the model), readable
   in browser DevTools or any APM tool, on your own production traffic.
+- **Cross-protocol losslessness completeness.** Provider-native request/response features now survive
+  cross-protocol translation instead of being silently dropped: sampling controls
+  (`frequency_penalty`/`presence_penalty`/`seed`/`n`), structured output (`response_format` mapped to
+  each protocol's analog), reasoning/thinking blocks both ways (Gemini `thought` parts and Responses
+  reasoning items, with signatures, non-stream and streaming), Anthropic `cache_control` ↔ Bedrock
+  `cachePoint`, Gemini/Responses cache-read token accounting, and Cohere v2 image input. Where a target
+  genuinely lacks an analog (e.g. structured output on Anthropic/Bedrock, or a Responses `file_id` image
+  on another vendor), the parameter is dropped with a `warn!` rather than silently.
 
 ### Changed
 
@@ -32,6 +50,17 @@ breaker FSM, governance contract, and lossless translation semantics are unchang
   ~32 KB payload roughly halved (≈186µs → ≈84µs); small requests are unchanged at the per-request
   framework floor (~33µs). Full reproducible methodology and numbers are published at
   [getbusbar.com/benchmark](https://getbusbar.com/benchmark).
+
+### Fixed
+
+- **Translation-fidelity siblings.** `top_k` camelCase/snake-case spelling is preserved to Bedrock;
+  temperature clamps to a provider's native range are now non-silent (a `warn!`) on Anthropic, Bedrock,
+  and Cohere; `max_completion_tokens` is preserved for OpenAI reasoning models (o1/o3); `max_tokens: 0`
+  is filtered uniformly across all six protocol readers.
+- **Breaker-trip telemetry.** `busbar_breaker_trips_total` now counts exactly one logical Closed→Open
+  trip on the degraded routing paths (previously under- or over-counted on some arms).
+- **Parse-error log hygiene.** A JSON (de)serialization error is logged as a sanitized byte-count
+  breadcrumb, never the raw library `Display` (which can embed body fragments).
 
 ### Notes
 
