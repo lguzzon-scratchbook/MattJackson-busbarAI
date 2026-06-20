@@ -1261,7 +1261,13 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             obj.insert("type".to_string(), serde_json::json!("thinking"));
             obj.insert("thinking".to_string(), serde_json::json!(text));
             if let Some(sig) = signature {
-                obj.insert("signature".to_string(), serde_json::json!(sig));
+                // HIGH-2: a Bedrock `redactedContent` reasoning block carries the busbar
+                // redacted-reasoning sentinel in `signature`. It is NOT a valid Anthropic signature
+                // token — emit the thinking text with NO signature rather than leak the `__busbar`
+                // marker (a busbar fingerprint + an invalid signature) to a native Anthropic SDK.
+                if !crate::proto::is_redacted_reasoning_sig(sig) {
+                    obj.insert("signature".to_string(), serde_json::json!(sig));
+                }
             }
             serde_json::Value::Object(obj)
         }
@@ -1894,6 +1900,13 @@ impl ProtocolWriter for AnthropicWriter {
                         serde_json::json!({ "type": "input_json_delta", "partial_json": json })
                     }
                     IrDelta::SignatureDelta(sig) => {
+                        // HIGH-2: a streamed Bedrock `redactedContent` reasoning delta carries the
+                        // busbar redacted-reasoning sentinel (the stream form appends the bytes:
+                        // `{SENTINEL}{base64}`). Never write the `__busbar` marker as a wire
+                        // `signature_delta` — emit NOTHING for this signature-only frame.
+                        if crate::proto::is_redacted_reasoning_sig(sig) {
+                            return None;
+                        }
                         serde_json::json!({ "type": "signature_delta", "signature": sig })
                     }
                     // L2-5 STREAMING citation: re-emit each carried citation as its own native
@@ -1905,45 +1918,34 @@ impl ProtocolWriter for AnthropicWriter {
                     // foreign `raw` from leaking through. An EMPTY citation vec carries nothing, so we
                     // emit no event (return None) rather than a stray empty `content_block_delta`.
                     IrDelta::CitationsDelta(citations) => {
-                        let mut events: Vec<(String, serde_json::Value)> = Vec::new();
-                        for c in citations {
-                            let mut data_obj = serde_json::Map::new();
-                            data_obj.insert(
-                                "type".to_string(),
-                                serde_json::json!("content_block_delta"),
-                            );
-                            data_obj.insert("index".to_string(), serde_json::json!(index));
-                            data_obj.insert(
-                                "delta".to_string(),
-                                serde_json::json!({
-                                    "type": "citations_delta",
-                                    "citation": write_citation(c),
-                                }),
-                            );
-                            events.push((
-                                "content_block_delta".to_string(),
-                                serde_json::Value::Object(data_obj),
-                            ));
-                        }
-                        // `write_response_event` returns at most one (event_type, body) pair, so a
-                        // multi-citation delta is flushed as a single combined SSE `event:` of type
-                        // `content_block_delta` whose `data` is the array of native event bodies.
-                        // Each element is a complete native `citations_delta` content_block_delta, so
-                        // a consumer that iterates the array sees the exact per-citation frames a
-                        // native Anthropic stream emits; a single citation (the common case — one
-                        // `citation` per native delta) yields a one-element array. The bare
-                        // `content_block_delta` arms below build ONE body; mirror that contract by
-                        // returning early here rather than falling through to the single-body wrap.
-                        return match events.len() {
-                            0 => None,
-                            1 => events.into_iter().next(),
-                            _ => Some((
-                                "content_block_delta".to_string(),
-                                serde_json::Value::Array(
-                                    events.into_iter().map(|(_, body)| body).collect(),
-                                ),
-                            )),
-                        };
+                        // EVERY Anthropic `citations_delta` event on the wire is EXACTLY ONE citation
+                        // object — never a JSON array (a native SDK `JSON.parse`s one object per
+                        // `data:` line and crashes on an array). The `ProtocolWriter` trait returns at
+                        // most one `(event_type, body)` per event, so a delta MUST carry at most one
+                        // citation by the time it reaches this writer. A multi-citation `CitationsDelta`
+                        // (e.g. a Gemini chunk batching N `citationSources[]`) is split into N
+                        // single-citation deltas UPSTREAM at the `StreamTranslate` framing seam (the
+                        // Anthropic-ingress multi-citation fan-out), so each call here sees exactly one.
+                        // An EMPTY vec carries nothing → emit no event (None) rather than a stray empty
+                        // `content_block_delta`. A vec of >1 cannot occur via the framer, but defend the
+                        // invariant anyway: take the FIRST and drop the rest rather than ever emitting
+                        // an array.
+                        let c = citations.first()?;
+                        let mut data_obj = serde_json::Map::new();
+                        data_obj
+                            .insert("type".to_string(), serde_json::json!("content_block_delta"));
+                        data_obj.insert("index".to_string(), serde_json::json!(index));
+                        data_obj.insert(
+                            "delta".to_string(),
+                            serde_json::json!({
+                                "type": "citations_delta",
+                                "citation": write_citation(c),
+                            }),
+                        );
+                        return Some((
+                            "content_block_delta".to_string(),
+                            serde_json::Value::Object(data_obj),
+                        ));
                     }
                 };
                 let mut data_obj = serde_json::Map::new();

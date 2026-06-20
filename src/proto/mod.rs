@@ -118,6 +118,24 @@ pub(crate) fn image_url_from_ir(media_type: &str, data: &str) -> String {
     }
 }
 
+/// SENTINEL value placed in an IR `Thinking { signature }` to mark that the block is actually a
+/// Bedrock Converse `reasoningContent.redactedContent` block (encrypted/redacted reasoning bytes),
+/// NOT a plaintext `reasoningText`. Promoted to this shared module (wire-correctness, HIGH-2) so
+/// EVERY writer can recognize it: the Bedrock writer re-emits `redactedContent` from it, but the
+/// NON-Bedrock writers (Anthropic / Gemini / Responses) MUST NOT emit this `__busbar`-prefixed
+/// marker as a signature on the wire — doing so leaks a busbar fingerprint AND an invalid signature
+/// to a native SDK. The streaming form APPENDS the redacted bytes (`{SENTINEL}{base64}`), so a
+/// PREFIX match (see [`is_redacted_reasoning_sig`]) is required, not equality.
+pub(crate) const REASONING_REDACTED_SIG_SENTINEL: &str = "__busbar_bedrock_redacted_reasoning";
+
+/// True when `sig` is a redacted-reasoning sentinel signature — either the bare sentinel (the
+/// non-stream form) or the sentinel with the redacted bytes appended (the stream form,
+/// `{SENTINEL}{base64}`). Every non-Bedrock signature-emission site must DROP a signature for which
+/// this returns true rather than write the `__busbar` marker onto the wire.
+pub(crate) fn is_redacted_reasoning_sig(sig: &str) -> bool {
+    sig.starts_with(REASONING_REDACTED_SIG_SENTINEL)
+}
+
 /// Sentinel `media_type` marking an IR `Image` block that carries a Responses `input_image.file_id`
 /// reference (an uploaded-file id), NOT inline bytes. The Responses reader stores it as
 /// `Image { media_type: FILE_ID_IMAGE_SENTINEL, data: <file_id> }`; the Responses writer decodes it
@@ -1509,6 +1527,38 @@ impl StreamTranslate {
             }
             if matches!(ev, crate::ir::IrStreamEvent::MessageStop) {
                 self.message_stopped = true;
+            }
+
+            // Anthropic-INGRESS multi-citation fan-out (wire-correctness, HIGH-1): a single
+            // `BlockDelta{CitationsDelta(vec of N)}` (e.g. ONE Gemini chunk batches 3–10
+            // `citationSources[]` → ONE delta carrying N citations) MUST NOT serialize to a single
+            // Anthropic `content_block_delta` whose body is a JSON ARRAY of N citation frames — a
+            // native Anthropic SDK `JSON.parse`s ONE object per `data:` line and crashes on an array.
+            // The native wire carries EXACTLY ONE `citation` per `citations_delta` event. The
+            // single-`(String,Value)`-return writer trait cannot emit N frames from one event, so —
+            // mirroring the Bedrock combined-delta fan-out above — split the multi-citation delta into
+            // N single-citation `BlockDelta`s here at the framing seam and frame each separately, so
+            // the wire carries N distinct single-object `citations_delta` events. ONLY for Anthropic
+            // ingress: the Gemini writer legitimately coalesces N sources into one candidate-level
+            // `citationMetadata` chunk (valid Gemini), so its batched delta is left intact. A
+            // single-citation delta (the common case) takes the untouched fall-through below.
+            if ingress_name == "anthropic" {
+                if let crate::ir::IrStreamEvent::BlockDelta {
+                    index,
+                    delta: crate::ir::IrDelta::CitationsDelta(citations),
+                } = &ev
+                {
+                    if citations.len() > 1 {
+                        for c in citations {
+                            let single = crate::ir::IrStreamEvent::BlockDelta {
+                                index: *index,
+                                delta: crate::ir::IrDelta::CitationsDelta(vec![c.clone()]),
+                            };
+                            self.emit_ir_event(&single, out);
+                        }
+                        continue;
+                    }
+                }
             }
 
             self.emit_ir_event(&ev, out);
@@ -5259,6 +5309,184 @@ mod stream_translate_tests {
             text.contains("error"),
             "an aborted stream's finish must emit a native error event, not a bare close; got: {text}"
         );
+    }
+
+    /// HIGH-1 (wire-correctness): a single Gemini stream chunk batching N `citationSources[]` becomes
+    /// ONE `IrDelta::CitationsDelta(vec of N)`. On Gemini EGRESS → Anthropic INGRESS, that MUST NOT be
+    /// flushed as ONE Anthropic `content_block_delta` whose body is a JSON ARRAY of N citation frames
+    /// (a native Anthropic SDK `JSON.parse`s ONE object per `data:` line and crashes on an array).
+    /// Every `citations_delta` event on the wire must be EXACTLY ONE citation object; a 3-source
+    /// Gemini chunk must yield THREE separate single-object `citations_delta` events.
+    #[test]
+    fn stream_gemini_multi_citation_yields_separate_single_object_anthropic_events() {
+        // ingress = anthropic (the client), egress = gemini (the backend): `feed` consumes Gemini SSE
+        // and emits Anthropic SSE.
+        let mut st = StreamTranslate::new("anthropic", "gemini").expect("translator");
+        // One Gemini chunk: a text part + candidate-level citationMetadata with 3 sources.
+        let chunk = br#"data: {"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"answer text"}]},"citationMetadata":{"citationSources":[{"startIndex":0,"endIndex":3,"uri":"https://example.com/a","title":"A"},{"startIndex":3,"endIndex":6,"uri":"https://example.com/b","title":"B"},{"startIndex":6,"endIndex":9,"uri":"https://example.com/c","title":"C"}]}}]}
+
+"#;
+        let mut out = st.feed(chunk);
+        out.extend_from_slice(&st.finish());
+        let text = String::from_utf8(out).expect("anthropic SSE is utf-8");
+
+        // Collect every `data:` line whose parsed body is a `citations_delta` content_block_delta.
+        let mut citation_bodies: Vec<serde_json::Value> = Vec::new();
+        for line in text.lines() {
+            let Some(json) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(body) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+                continue;
+            };
+            // INVARIANT: a `citations_delta` event body is NEVER a JSON array — always one object.
+            assert!(
+                !body.is_array(),
+                "no SSE event body may be a JSON array (a native Anthropic SDK crashes on it): {body}"
+            );
+            if body.pointer("/delta/type").and_then(|t| t.as_str()) == Some("citations_delta") {
+                // Each citation event carries exactly ONE `citation` object, never an array.
+                let citation = body
+                    .pointer("/delta/citation")
+                    .expect("a citations_delta carries a single `citation`");
+                assert!(
+                    citation.is_object(),
+                    "the `citation` field must be a single object, not an array: {citation}"
+                );
+                citation_bodies.push(body);
+            }
+        }
+
+        assert_eq!(
+            citation_bodies.len(),
+            3,
+            "3 Gemini citationSources → 3 separate single-object Anthropic citations_delta events"
+        );
+        // The three carry the three distinct sources, in order.
+        let urls: Vec<&str> = citation_bodies
+            .iter()
+            .filter_map(|b| b.pointer("/delta/citation/url").and_then(|u| u.as_str()))
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c"
+            ]
+        );
+    }
+
+    /// HIGH-1 reverse direction: 3 Anthropic single-citation `citations_delta` events (as a native
+    /// Anthropic stream emits — one citation per delta) → Gemini EGRESS-shaped `citationMetadata`
+    /// chunks that are VALID Gemini (candidate-level `citationSources`), never an array-bodied frame.
+    #[test]
+    fn stream_anthropic_single_citations_project_to_valid_gemini_citation_metadata() {
+        let writer = GeminiWriter;
+        let mk = |url: &str| crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::CitationsDelta(vec![crate::ir::IrCitation {
+                kind: Some("web_search_result_location".to_string()),
+                cited_text: None,
+                title: Some("T".to_string()),
+                url: Some(url.to_string()),
+                document_index: None,
+                start_index: Some(0),
+                end_index: Some(3),
+                encrypted_index: None,
+                raw: None,
+            }]),
+        };
+        for url in ["https://x/1", "https://x/2", "https://x/3"] {
+            let (_, body) = writer
+                .write_response_event(&mk(url))
+                .expect("each single-citation delta emits a Gemini citationMetadata chunk");
+            let sources = body
+                .pointer("/candidates/0/citationMetadata/citationSources")
+                .and_then(|s| s.as_array())
+                .expect("a valid Gemini chunk carries candidate-level citationSources[]");
+            assert_eq!(sources.len(), 1, "one citation per delta → one source");
+            assert_eq!(
+                sources[0].get("uri").and_then(|v| v.as_str()),
+                Some(url),
+                "the Gemini source carries the citation uri"
+            );
+        }
+    }
+
+    /// HIGH-2 (wire-correctness): a Bedrock `redactedContent` reasoning block is carried in the IR as
+    /// `Thinking { signature: Some(REASONING_REDACTED_SIG_SENTINEL…) }`. The NON-Bedrock writers
+    /// (Anthropic / Gemini / Responses) MUST NOT emit that `__busbar` sentinel onto the wire — doing
+    /// so is a busbar fingerprint AND an invalid signature token a native SDK would reject. The block
+    /// degrades to plain thinking text with NO signature on every non-Bedrock egress.
+    #[test]
+    fn redacted_reasoning_sentinel_never_leaks_to_non_bedrock_wires() {
+        // Both forms: the bare non-stream sentinel and the stream form with bytes appended.
+        for sig in [
+            REASONING_REDACTED_SIG_SENTINEL.to_string(),
+            format!("{REASONING_REDACTED_SIG_SENTINEL}RVhBTVBMRQ=="),
+        ] {
+            assert!(
+                is_redacted_reasoning_sig(&sig),
+                "both sentinel forms must be recognized (prefix match): {sig}"
+            );
+            let ir = crate::ir::IrResponse {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::Thinking {
+                    text: "private reasoning".to_string(),
+                    signature: Some(sig.clone()),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                usage: crate::ir::IrUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+                model: None,
+                id: None,
+                created: None,
+                system_fingerprint: None,
+                stop_sequence: None,
+            };
+
+            // The serialized wire output of each non-Bedrock writer must NOT contain the sentinel.
+            // Bind each writer to a local (these unit structs carry interior-mutable per-stream
+            // state, so borrowing the bare value trips `borrow_interior_mutable_const`).
+            let (aw, gw, rw) = (AnthropicWriter, GeminiWriter, ResponsesWriter);
+            let anthropic = aw.write_response(&ir).to_string();
+            let gemini = gw.write_response(&ir).to_string();
+            let responses = rw.write_response(&ir).to_string();
+            for (name, wire) in [
+                ("anthropic", &anthropic),
+                ("gemini", &gemini),
+                ("responses", &responses),
+            ] {
+                assert!(
+                    !wire.contains(REASONING_REDACTED_SIG_SENTINEL),
+                    "{name} wire output leaked the redacted-reasoning sentinel: {wire}"
+                );
+            }
+            // The thinking TEXT must still survive (we drop only the signature, not the block).
+            assert!(
+                anthropic.contains("private reasoning"),
+                "anthropic must keep the thinking text: {anthropic}"
+            );
+
+            // Streaming signature delta carrying the sentinel emits NOTHING on Anthropic/Gemini.
+            let sig_delta = crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::SignatureDelta(sig.clone()),
+            };
+            assert!(
+                aw.write_response_event(&sig_delta).is_none(),
+                "anthropic stream must drop a redacted-sentinel signature_delta"
+            );
+            assert!(
+                gw.write_response_event(&sig_delta).is_none(),
+                "gemini stream must drop a redacted-sentinel signature_delta"
+            );
+        }
     }
 
     /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for tests.

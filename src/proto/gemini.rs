@@ -2039,7 +2039,11 @@ impl ProtocolWriter for GeminiWriter {
                         part.insert("text".to_string(), serde_json::json!(text));
                         part.insert("thought".to_string(), serde_json::json!(true));
                         if let Some(sig) = signature {
-                            part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                            // HIGH-2: never leak the busbar redacted-reasoning sentinel as a Gemini
+                            // `thoughtSignature` — it is a busbar fingerprint + an invalid token.
+                            if !crate::proto::is_redacted_reasoning_sig(sig) {
+                                part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                            }
                         }
                         parts_arr.push(serde_json::Value::Object(part));
                     }
@@ -2488,17 +2492,27 @@ impl ProtocolWriter for GeminiWriter {
                 // signature arrives as its own IR delta, so emit a minimal thought part bearing the
                 // signature (empty text, `thought:true`) — the closest faithful streamed form, since a
                 // bare signature has no accompanying incremental text. Previously dropped (None).
-                crate::ir::IrDelta::SignatureDelta(sig) => Some((
-                    "".to_string(),
-                    serde_json::json!({
-                        "candidates": [{
-                            "content": {
-                                "role": "model",
-                                "parts": [{"text": "", "thought": true, "thoughtSignature": sig}]
-                            }
-                        }]
-                    }),
-                )),
+                crate::ir::IrDelta::SignatureDelta(sig) => {
+                    // HIGH-2: a streamed Bedrock `redactedContent` reasoning delta carries the busbar
+                    // redacted-reasoning sentinel (stream form: `{SENTINEL}{base64}`). Never emit the
+                    // `__busbar` marker as a Gemini `thoughtSignature` — drop this signature-only
+                    // frame entirely (None) rather than leak the fingerprint/invalid token.
+                    if crate::proto::is_redacted_reasoning_sig(sig) {
+                        None
+                    } else {
+                        Some((
+                            "".to_string(),
+                            serde_json::json!({
+                                "candidates": [{
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "", "thought": true, "thoughtSignature": sig}]
+                                    }
+                                }]
+                            }),
+                        ))
+                    }
+                }
 
                 // L2-5 STREAMING citations → emit a candidate-level `citationMetadata.citationSources`
                 // chunk, mirroring the non-stream `read_response`/`write_response` shape (Gemini
@@ -2686,7 +2700,11 @@ impl ProtocolWriter for GeminiWriter {
                     part.insert("text".to_string(), serde_json::json!(text));
                     part.insert("thought".to_string(), serde_json::json!(true));
                     if let Some(sig) = signature {
-                        part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                        // HIGH-2: never leak the busbar redacted-reasoning sentinel as a Gemini
+                        // `thoughtSignature` — it is a busbar fingerprint + an invalid token.
+                        if !crate::proto::is_redacted_reasoning_sig(sig) {
+                            part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                        }
                     }
                     parts_arr.push(serde_json::Value::Object(part));
                 }

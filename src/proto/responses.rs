@@ -2489,6 +2489,16 @@ impl ProtocolWriter for ResponsesWriter {
         if let Some(top_p) = req.top_p {
             out.insert("top_p".to_string(), serde_json::json!(top_p));
         }
+        // LOW: the Responses create API models no `top_k` (only `top_p`). A cross-protocol source's
+        // `top_k` has no Responses target. Rather than silently dropping it, emit a `warn!` so the
+        // lossy-by-target omission is observable in logs (mirrors the `stop`-drop warn below and the
+        // anthropic/bedrock writers' drop-with-warn contract). Nothing is written to `out`.
+        if req.top_k.is_some() {
+            tracing::warn!(
+                "responses writer: the /v1/responses API models no `top_k` parameter; \
+                 dropping top_k (lossy-by-target)"
+            );
+        }
 
         // SAMPLING (Phase 0): the Responses create API does NOT model `frequency_penalty`,
         // `presence_penalty`, `seed`, or `n` (verified against the official openai-python
@@ -3175,7 +3185,15 @@ impl ProtocolWriter for ResponsesWriter {
                 // `encrypted_content` slot (the opaque reasoning-reuse blob) so a same-protocol hop is
                 // lossless. A purely-empty Thinking block emits no item.
                 crate::ir::IrBlock::Thinking { text, signature } => {
-                    if text.is_empty() && signature.is_none() {
+                    // HIGH-2: a Bedrock `redactedContent` reasoning block carries the busbar
+                    // redacted-reasoning sentinel in `signature`. It is NOT a valid Responses
+                    // `encrypted_content` blob — drop it rather than leak the `__busbar` marker (a
+                    // busbar fingerprint + an invalid token) into the Responses wire.
+                    let emit_sig = signature
+                        .as_deref()
+                        .filter(|sig| !crate::proto::is_redacted_reasoning_sig(sig));
+                    // A purely-empty Thinking block (no text and no EMITTABLE signature) emits no item.
+                    if text.is_empty() && emit_sig.is_none() {
                         continue;
                     }
                     let mut item = serde_json::Map::new();
@@ -3189,7 +3207,7 @@ impl ProtocolWriter for ResponsesWriter {
                         "content".to_string(),
                         serde_json::json!([{ "type": "reasoning_text", "text": text }]),
                     );
-                    if let Some(sig) = signature {
+                    if let Some(sig) = emit_sig {
                         item.insert("encrypted_content".to_string(), serde_json::json!(sig));
                     }
                     output_arr.push(serde_json::Value::Object(item));
@@ -3344,6 +3362,53 @@ impl ProtocolWriter for ResponsesWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LOW (lossless-by-target): the Responses create API models no `top_k`. A request carrying
+    /// `top_k` must NOT emit a `top_k` field (it would 400 a real `/v1/responses` call) — it is
+    /// dropped with a `warn!` (the drop-with-warn branch is exercised here). `top_p`, which the
+    /// surface DOES model, still passes through.
+    #[test]
+    fn write_request_drops_top_k_with_warn() {
+        let mk = |top_k: Option<u32>| crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: Some(64),
+            temperature: None,
+            top_p: Some(0.9),
+            top_k,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let writer = ResponsesWriter;
+        // With top_k set: the warn-drop branch runs and NO `top_k` reaches the body.
+        let with = writer.write_request(&mk(Some(40)));
+        assert!(
+            with.get("top_k").is_none(),
+            "the Responses body must NOT carry top_k (lossy-by-target): {with}"
+        );
+        // top_p (a modeled param) still passes through.
+        assert_eq!(with.get("top_p").and_then(|v| v.as_f64()), Some(0.9));
+
+        // Without top_k: body shape is identical w.r.t. top_k absence (sanity baseline).
+        let without = writer.write_request(&mk(None));
+        assert!(without.get("top_k").is_none());
+    }
 
     #[test]
     fn test_write_request() {

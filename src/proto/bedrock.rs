@@ -171,7 +171,11 @@ const GUARD_CONTENT_SENTINEL: &str = "__busbar_bedrock_guard_content";
 /// real `reasoningText` signature is a base64 SDK token and never equals this `__busbar`-prefixed
 /// marker, so the two can never collide; on the cross-protocol seam (where `extra`/sentinels carry no
 /// Bedrock meaning) the block degrades to a plain Thinking the target writer handles.
-const REASONING_REDACTED_SIG_SENTINEL: &str = "__busbar_bedrock_redacted_reasoning";
+///
+/// Repointed (wire-correctness, HIGH-2) to the shared `crate::proto::REASONING_REDACTED_SIG_SENTINEL`
+/// so the non-Bedrock writers can recognize and DROP this marker instead of leaking it to the wire.
+/// Bedrock behavior is unchanged — same string, same re-emit-as-`redactedContent` logic below.
+use crate::proto::REASONING_REDACTED_SIG_SENTINEL;
 
 /// Source-spelling hint for `top_k` (PF — losslessness). Bedrock carries `top_k` in
 /// `additionalModelRequestFields` under two spellings: `top_k` (snake_case) and `topK` (camelCase,

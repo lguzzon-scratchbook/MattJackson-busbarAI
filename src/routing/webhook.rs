@@ -186,7 +186,11 @@ impl RoutingPolicy for WebhookPolicy {
             }
             buf.extend_from_slice(&chunk);
         }
-        let parsed: WebhookResponse = serde_json::from_slice(&buf)?;
+        // Parse through the `crate::json` depth-guard seam (MAX_JSON_DEPTH=128) so a hostile/buggy
+        // sidecar returning a pathologically nested body is rejected as `Err` (→ `on_error`) BEFORE a
+        // recursive deserialize can blow the stack — same guard the forwarding path uses. The 64 KiB
+        // cap above bounds size; this bounds nesting depth.
+        let parsed: WebhookResponse = crate::json::parse(&buf)?;
         if parsed.abstain {
             return Ok(RoutingDecision::Abstain);
         }
@@ -359,6 +363,35 @@ mod tests {
         assert!(
             res.is_err(),
             "a malformed sidecar body must surface as Err (→ on_error fallback)"
+        );
+    }
+
+    /// MED (wire-correctness): the sidecar RESPONSE body is parsed through the `crate::json`
+    /// depth-guard seam (MAX_JSON_DEPTH=128). A pathologically nested response (~150 deep) must be
+    /// rejected as `Err` (→ `on_error` fallback) BEFORE a recursive deserialize can blow the stack —
+    /// not parsed. The body stays well under the 64 KiB cap, so depth (not size) is what rejects it.
+    #[tokio::test]
+    async fn deeply_nested_response_body_is_rejected() {
+        // 150 levels of nested arrays: `{"order":[[[...]]]}` — past MAX_JSON_DEPTH=128, well under 64 KiB.
+        let depth = 150;
+        let mut deep = String::from(r#"{"order":"#);
+        deep.push_str(&"[".repeat(depth));
+        deep.push_str(&"]".repeat(depth));
+        deep.push('}');
+        assert!(
+            deep.len() < 64 * 1024,
+            "the deep body must stay under the size cap"
+        );
+        let body: &'static str = Box::leak(deep.into_boxed_str());
+        let url = mock_sidecar(200, body, None).await;
+        let policy = WebhookPolicy::new(url, client());
+        let cands = [cand(0)];
+        let res = policy
+            .decide(&req(), &cands, &ctx(), Duration::from_secs(2))
+            .await;
+        assert!(
+            res.is_err(),
+            "a ~150-deep sidecar response must be rejected by the depth guard (→ on_error fallback)"
         );
     }
 
