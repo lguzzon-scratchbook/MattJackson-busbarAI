@@ -7,16 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] — 2026-06-20
+## [1.0.0] — 2026-06-21
 
-First stable release. 1.0.0 promotes `1.0.0-rc.7` unchanged — the architectural unification (all
-traffic through the superset IR with a verbatim serialize short-circuit), IR-metered billing with
-provider cache-token correctness, and the config/surface cleanup this release freezes. The HTTP API,
-configuration schema, and the six wire-protocol contracts are now stable under Semantic Versioning: no
-breaking change without a major-version bump.
+First stable release. 1.0.0 keeps the `1.0.0-rc.7` architecture (all traffic through the superset IR
+with a verbatim serialize short-circuit, IR-metered billing) and ships an extensive convergence-
+hardening pass on top of it. The HTTP API, configuration schema, and the six wire-protocol contracts
+are stable under Semantic Versioning: no breaking change without a major-version bump.
 
-See [1.0.0-rc.7] below for the full change set and the only migration steps needed to move onto 1.0
-(the rc.6 → rc.7 notes).
+### Changed and hardened since rc.7
+
+- **Typed-IR completeness.** `response_format`, `stop_reason`, image source, and redacted-reasoning
+  are first-class IR fields rather than passthrough blobs, so each survives a cross-protocol hop
+  losslessly and no off-spec value reaches a wire.
+- **Cross-protocol fidelity fixes.** Two Bedrock egress shapes that returned 400 on a valid request;
+  consecutive same-role turn coalescing on Bedrock; Anthropic `cache_control` carried through on
+  thinking/image blocks; unknown `stop_reason` normalized on egress; a streaming-Responses refusal
+  data-loss.
+- **Billing precision.** Sub-cent carry attribution, billing of cancelled mid-stream requests, and no
+  token-billing of a translate-aborted stream.
+- **Security and reliability.** A slow-loris header-read bound on both the TLS and plain-HTTP
+  listeners; the SigV4 inbound body buffer capped independently of the body-limit layer;
+  circuit-breaker probe-leak / streak-inflation / jitter hardening.
+- **Containment refactor.** Per-protocol logic moved fully behind the reader/writer vtable so the
+  agnostic core names no protocol module; load-bearing literals named as consts; in-module-only
+  items privatized.
+- **OpenAI-family module split.** `proto/openai.rs` → `openai_chat.rs`, `proto/responses.rs` →
+  `openai_responses.rs`, with shared error/auth/id helpers in `openai_family.rs`. The protocol names
+  (`openai`, `responses`) are unchanged — internal layout only.
+- **Reproducible builds.** CI and release builds run with `--locked`.
+
+### Migration (rc.7 → 1.0.0)
+
+- `governance.rate_sweep_interval` must now be `>= 1`; `0` is rejected at boot (rc.7 silently disabled
+  the rate-map idle-entry sweep on `0`). No other config change for a default deployment.
+
+See the rc entries below for the full pre-1.0 history.
 
 ## [1.0.0-rc.7] — 2026-06-20
 
