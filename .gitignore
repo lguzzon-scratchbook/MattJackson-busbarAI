@@ -36,3 +36,4 @@ Thumbs.db
 # Python bytecode (bench harness)
 __pycache__/
 *.pyc
+graphify-out/
