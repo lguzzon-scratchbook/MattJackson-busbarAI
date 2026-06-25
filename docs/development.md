@@ -42,7 +42,7 @@ and the two common extension tasks.
 
 ## Build / test / lint
 
-Single Rust binary, stable toolchain, edition 2021.
+Single Rust binary, stable toolchain, edition 2021. `rust-toolchain.toml` pins the tested compiler version (currently 1.96.0) for CI and reproducible dev builds; the project MSRV is 1.87.0.
 
 ```bash
 cargo build                                   # debug build
