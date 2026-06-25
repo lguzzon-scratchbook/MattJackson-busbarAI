@@ -35,6 +35,9 @@ Both files support `${VAR}` environment interpolation before YAML is parsed. A m
     - [`affinity`](#affinity)
     - [Context-length failover](#context-length-failover)
   - [`limits`](#limits)
+  - [`metrics`](#metrics)
+  - [`health`](#health)
+  - [`routing`](#routing)
   - [`observability`](#observability)
   - [`governance`](#governance)
   - [`security`](#security)
@@ -286,6 +289,7 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 | `max_concurrent` | integer | **yes** | — | Maximum simultaneous in-flight requests for this lane (semaphore size). Must be ≥ 1. |
 | `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
+| `upstream_name` | string | no | — | Model identifier sent to the provider on the wire. Use when the provider expects a different model string than the config key (e.g. Bedrock model IDs such as `anthropic.claude-3-5-sonnet-20241022-v2:0`). The config key is still used for routing and pool membership. |
 
 ```yaml
 models:
@@ -294,6 +298,11 @@ models:
     max_concurrent: 20
     max_requests: -1
     default_max_tokens: 8192
+
+  claude-bedrock:
+    provider: bedrock-us-east-1
+    max_concurrent: 20
+    upstream_name: anthropic.claude-3-5-sonnet-20241022-v2:0
 
   gpt-4o:
     provider: openai
@@ -605,6 +614,53 @@ limits:
 
 ---
 
+### `metrics`
+
+Optional process-wide Prometheus metrics tunables.
+
+```yaml
+metrics:
+  key_gauge_limit: 2000
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `key_gauge_limit` | integer | `2000` | Maximum per-key gauge series emitted on each `/metrics` scrape. Limits cardinality when many virtual keys exist. |
+
+---
+
+### `health`
+
+Optional process-wide defaults for active health probing. Per-provider `health.interval_secs` / `health.timeout_secs` still override these values.
+
+```yaml
+health:
+  default_probe_interval_secs: 30
+  default_probe_timeout_secs: 5
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `default_probe_interval_secs` | integer | `30` | Seconds between active health probes when no per-provider interval is set. |
+| `default_probe_timeout_secs` | integer | `5` | Per-probe request timeout when no per-provider timeout is set. |
+
+---
+
+### `routing`
+
+Optional process-wide routing defaults. Per-policy `policy.timeout_ms` still overrides this value.
+
+```yaml
+routing:
+  default_policy_timeout_ms: 150
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `default_policy_timeout_ms` | integer | `150` | Hard wall-clock deadline for pluggable routing-policy decisions (webhook/script/native) when a per-policy timeout is not set. |
+
+---
+
 ### `observability`
 
 All sinks are opt-in. Prometheus `/metrics` is always on and needs no config entry. It is auth-gated (same rules as `/stats`) and is not an unauthenticated endpoint.
@@ -619,7 +675,9 @@ observability:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `otlp_endpoint` | string | none | When set, installs an OTLP/HTTP trace exporter. Loopback `http://` is allowed (standard collector default). Remote endpoints must use `https://`. SSRF-guarded: rejects RFC-1918, link-local, CGNAT, metadata hosts. Traces are flushed on graceful shutdown. |
-| `request_log_webhook_url` | string | none | When set, fires a fire-and-forget JSON POST per completed request: `{ts, ingress_protocol, pool, outcome, latency_ms}`. Must be `https://`. SSRF-guarded (same classes as `otlp_endpoint` plus broadcast). At most 64 deliveries in flight; drops rather than queues. 2-second delivery timeout. |
+| `request_log_webhook_url` | string | none | When set, fires a fire-and-forget JSON POST per completed request: `{ts, ingress_protocol, pool, outcome, latency_ms}`. Must be `https://`. SSRF-guarded (same classes as `otlp_endpoint` plus broadcast). |
+| `max_inflight_webhook_deliveries` | integer | `64` | Maximum webhook deliveries in flight at once. Extra deliveries are dropped rather than queued. |
+| `webhook_delivery_timeout_secs` | integer | `2` | Wall-clock timeout for each webhook delivery. |
 | `emit_server_timing` | bool | `false` | Controls whether the `Server-Timing: busbar;dur=<ms>` response header is emitted on every response. Defaults to `false` — the header is an in-band busbar fingerprint, so it is suppressed by default for backend indistinguishability. Set to `true` to enable it as a latency probe. |
 
 **OTLP credential hygiene.** If your OTLP endpoint requires auth, supply credentials in the URL userinfo (`https://user:pass@collector.example.com/…`) — Busbar moves them to an `Authorization: Basic` header and strips them from the URL before logging, so they do not appear in logs or spans.
@@ -655,7 +713,7 @@ governance:
 **Enforcement semantics (important for operators):**
 - **RPM is precise.** The per-minute counter is incremented synchronously on admission.
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
-- **Budget is best-effort/soft under concurrency.** The budget check and deduction are not atomic; concurrent requests can overshoot. Overshoot is bounded by the degree of parallelism, not unbounded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed hard guarantee).
+- **Budget is an atomic hard cap.** The admission check and spend charge are a single atomic SQLite UPSERT (`charge_within_budget`) — no concurrency overshoot is possible. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed hard guarantee). A definitive over-budget result always rejects regardless of this setting.
 
 **Incompatible combination:** `enabled: true` + `auth.mode: passthrough` is a startup error. Governance supersedes passthrough; the combination is unsupported.
 
